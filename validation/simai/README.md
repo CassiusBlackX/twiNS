@@ -38,7 +38,9 @@ without it the run crashes.
 
 `simai-ref` adds `simai.patch` (ns-3-alibabacloud):
 - **ECN**: each switch egress port draws its ECN marks from its own random stream, as
-  `validation/hpcc/hpcc.patch` does for the HPCC fork.
+  `validation/hpcc/hpcc.patch` does for the HPCC fork. The draws then no longer depend on how
+  many draws happened before anywhere in the network, which is what lets twins-rdma reproduce
+  them.
 - **Two crashes fixed.** Both change only runs that crash in stock SimAI.
   - **PFC.** `QbbNetDevice::Resume` asks `m_rdmaEQ->GetQp(qIndex)` whether NVLS is on before it
     checks the node type. A switch port has no `m_rdmaEQ`, so the first RESUME frame a switch
@@ -47,8 +49,6 @@ without it the run crashes.
   - **HPCC.** The switch writes INT at `ppp + 20 + 8 + 6`, the HPCC fork's offset, but SimAI's SeqTs
     header is 10 bytes. INT overwrites the data frame's sequence number and priority, and the next
     switch enqueues the frame into queue 168. The patch writes INT at `+ 10`.
-- The ECN draws then no longer depend on how many draws happened before anywhere in the network.
-- That is what lets twins-rdma reproduce them.
 
 `simai-ref.cc` is the network reference without astra-sim.
 - It is SimAI's network setup (`common.h`: `ReadConf`, `SetConfig`, `SetupNetwork`, `CalculateRoute`) with the topology maps ordered by node id.
