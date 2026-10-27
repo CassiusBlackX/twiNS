@@ -1648,14 +1648,18 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 base += ocnt[p];
             obase[o] = base;
             int *cur = mcur + o * K;
+            // the ingress ports with arrivals left for o: their cursors packed at the front of
+            // cur, in port order
+            int na = 0;
+            for (int p = 0; p < deg; p++)
+                if (cur[p] >= 0)
+                    cur[na++] = cur[p];
             for (int n = 0; n < ocnt[o]; n++)
             {
                 int bp = -1;
-                for (int p = 0; p < deg; p++)
+                for (int p = 0; p < na; p++)
                 {
                     int k = cur[p];
-                    if (k < 0)
-                        continue;
                     if (bp < 0)
                     {
                         bp = p;
@@ -1671,7 +1675,14 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 }
                 olist[base + n] = cur[bp];
                 int nx = onext[cur[bp]];
-                cur[bp] = nx == 0xFFFF ? -1 : nx;
+                if (nx != 0xFFFF)
+                    cur[bp] = nx;
+                else
+                {
+                    for (int q = bp + 1; q < na; q++)
+                        cur[q - 1] = cur[q];
+                    na--;
+                }
             }
         }
         if (lane < deg)
