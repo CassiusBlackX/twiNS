@@ -34,8 +34,8 @@ simulator is the ns-3 fork that RDMA studies build on (ns3-rdma, ConWeave). twin
 
 In 47 validation runs every flow's completion time equals the reference's. The runs span FatTree
 k=4–16, leaf-spine, Jellyfish, torus and Dragonfly, PFC storms, and every switch of the config.
-twins-rdma is 4–74× faster than the reference (20–74× on the larger workloads; incasts, whose
-hot switch port serializes everything, 4–9×). See [RDMA](#rdma).
+twins-rdma is 3.5–200× faster than the reference (25–200× on the larger workloads, 180–200× at
+k=16; incasts, whose hot switch port serializes everything, 4–8×). See [RDMA](#rdma).
 
 ## Build
 
@@ -256,7 +256,9 @@ variable created before it. `validation/hpcc/README.md` covers:
 **How it differs from the TCP model.**
 - **Switches.** A switch's MMU couples its ports, since every PFC threshold depends on the
   switch-wide shared buffer. Each switch therefore runs in a wave of its own. Its lanes first load
-  the slot's arriving frames (with their routes) and the heads of its queues into LDS together.
+  the slot's arriving frames together, with their routes, into a pool in global memory. Only
+  small state stays in LDS: ports, cursors, chain prefixes, and 16-bit arrival times and orders.
+  LDS bounds how many switches a CU holds, and at k=16 that was the limit.
   - **Safe slots** are the common case: no port is MMU-paused, none has headroom bytes, and every
     port stays below the lowest threshold the slot can reach even if all its arrivals stay. Then
     no MMU decision can occur. Each lane runs one egress port's events: the arrivals routed to it
@@ -275,14 +277,14 @@ variable created before it. `validation/hpcc/README.md` covers:
 
 | run | flows | reference | twins-rdma | speedup |
 |---|---|---|---|---|
-| k16 a2a30, DCQCN | 2253 | 199.8 s | 3.95 s | 51× |
-| k16 a2a30, HPCC | 2253 | 215.9 s | 4.37 s | 49× |
-| k16 a2a50s, DCQCN, 2 MB buffers (4043 pauses) | 50818 | 210.0 s | 4.38 s | 48× |
-| k8 a2a50s, HPCC | 12519 | 35.3 s | 0.70 s | 50× |
-| k8 permutation, HPCC | 382 | 10.6 s | 0.165 s | 64× |
-| leaf-spine a2a30, DCQCN | 541 | 30.4 s | 1.01 s | 30× |
-| Jellyfish a2a30, HPCC | 289 | 20.1 s | 1.01 s | 20× |
-| k8 incast64, 1 MB buffers (4315 pauses), DCQCN | 64 | 4.1 s | 0.90 s | 4.6× |
+| k16 a2a30, DCQCN | 2253 | 199.8 s | 0.99 s | 202× |
+| k16 a2a30, HPCC | 2253 | 215.9 s | 1.14 s | 189× |
+| k16 a2a50s, DCQCN, 2 MB buffers (4043 pauses) | 50818 | 210.0 s | 1.17 s | 180× |
+| k8 a2a50s, HPCC | 12519 | 35.3 s | 0.44 s | 79× |
+| k8 permutation, HPCC | 382 | 10.6 s | 0.094 s | 113× |
+| leaf-spine a2a30, DCQCN | 541 | 30.4 s | 0.63 s | 48× |
+| Jellyfish a2a30, HPCC | 289 | 20.1 s | 0.76 s | 26× |
+| k8 incast64, 1 MB buffers (4315 pauses), DCQCN | 64 | 4.1 s | 0.92 s | 4.5× |
 
 These are wall times on the RX 9060 XT against the reference on one core of a Xeon Gold 5218.
 The reference times include the start of its container (about 0.4 s).
