@@ -163,6 +163,50 @@ static bool simai_link0(const string &path, uint64_t *bps, int64_t *delay)
     return true;
 }
 
+// ns-3's Hash32: MurmurHash3_x86_32 with seed 0x8BADF00D (hash-murmur3.cc)
+static uint32_t ns3_hash32(const uint8_t *key, int len)
+{
+    auto rotl = [](uint32_t x, int r) { return (x << r) | (x >> (32 - r)); };
+    const uint32_t c1 = 0xcc9e2d51, c2 = 0x1b873593;
+    uint32_t h = 0x8BADF00D;
+    int nblocks = len / 4;
+    for (int i = 0; i < nblocks; i++)
+    {
+        uint32_t k;
+        memcpy(&k, key + 4 * i, 4);
+        k *= c1;
+        k = rotl(k, 15);
+        k *= c2;
+        h ^= k;
+        h = rotl(h, 13);
+        h = h * 5 + 0xe6546b64;
+    }
+    const uint8_t *tail = key + 4 * nblocks;
+    uint32_t k = 0;
+    switch (len & 3)
+    {
+    case 3:
+        k ^= tail[2] << 16;
+        [[fallthrough]];
+    case 2:
+        k ^= tail[1] << 8;
+        [[fallthrough]];
+    case 1:
+        k ^= tail[0];
+        k *= c1;
+        k = rotl(k, 15);
+        k *= c2;
+        h ^= k;
+    }
+    h ^= (uint32_t)len;
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
+
 static void host_push(Chain *c, int64_t lead, int ord) { cpush(c, ccode(lead, ord), Chain(*c)); }
 
 // One network: its parameters, topology, routes and flows, numbered within it.
@@ -173,11 +217,13 @@ struct World
     int H = 0, S = 0, N = 0, L = 0, K = 1;
     vector<int> deg, out_link, in_link, link_dst, link_dport; // [N K] with the world's K
     vector<Route> rt;                                         // [S H]
+    vector<uint8_t> rtp;                                      // their ports
     vector<FlowInfo> fi;
     vector<int> start_list, start_off;
     vector<uint64_t> lbps;  // [L] per directed link
     vector<int64_t> ldelay; // [L]
     vector<PortCfg> pcfg;   // its switches' ports in turn
+    vector<uint8_t> nvs;    // [S] an NVSwitch
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
 
@@ -259,6 +305,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     vector<std::pair<int, int>> links;
     vector<uint64_t> link_rate; // per undirected link
     vector<int64_t> link_delay;
+    int gps = 1; // gpus_per_server
     {
         std::ifstream f(topo_file);
         if (!f)
@@ -270,25 +317,22 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         f >> x;
         if (!x.empty() && isdigit((unsigned char)x[0]))
         {
-            // SimAI's format: node ids are GPUs first, then (here) switches; no NVSwitches yet
-            int nodes = atoi(x.c_str()), gps, nvs, sws, nl;
+            // SimAI's format: node ids are GPUs first, then NVSwitches and switches
+            int nodes = atoi(x.c_str()), nvs, sws, nl;
             string gpu_type;
             f >> gps >> nvs >> sws >> nl >> gpu_type;
-            if (nvs != 0)
-            {
-                fprintf(stderr, "%s: NVSwitches are not modelled yet\n", w.name.c_str());
-                return false;
-            }
-            H = nodes - sws, S = sws;
-            for (int i = 0; i < sws; i++)
+            H = nodes - nvs - sws, S = nvs + sws;
+            w.nvs.assign(S, 0);
+            for (int i = 0; i < nvs + sws; i++)
             {
                 int id;
                 f >> id;
-                if (id < H)
+                if (id < H || id >= nodes)
                 {
                     fprintf(stderr, "%s: switch %d: SimAI topologies must list GPUs before switches\n", w.name.c_str(), id);
                     return false;
                 }
+                w.nvs[id - H] = i < nvs;
             }
             for (int i = 0; i < nl; i++)
             {
@@ -330,6 +374,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     link_delay.push_back(delay);
                 }
             } while (f >> x);
+        if (!P.simai)
+            w.nvs.assign(S, 0);
     }
     P.bps = link_rate.empty() ? bps : link_rate[0];
     P.seq_extra = P.simai ? 4 : 0;
@@ -356,9 +402,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         return false;
     }
     for (int h = 0; h < H; h++)
-        if (deg[h] != 1)
+        if (deg[h] < 1 || deg[h] > MAXD || (!P.simai && deg[h] != 1))
         {
-            fprintf(stderr, "%s: host %d has %d links (one expected)\n", w.name.c_str(), h, deg[h]);
+            fprintf(stderr, "%s: host %d has %d links (%s expected)\n", w.name.c_str(), h, deg[h], P.simai ? "1 to 4" : "one");
             return false;
         }
     w.out_link.assign((size_t)N * K, -1);
@@ -385,8 +431,11 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             nbr[b][a] = pb;
         }
     }
-    // routes (CalculateRoute: BFS from each host over switches, neighbours by id)
+    // routes (CalculateRoute: BFS from each host over switches, neighbours by id). Next hops
+    // through an NVSwitch replace the others: once a node has one, only NVSwitches are added
+    auto is_nvs = [&](int n) { return n >= H && w.nvs[n - H]; };
     vector<vector<vector<int>>> next_hop(S, vector<vector<int>>(H)); // [switch][host] -> next nodes
+    vector<vector<vector<int>>> hnext(H, vector<vector<int>>(H));    // [host][host] -> next nodes
     vector<vector<int64_t>> hop_n(N, vector<int64_t>(H, -1));         // links from node to host
     // CalculateRoute's sums along the path that first reaches a node: pairDelay, pairTxDelay
     // (one MTU frame per hop) and pairBw (the slowest link), from host i to host h at [i][h]
@@ -413,8 +462,21 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     if (next >= H)
                         q.push_back(next);
                 }
-                if (d + 1 == dis[next] && next >= H)
-                    next_hop[next - H][h].push_back(now);
+                if (d + 1 == dis[next])
+                {
+                    vector<int> &v = next < H ? hnext[next][h] : next_hop[next - H][h];
+                    bool via = false;
+                    for (int y : v)
+                        via = via || is_nvs(y);
+                    if (!via)
+                    {
+                        if (is_nvs(now))
+                            v.clear();
+                        v.push_back(now);
+                    }
+                    else if (is_nvs(now))
+                        v.push_back(now);
+                }
             }
         }
         for (int n = 0; n < N; n++)
@@ -427,15 +489,10 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         for (int h = 0; h < H; h++)
         {
             Route &r = w.rt[(size_t)x * H + h];
-            if (next_hop[x][h].size() > (size_t)RT_PORTS)
-            {
-                fprintf(stderr, "%s: switch %d has %zu equal-cost ports towards host %d (at most %d)\n", w.name.c_str(), H + x,
-                        next_hop[x][h].size(), h, RT_PORTS);
-                return false;
-            }
+            r.off = w.rtp.size();
             r.n = next_hop[x][h].size();
-            for (int i = 0; i < r.n; i++)
-                r.port[i] = nbr[H + x][next_hop[x][h][i]];
+            for (uint32_t i = 0; i < r.n; i++)
+                w.rtp.push_back((uint8_t)nbr[H + x][next_hop[x][h][i]]);
         }
     // maxRtt, maxBdp: delay * 2 + txDelay, and its product with the bandwidth, over host pairs
     uint64_t max_rtt = 0, max_bdp = 0;
@@ -481,8 +538,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     pc.shift--;
                     r /= 2;
                 }
-                double kmin, kmax, pmax;
-                if (!ecn_lookup("KMIN_MAP", pc.bps, &kmin) || !ecn_lookup("KMAX_MAP", pc.bps, &kmax) || !ecn_lookup("PMAX_MAP", pc.bps, &pmax))
+                double kmin = 0, kmax = 0, pmax = 0;
+                if (!w.nvs[x] && (!ecn_lookup("KMIN_MAP", pc.bps, &kmin) || !ecn_lookup("KMAX_MAP", pc.bps, &kmax) || !ecn_lookup("PMAX_MAP", pc.bps, &pmax)))
                 {
                     fprintf(stderr, "%s: KMIN/KMAX/PMAX_MAP: no entry for %llu bps\n", w.name.c_str(), (unsigned long long)pc.bps);
                     return false;
@@ -561,12 +618,62 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 host_push(&c, t - prev_t, k == 0 ? 0 : prev_n); // ScheduleFlowInputs (from the previous one, or main)
                 host_push(&c, 0, m - i);                        // Application::Start
                 host_push(&c, 0, 0);                            // StartApplication
+                c.hash = 0; // (the hashes cover what follows the start)
+                for (int k = 0; k < NANC; k++)
+                    c.anc[k] = 0;
                 x.start_chain = c;
             }
             prev_t = t;
             prev_n = j - i;
             k++;
             i = j;
+        }
+    }
+    // the devices of a flow's queue pairs: RdmaHw's tables of a host towards a host are its next
+    // hops, through NVSwitches (m_rtTable_nxthop_nvswitch) or not (m_rtTable); among several, a
+    // queue pair picks by Hash32 of its (sip, dip, sport, dport)
+    {
+        auto tables = [&](int a, int b, vector<int> &nv, vector<int> &rt_) {
+            nv.clear(), rt_.clear();
+            for (int y : hnext[a][b])
+                (is_nvs(y) ? nv : rt_).push_back(nbr[a][y]);
+        };
+        auto pick = [&](const vector<int> &v, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+            uint8_t buf[12];
+            memcpy(buf, &sip, 4);
+            memcpy(buf + 4, &dip, 4);
+            memcpy(buf + 8, &sport, 2);
+            memcpy(buf + 10, &dport, 2);
+            return v[ns3_hash32(buf, 12) % v.size()];
+        };
+        vector<int> nv, rt_;
+        for (size_t i = 0; i < fi.size(); i++)
+        {
+            FlowInfo &x = fi[i];
+            if (deg[x.src] == 1 && deg[x.dst] == 1)
+            {
+                x.snic = x.rnic = 0;
+                continue;
+            }
+            if (x.src == x.dst)
+            {
+                fprintf(stderr, "%s: flow %zu from a GPU to itself\n", w.name.c_str(), i);
+                return false;
+            }
+            // GetNicIdxOfQp: the NVSwitch table within a server or when it has an entry
+            tables(x.src, x.dst, nv, rt_);
+            const vector<int> &sv = (x.src / gps == x.dst / gps || !nv.empty()) ? nv : rt_;
+            // GetNicIdxOfRxQp: m_rtTable first
+            tables(x.dst, x.src, nv, rt_);
+            const vector<int> &rv = !rt_.empty() ? rt_ : nv;
+            if (sv.empty() || rv.empty())
+            {
+                fprintf(stderr, "%s: flow %zu: no route between GPUs %d and %d\n", w.name.c_str(), i, x.src, x.dst);
+                return false;
+            }
+            x.snic = (uint8_t)pick(sv, node_ip(x.src), node_ip(x.dst), (uint16_t)x.sport, 100);
+            // the receiving queue pair: sip and dip are the receiver's and the sender's
+            x.rnic = (uint8_t)pick(rv, node_ip(x.dst), node_ip(x.src), 100, (uint16_t)x.sport);
         }
     }
     w.start_list.assign(F, 0);
@@ -751,8 +858,10 @@ int main(int argc, char **argv)
     auto gnode = [&](int wi, int n) { return n < worlds[wi].H ? hbase[wi] + n : H + sbase[wi] + (n - worlds[wi].H); };
     vector<int> deg(N), out_link((size_t)N * K, -1), in_link((size_t)N * K, -1), link_dst(L), link_dport(L);
     vector<Route> rt;
+    vector<uint8_t> rtp;
     vector<SwInfo> si(S);
     vector<FlowInfo> fi(F);
+    vector<Chain> root_chain(F);
     vector<int> start_list(F), start_off(H + 1, 0), h_world(H), s_world(S);
     vector<Params> Pw(W);
     int64_t max_slots = 0;
@@ -777,18 +886,28 @@ int main(int argc, char **argv)
             link_dst[lbase[wi] + l] = gnode(wi, w.link_dst[l]);
             link_dport[lbase[wi] + l] = w.link_dport[l];
         }
+        const uint32_t rb = rtp.size();
+        rtp.insert(rtp.end(), w.rtp.begin(), w.rtp.end());
         for (int x = 0; x < w.S; x++)
         {
             SwInfo &z = si[sbase[wi] + x];
             z.seed = (uint32_t)(w.H + x);
             z.hbase = hbase[wi];
             z.rt_off = rt.size();
-            rt.insert(rt.end(), w.rt.begin() + (size_t)x * w.H, w.rt.begin() + (size_t)(x + 1) * w.H);
+            z.nvs = w.nvs[x];
+            for (int h = 0; h < w.H; h++)
+            {
+                Route r = w.rt[(size_t)x * w.H + h];
+                r.off += rb;
+                rt.push_back(r);
+            }
             s_world[sbase[wi] + x] = wi;
         }
         for (size_t f = 0; f < w.fi.size(); f++)
         {
             FlowInfo x = w.fi[f];
+            x.start_chain.root += fbase[wi]; // roots over all worlds (the order within one is kept)
+            root_chain[x.start_chain.root - 1] = x.start_chain;
             x.src += hbase[wi];
             x.dst += hbase[wi];
             fi[fbase[wi] + f] = x;
@@ -834,34 +953,65 @@ int main(int argc, char **argv)
     s.link_dst = dev_copy(link_dst);
     s.link_dport = dev_copy(link_dport);
     s.rt = dev_copy(rt);
+    s.rtp = dev_copy(rtp);
     s.fi = dev_copy(fi);
+    s.root_chain = dev_copy(root_chain);
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
     s.rx = dev_alloc<RcvQP>(F);
     s.start_list = dev_copy(start_list);
+    // per NIC: a host's devices in turn (its flow starts in its first device's Host)
+    vector<int> nic_off(H + 1, 0);
+    for (int h = 0; h < H; h++)
+        nic_off[h + 1] = nic_off[h] + deg[h];
+    const int NICS = nic_off[H];
+    s.nic_off = dev_copy(nic_off);
     {
-        vector<Host> hs(H);
+        vector<int> l1, lm;
+        for (int h = 0; h < H; h++)
+            (deg[h] == 1 ? l1 : lm).push_back(h);
+        s.n1 = l1.size(), s.nm = lm.size();
+        s.hlist1 = dev_copy(l1);
+        s.hlistm = dev_copy(lm);
+        vector<int> ls, lb;
+        s.ks = s.kb = 1;
+        for (int x = 0; x < S; x++)
+        {
+            int d = deg[H + x];
+            (d <= KSMALL ? ls : lb).push_back(x);
+            int &k = d <= KSMALL ? s.ks : s.kb;
+            k = std::max(k, d);
+        }
+        s.ns_s = ls.size(), s.ns_b = lb.size();
+        s.slist_s = dev_copy(ls);
+        s.slist_b = dev_copy(lb);
+    }
+    {
+        vector<Host> hs(NICS);
+        for (int i = 0; i < NICS; i++)
+        {
+            hs[i] = Host{};
+            hs[i].tc_at = hs[i].ns_at = -1;
+        }
         for (int h = 0; h < H; h++)
         {
-            hs[h] = Host{};
-            hs[h].tc_at = hs[h].ns_at = -1;
-            hs[h].next_start = start_off[h];
-            hs[h].start_end = start_off[h + 1];
+            hs[nic_off[h]].next_start = start_off[h];
+            hs[nic_off[h]].start_end = start_off[h + 1];
         }
         s.hs = dev_copy(hs);
     }
-    s.h_tc = dev_alloc<Chain>(H);
-    s.h_ns = dev_alloc<Chain>(H);
+    s.h_tc = dev_alloc<Chain>(NICS);
+    s.h_ns = dev_alloc<Chain>(NICS);
     s.ackq_cap = 1024;
-    s.ackq = dev_alloc<Pkt>((size_t)H * s.ackq_cap);
+    s.ackq = dev_alloc<Pkt>((size_t)NICS * s.ackq_cap);
     {
-        // queue pairs a host has open at once (finished ones leave its group lazily)
-        vector<int> per(H, 0);
+        // queue pairs a NIC has open at once (finished ones leave its group lazily)
+        vector<int> per(NICS, 0);
         for (auto &x : fi)
-            per[x.src]++;
+            per[nic_off[x.src] + x.snic]++;
         s.qps_cap = std::max(1, *std::max_element(per.begin(), per.end()));
     }
-    s.qps = dev_alloc<int>((size_t)H * s.qps_cap);
+    s.qps = dev_alloc<int>((size_t)NICS * s.qps_cap);
     {
         vector<Switch> sw(S);
         vector<Port> ps(nports);
@@ -918,9 +1068,9 @@ int main(int argc, char **argv)
                 if (r == rates.size())
                     rates.push_back(x.bps);
                 x.rc = (uint32_t)r;
-                int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = std::max<int64_t>(1, tx_ns(P.simai, x.bps, PFC_SIZE));
+                int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = std::max<int64_t>(1, tx_ns(P.simai, x.bps, 60));
                 int64_t nb = 2 + (txmax + x.delay - 1) / D;
-                int64_t cap = std::min<int64_t>(MAXF, D / txmin + 1);
+                int64_t cap = std::min<int64_t>(MAXF, D / txmin + 2); // (back to back: ACKs, 60 bytes; overflows are reported)
                 if (nb > 4096)
                 {
                     fprintf(stderr, "a link's delay (%lld ns) is too long for the slot (%lld ns)\n", (long long)x.delay, (long long)D);
@@ -978,6 +1128,13 @@ int main(int argc, char **argv)
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
     }
     {
+        Memo m;
+        uint64_t cap = 1ull << 22; // 32 MB
+        m.t = dev_alloc<unsigned long long>(cap);
+        m.mask = cap - 1;
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo), &m, sizeof(m)));
+    }
+    {
         vector<int32_t> txt(rates.size() * TXT_N);
         for (size_t r = 0; r < rates.size(); r++)
             for (int b = 0; b < TXT_N; b++)
@@ -989,13 +1146,14 @@ int main(int argc, char **argv)
     // a block (one wave) per host and per switch; a switch keeps its ports in LDS
     s.spread = spread;
     s.serial = serial || spread < SAFE_LANES;
-    size_t per_sw = (size_t)K * sizeof(SwPortLds) + sw_ints(K) * sizeof(int);
+    // LDS: a host's arrival pool; a switch's ports and int workspace, for the most ports of its kernel
+    auto per_sw = [&](int k) { return (size_t)k * sizeof(SwPortLds) + sw_ints(k) * sizeof(int); };
     s.apool = dev_alloc<ArrLds>((size_t)S * POOL);
     s.aidx = dev_alloc<int>((size_t)S * 2 * POOL);
-    size_t per_h = HPOOL * sizeof(HArr) + 4 * sizeof(int);
-    if (per_sw > 64 * 1024)
+    size_t per_h = HPOOL * sizeof(HArr) + HHINTS * sizeof(int);
+    if (per_sw(s.kb) > 64 * 1024)
     {
-        fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw, K);
+        fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw(s.kb), s.kb);
         return 1;
     }
     int BS = spread;
@@ -1004,18 +1162,46 @@ int main(int argc, char **argv)
     auto t_start = std::chrono::steady_clock::now();
     int fin = 0;
     long long launches = 0;
-    // a graph of 64 slots (fewer launch costs)
-    hipStream_t sa;
+    // a graph of 64 slots (fewer launch costs); a slot's kernels run side by side (forked from sa)
+    hipStream_t sa, sb, sc;
     CK(hipStreamCreate(&sa));
+    CK(hipStreamCreate(&sb));
+    CK(hipStreamCreate(&sc));
     const int GS = 64;
-    size_t lds = std::max(per_h, per_sw);
-    if (lds > 48 * 1024)
-        CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
+    const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = per_sw(s.kb);
+    CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
+    CK(hipFuncSetAttribute((const void *)rdma_slot_m, hipFuncAttributeMaxDynamicSharedMemorySize, (int)per_h));
+    CK(hipFuncSetAttribute((const void *)rdma_slot_big, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds_b));
     hipGraph_t graph;
     hipGraphExec_t gexec;
+    hipEvent_t ef, ejb, ejc;
+    CK(hipEventCreateWithFlags(&ef, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&ejb, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&ejc, hipEventDisableTiming));
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
     for (int i = 0; i < GS; i++)
-        rdma_slot<<<H + S, BS, lds, sa>>>(s);
+    {
+        if (s.nm || s.ns_b)
+        {
+            CK(hipEventRecord(ef, sa));
+            CK(hipStreamWaitEvent(sb, ef, 0));
+            CK(hipStreamWaitEvent(sc, ef, 0));
+        }
+        if (s.n1 + s.ns_s > 0)
+            rdma_slot<<<s.n1 + s.ns_s, BS, lds, sa>>>(s);
+        if (s.nm)
+        {
+            rdma_slot_m<<<s.nm, BS, per_h, sb>>>(s);
+            CK(hipEventRecord(ejb, sb));
+            CK(hipStreamWaitEvent(sa, ejb, 0));
+        }
+        if (s.ns_b)
+        {
+            rdma_slot_big<<<s.ns_b, BS, lds_b, sc>>>(s);
+            CK(hipEventRecord(ejc, sc));
+            CK(hipStreamWaitEvent(sa, ejc, 0));
+        }
+    }
     CK(hipStreamEndCapture(sa, &graph));
     CK(hipGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
     while (!fin)
@@ -1099,6 +1285,11 @@ int main(int argc, char **argv)
         fclose(ft);
     }
 #ifdef RDMA_PROF
+    {
+        unsigned long long gp[8];
+        CK(hipMemcpyFromSymbol(gp, HIP_SYMBOL(g_prof), sizeof(gp)));
+        printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu)\n", gp[0], gp[3], gp[1], gp[4]);
+    }
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);

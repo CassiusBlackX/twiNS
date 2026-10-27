@@ -100,6 +100,7 @@ topologies to SimAI's format.
 |---|---|---|---|
 | `jobs_net1.txt` | 13 | FatTree k=4 and k=8 in SimAI's format, uniform links (100 Gb/s at 1 µs, 400 Gb/s at 500 ns); SimAI.conf (MTU 9000, DCQCN, `GLOBAL_T 0`) and variants: MTU 1000, HPCC, `GLOBAL_T 1`, 1–2 MB buffers (up to 2456 pauses) | all |
 | `jobs_net2.txt` | 15 | FatTree k=4 and k=8 with host links and switch links of different rates (25–400 Gb/s) and delays (100 ns–2 µs, up to 20× apart); DCQCN and HPCC, 1–2 MB buffers | all |
+| `jobs_gpu1.txt` | 17 | SimAI's own topologies (`gen_Topo_Template.py`): Spectrum-X, AlibabaHPN (dual ToR: two NICs per GPU) and DCN+ with 16 GPUs, Spectrum-X with 128; NVSwitches, NVLink at 2400–2880 Gb/s and 25 ns; rings, cross-server pairs, all-to-all within servers, incasts, a mix of 200 flows; MTU 9000 and 1000 | all |
 
 The 28 runs also give identical results as one batch (`check_batch.sh` with `REF=out/simai/ref
 CFG=validation/simai/SimAI.conf OUT=out/simai/batch DATA=data/simai:data/rdma:data/topo:data/flows`).
@@ -111,4 +112,29 @@ CFG=validation/simai/SimAI.conf OUT=out/simai/batch DATA=data/simai:data/rdma:da
   `SetupNetwork` configures them.
 - Pair RTTs, BDPs and bandwidths follow `CalculateRoute`'s path sums.
 
-Not modelled yet: NVSwitches, GPUs with two ports, NVLS.
+**GPU servers.**
+- **NVSwitches** are switches without PFC frames, ECN marking or INT. They keep the MMU's
+  admission and drops.
+- **A GPU** is a host with a device per link (NVLink, one or two NICs), each with its own
+  QbbNetDevice and egress queue. Its queue pairs share RdmaHw.
+- **Device choice.** A flow's sender sends on the device `GetNicIdxOfQp` picks, and its receiver
+  ACKs on the device `GetNicIdxOfRxQp` picks:
+  - the NVSwitch table within a server, the switch table otherwise, from `CalculateRoute`'s next
+    hops (an NVSwitch hop replaces the others);
+  - among several, by ns-3's `Hash32` (Murmur3) of the queue pair's 4-tuple.
+- **Kernels.** GPUs run in a kernel of their own (`rdma_slot_m`), as do switches with more than 64
+  ports (`rdma_slot_big`), alongside the main kernel: their larger state would otherwise slow every
+  block.
+
+**Ties in lockstep traffic.** Symmetric traffic makes many events simultaneous whose lineages agree
+for hundreds of events. NVLink transfers are an example: every frame takes one slot.
+- Deciding such ties walked the chains deep into the tail ring: 2.7 M cycles per event selection on
+  an all-to-all within servers.
+- Each chain now carries a hash of its leads above its root, and its ancestors' hashes four levels
+  down.
+- Chains of equal leads on distinct roots compare as their roots' start chains.
+- Decisions made by a lead are remembered by the pair of hashes (`ccmp`), and lookups strip equal
+  leading elements. The comparisons of two ports' lineages slot after slot are then mostly lookups.
+- The memo key is 64 bits. A hash collision, about 2^-64 per lookup, would decide a tie wrongly.
+
+Not modelled yet: NVLS (SimAI generates no flows with it across servers anyway).

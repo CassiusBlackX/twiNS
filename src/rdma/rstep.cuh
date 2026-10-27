@@ -98,6 +98,26 @@ __host__ __device__ __forceinline__ uint32_t ccode(int64_t lead, int ord)
 }
 
 __device__ TailPool g_tail;
+// remembered comparisons (see ccmp): key | result, open addressing
+struct Memo
+{
+    unsigned long long *t;
+    uint64_t mask;
+};
+__device__ Memo g_memo;
+#ifdef RDMA_PROF
+__device__ unsigned long long g_prof[8]; // ccmp calls, walks, walk steps, memo hits, inserts
+#endif
+
+// a chain's hash after one more code: of its lead only (splitmix64's finalizer). Ordinals decide
+// only between chains of one root (see ccmp)
+__host__ __device__ __forceinline__ uint64_t chash(uint64_t h, uint32_t code)
+{
+    uint64_t z = h + 0x9e3779b97f4a7c15ull * ((code >> 3) + 1ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
 
 // the chain of an event scheduled with `code` by the event whose chain is par
 __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const Chain &par)
@@ -108,6 +128,7 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
         c = par;
         if (c.r[0].cnt < 0xFFFFFFFFu)
             c.r[0].cnt++;
+        c.hash = chash(par.hash, code);
     }
     else
     {
@@ -117,6 +138,7 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             c.r[i] = par.r[i - 1];
         c.root = par.root;
         c.tail = par.tail;
+        c.hash = chash(par.hash, code);
         c.pad = 0;
         if (par.r[RUNS - 1].code)
         {
@@ -133,6 +155,9 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
 #endif
         }
     }
+    c.anc[0] = par.hash;
+    for (int i = 1; i < NANC; i++)
+        c.anc[i] = par.anc[i - 1];
     *dst = c;
 }
 
@@ -218,9 +243,12 @@ struct RunCursor
 // (the larger: an earlier ancestor). If every lead is equal, the ancestors are the same event from
 // the deepest level at which the ordinals differ, and there the smaller ordinal (the sibling
 // scheduled first) decides; distinct roots (flows' StartApplications) decide in start order.
-__device__ __forceinline__ int ccmp(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact)
+// (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
+__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr)
 {
     *inexact = false;
+    if (by_lead)
+        *by_lead = false;
     int ord = 0;
     RunCursor A, B;
     A.init(a, pa);
@@ -240,12 +268,18 @@ __device__ __forceinline__ int ccmp(uint32_t pa, const Chain &a, uint32_t pb, co
                 return ord;
             }
             // a complete chain ends at an event scheduled before everything after it
+            if (by_lead)
+                *by_lead = !(ca == 0 ? A.lost : B.lost);
             if (ca == 0)
                 return A.lost ? ord : -1;
             return B.lost ? ord : 1;
         }
         if (ca >> 3 != cb >> 3)
+        {
+            if (by_lead)
+                *by_lead = true;
             return ca > cb ? -1 : 1;
+        }
         if (ca != cb)
             ord = (ca & 7) > (cb & 7) ? -1 : 1;
         uint32_t m = A.left < B.left ? A.left : B.left;
@@ -256,6 +290,106 @@ __device__ __forceinline__ int ccmp(uint32_t pa, const Chain &a, uint32_t pb, co
         if (B.left == 0)
             B.next();
     }
+}
+
+// Comparisons decided by the leads (a first differing lead, or one chain ending first) depend only
+// on the two chains' leads, so they are remembered by their lead hashes. In lockstep traffic (as
+// in collectives) two ports see the same pair of lineages slot after slot, each extended by the
+// same leads: after its equal-lead top elements a comparison is one made before. ccmp looks the pair
+// up at depths 0 .. NANC (the ancestors' hashes), walks only if none is known, and remembers what
+// the walk found for the depths whose top leads were equal. (A memo key is 64 bits of the two
+// hashes: a collision, at about 2^-64 per lookup, would decide a tie wrongly.)
+__device__ __forceinline__ uint64_t memo_key(uint64_t ha, uint64_t hb)
+{
+    uint64_t k = chash(ha * 0x9e3779b97f4a7c15ull ^ hb, 0x5bd1e995u) & ~3ull;
+    return k ? k : 4;
+}
+// 0: unknown, else -1 or 1 (a runs first)
+__device__ __forceinline__ int memo_get(uint64_t ha, uint64_t hb)
+{
+    uint64_t k = memo_key(ha, hb);
+    for (int i = 0; i < 4; i++)
+    {
+        unsigned long long v = g_memo.t[(k + i) & g_memo.mask];
+        if (v == 0)
+            return 0;
+        if ((v & ~3ull) == k)
+            return (v & 3) == 1 ? -1 : 1;
+    }
+    return 0;
+}
+__device__ __forceinline__ void memo_put(uint64_t ha, uint64_t hb, int r)
+{
+    uint64_t k = memo_key(ha, hb);
+    unsigned long long v = k | (r < 0 ? 1 : 2);
+    for (int i = 0; i < 4; i++)
+    {
+        unsigned long long *p = &g_memo.t[(k + i) & g_memo.mask];
+        unsigned long long old = atomicCAS(p, 0ull, v);
+        if (old == 0 || (old & ~3ull) == k)
+            return;
+    }
+}
+
+// ccmp_walk, sped up: chains of distinct roots with equal leads above their roots (equal hashes:
+// lineages in lockstep, whose walk would go all the way down) compare as their roots' start chains
+// (there are their first differing lead, and the end where the roots decide; ordinals decide only
+// below a common root); comparisons decided by leads come from the memo when known
+__device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact)
+{
+#ifdef RDMA_PROF
+    atomicAdd(&g_prof[0], 1ull);
+#endif
+    // the hashes of the chains compared (a virtual push pa on a) and of their ancestors
+    uint64_t ha[NANC + 1], hb[NANC + 1];
+    ha[0] = pa ? chash(a.hash, pa) : a.hash;
+    hb[0] = pb ? chash(b.hash, pb) : b.hash;
+    for (int i = 1; i <= NANC; i++)
+    {
+        ha[i] = pa ? (i == 1 ? a.hash : a.anc[i - 2]) : a.anc[i - 1];
+        hb[i] = pb ? (i == 1 ? b.hash : b.anc[i - 2]) : b.anc[i - 1];
+    }
+    if (a.root && b.root && a.root != b.root && ha[0] == hb[0])
+        return ccmp_walk(0, s.root_chain[a.root - 1], 0, s.root_chain[b.root - 1], inexact);
+    // the top elements' leads, one at a time: depth j is usable when the top j leads are equal
+    RunCursor A, B;
+    A.init(a, pa);
+    B.init(b, pb);
+    int eq = 0; // top elements with equal leads (at most NANC)
+    for (int j = 0;; j++)
+    {
+        int m = memo_get(ha[j], hb[j]);
+        if (m)
+        {
+#ifdef RDMA_PROF
+            atomicAdd(&g_prof[3], 1ull);
+#endif
+            *inexact = false;
+            return m;
+        }
+        if (j == NANC || A.code == 0 || B.code == 0 || (A.code >> 3) != (B.code >> 3))
+            break;
+        eq = j + 1;
+        if (--A.left == 0)
+            A.next();
+        if (--B.left == 0)
+            B.next();
+    }
+    bool by_lead;
+    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead);
+#ifdef RDMA_PROF
+    atomicAdd(&g_prof[1], 1ull);
+#endif
+    // a decision by the leads: not the end of both chains (roots, ordinals), nor a lost tail
+    if (by_lead && !*inexact)
+    {
+        for (int j = 0; j <= eq; j++)
+            memo_put(ha[j], hb[j], r);
+#ifdef RDMA_PROF
+        atomicAdd(&g_prof[4], 1ull);
+#endif
+    }
+    return r;
 }
 
 // the first three runs of the chain cpush(code0, ch) (code0 0: of ch itself)
@@ -314,7 +448,7 @@ __device__ __forceinline__ bool before(const Sim &s, int64_t ta, uint32_t pa, co
     if (ta != tb)
         return ta < tb;
     bool inexact;
-    int c = ccmp(pa, a, pb, b, &inexact);
+    int c = ccmp(s, pa, a, pb, b, &inexact);
     if (inexact)
         atomicAdd(&s.ev[9], 1ull);
     if (c == 0)
@@ -462,7 +596,13 @@ __device__ __forceinline__ uint32_t arrival_code(const Sim &s, int link, int64_t
     return ccode(link_tx(s, link, f.p.size) + delay, f.p.ord);
 }
 
-// ------------------------------------------------------------------ host: the NIC
+// ------------------------------------------------------------------ host: the NICs
+// A host has a device per link (a GPU: an NVLink port and one or two NICs). Each has its own
+// QbbNetDevice and RdmaEgressQueue state (Host, its TransmitComplete and m_nextSend chains, its ACK
+// queue and queue-pair group: the per-NIC arrays, at s.nic_off[h] + device); RdmaHw (queue pairs)
+// is shared. The host's flow starts live in its first device's Host.
+constexpr int MAXD = 4;
+template <int ND>
 struct HCtx
 {
     const Sim *s;
@@ -471,15 +611,31 @@ struct HCtx
     bool pre_ok;     // the running ACK's HPCC U and dt were computed ahead
     double pre_U;
     uint64_t pre_dt;
-    Host st;
     int64_t now, slot;
     Chain cur; // the running event's chain
     int ord;   // events it has scheduled
-    LFrame *out;
-    int nout, link; // frames it sent this slot; its link
-    int64_t ldelay;
-    OutBucket ob;
+    int nout;  // frames it sent this slot
+    int nd, nic0;
+    int d; // the current device (hsel)
+    Host stv[ND];
+    int lk[ND];
+    int64_t ldl[ND];
+    OutBucket obv[ND];
+    // the current device's index (0 for ND 1: constant, so the state stays in registers), NIC
+    // index, state, out link and its delay, out bucket
+    __device__ __forceinline__ int cd() const { return ND == 1 ? 0 : d; }
+    __device__ __forceinline__ int nic() const { return nic0 + cd(); }
+    __device__ __forceinline__ Host &st() { return stv[cd()]; }
+    __device__ __forceinline__ int link() const { return lk[cd()]; }
+    __device__ __forceinline__ int64_t ldelay() const { return ldl[cd()]; }
+    __device__ __forceinline__ OutBucket &ob() { return obv[cd()]; }
 };
+
+template <int ND>
+__device__ __forceinline__ void hsel(HCtx<ND> &c, int d)
+{
+    c.d = ND == 1 ? 0 : d;
+}
 
 __device__ __forceinline__ uint64_t bytes_left(const SndQP &q) { return q.size >= q.snd_nxt ? q.size - q.snd_nxt : 0; }
 
@@ -511,11 +667,12 @@ __device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
 }
 
 // QbbNetDevice::TransmitStart: TransmitComplete after tx, the peer's Receive after tx + delay
-__device__ __forceinline__ void h_transmit(HCtx &c, Pkt p)
+template <int ND>
+__device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
 {
     const Sim &s = *c.s;
-    int64_t tx = link_tx(s, c.link, p.size);
-    c.st.tc_at = c.now + tx;
+    int64_t tx = link_tx(s, c.link(), p.size);
+    c.st().tc_at = c.now + tx;
     if (c.P->simai && p.size > 60 && p.size < 9000)
     {
         // ns-3-alibabacloud's TransmitStart first schedules SendCallback (RdmaHw::SendPacketComplete,
@@ -524,40 +681,42 @@ __device__ __forceinline__ void h_transmit(HCtx &c, Pkt p)
         if (p.kind == K_DATA && s.sent[p.flow] < 0)
             s.sent[p.flow] = c.now + tx;
     }
-    cpush(&s.h_tc[c.h], ccode(tx, c.ord++), c.cur);
+    cpush(&s.h_tc[c.nic()], ccode(tx, c.ord++), c.cur);
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
     c.ord++;
     c.nout++;
-    int64_t ts = c.now + tx + c.ldelay;
-    LFrame *f = link_push(s, c.link, ts, c.ob);
+    int64_t ts = c.now + tx + c.ldelay();
+    LFrame *f = link_push(s, c.link(), ts, c.ob());
     if (!f)
         return;
     f->ts = ts;
     f->c = c.cur;
     f->p = p;
-    trace_tx(s, c.now, c.h, 0, p);
+    trace_tx(s, c.now, c.h, c.d, p);
 }
 
-__device__ __forceinline__ void h_schedule_ns(HCtx &c, int64_t at)
+template <int ND>
+__device__ __forceinline__ void h_schedule_ns(HCtx<ND> &c, int64_t at)
 {
-    c.st.ns_at = at;
-    cpush(&c.s->h_ns[c.h], ccode(at - c.now, c.ord++), c.cur);
+    c.st().ns_at = at;
+    cpush(&c.s->h_ns[c.nic()], ccode(at - c.now, c.ord++), c.cur);
 }
 
 // RdmaEgressQueue::GetNextQindex: -1 the ACK queue, -1024 none, else the QP's index in the group
-__device__ __forceinline__ int next_qindex(HCtx &c)
+template <int ND>
+__device__ __forceinline__ int next_qindex(HCtx<ND> &c)
 {
     const Sim &s = *c.s;
     int ackq = c.P->ack_high_prio ? 0 : PG;
-    if (!(c.st.paused >> ackq & 1) && c.st.ackq_n > 0)
+    if (!(c.st().paused >> ackq & 1) && c.st().ackq_n > 0)
         return -1;
-    int *list = s.qps + (size_t)c.h * s.qps_cap;
-    int res = -1024, fcount = c.st.qp_n, min_finish = INT_MAX;
+    int *list = s.qps + (size_t)c.nic() * s.qps_cap;
+    int res = -1024, fcount = c.st().qp_n, min_finish = INT_MAX;
     for (int qi = 1; qi <= fcount; qi++)
     {
-        int idx = (qi + c.st.rr) % fcount;
+        int idx = (qi + c.st().rr) % fcount;
         const SndQP &q = s.qp[list[idx]];
-        if (!(c.st.paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
+        if (!(c.st().paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
         {
             if (q.next_avail > c.now)
                 continue;
@@ -577,31 +736,32 @@ __device__ __forceinline__ int next_qindex(HCtx &c)
                     res = nxt;
                 list[nxt++] = list[i];
             }
-        c.st.qp_n = nxt;
+        c.st().qp_n = nxt;
     }
     return res;
 }
 
 // QbbNetDevice::DequeueAndTransmit on a host
-__device__ __forceinline__ void h_dequeue(HCtx &c)
+template <int ND>
+__device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
 {
     const Sim &s = *c.s;
-    if (c.st.tc_at >= 0)
+    if (c.st().tc_at >= 0)
         return;
     int idx = next_qindex(c);
     if (idx == -1)
     {
-        Pkt p = s.ackq[(size_t)c.h * s.ackq_cap + c.st.ackq_head];
-        c.st.ackq_head = (c.st.ackq_head + 1) % s.ackq_cap;
-        c.st.ackq_n--;
+        Pkt p = s.ackq[(size_t)c.nic() * s.ackq_cap + c.st().ackq_head];
+        c.st().ackq_head = (c.st().ackq_head + 1) % s.ackq_cap;
+        c.st().ackq_n--;
         h_transmit(c, p);
         return;
     }
-    int *list = s.qps + (size_t)c.h * s.qps_cap;
+    int *list = s.qps + (size_t)c.nic() * s.qps_cap;
     if (idx >= 0)
     {
         int f = list[idx];
-        c.st.rr = idx;
+        c.st().rr = idx;
         SndQP &q = s.qp[f];
         // RdmaHw::GetNxtPacket
         uint64_t left = bytes_left(q);
@@ -622,23 +782,24 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
         return;
     }
     int64_t t = INT64_MAX;
-    for (int i = 0; i < c.st.qp_n; i++)
+    for (int i = 0; i < c.st().qp_n; i++)
     {
         const SndQP &q = s.qp[list[i]];
         if (bytes_left(q) == 0 && !c.P->simai) // ns-3-alibabacloud dropped this skip
             continue;
         t = q.next_avail < t ? q.next_avail : t;
     }
-    if (c.st.ns_at < 0 && t < INT64_MAX && t > c.now)
+    if (c.st().ns_at < 0 && t < INT64_MAX && t > c.now)
         h_schedule_ns(c, t);
 }
 
 // RdmaHw::ChangeRate (and QbbNetDevice::UpdateNextAvail)
-__device__ __forceinline__ void change_rate(HCtx &c, SndQP &q, uint64_t new_rate)
+template <int ND>
+__device__ __forceinline__ void change_rate(HCtx<ND> &c, SndQP &q, uint64_t new_rate)
 {
     int64_t st = qp_tx(*c.P, q, q.rate, q.last_pkt), nt = qp_tx(*c.P, q, new_rate, q.last_pkt);
     q.next_avail = q.next_avail + nt - st;
-    if (c.st.ns_at >= 0 && q.next_avail < c.st.ns_at)
+    if (c.st().ns_at >= 0 && q.next_avail < c.st().ns_at)
         h_schedule_ns(c, q.next_avail < c.now ? c.now : q.next_avail);
     q.rate = new_rate;
 }
@@ -670,7 +831,8 @@ __device__ __forceinline__ void hpcc_hops(const Params &P, const uint64_t *ph, i
 
 // RdmaHw::UpdateRateHp, one rate for the path (MULTI_RATE 0). pre: U and dt computed ahead
 // (hpcc_hops, in the host's prologue)
-__device__ __forceinline__ void hpcc_update(HCtx &c, SndQP &q, const Pkt &p, bool fast)
+template <int ND>
+__device__ __forceinline__ void hpcc_update(HCtx<ND> &c, SndQP &q, const Pkt &p, bool fast)
 {
     const Params &P = *c.P;
     uint32_t next_seq = (uint32_t)q.snd_nxt;
@@ -749,7 +911,8 @@ __device__ __forceinline__ void hpcc_update(HCtx &c, SndQP &q, const Pkt &p, boo
 }
 
 // RdmaHw::cnp_received_mlx
-__device__ __forceinline__ void dcqcn_cnp(HCtx &c, int f, SndQP &q)
+template <int ND>
+__device__ __forceinline__ void dcqcn_cnp(HCtx<ND> &c, int f, SndQP &q)
 {
     const Sim &s = *c.s;
     q.alpha_cnp = 1;
@@ -768,7 +931,8 @@ __device__ __forceinline__ void dcqcn_cnp(HCtx &c, int f, SndQP &q)
 }
 
 // the DCQCN timers: 0 UpdateAlphaMlx, 1 CheckRateDecreaseMlx, 2 RateIncEventTimerMlx
-__device__ __forceinline__ void dcqcn_timer(HCtx &c, int f, int kind)
+template <int ND>
+__device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
 {
     const Sim &s = *c.s;
     const Params &P = *c.P;
@@ -815,7 +979,8 @@ __device__ __forceinline__ void dcqcn_timer(HCtx &c, int f, int kind)
 }
 
 // RdmaHw::ReceiveAck (ACK and NACK)
-__device__ __forceinline__ void h_ack(HCtx &c, const Pkt &p)
+template <int ND>
+__device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
 {
     const Sim &s = *c.s;
     int f = p.flow;
@@ -825,6 +990,7 @@ __device__ __forceinline__ void h_ack(HCtx &c, const Pkt &p)
         atomicAdd(&s.ev[10], 1ull); // m_qpMap no longer has it
         return;
     }
+    hsel(c, q.nic); // the queue pair's NIC (GetNicIdxOfQp): rate changes, TriggerTransmit
     if (p.seq > q.snd_una)
         q.snd_una = p.seq;
     if (q.snd_una >= q.size)
@@ -850,7 +1016,8 @@ __device__ __forceinline__ void h_ack(HCtx &c, const Pkt &p)
 }
 
 // RdmaHw::ReceiveUdp
-__device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
+template <int ND>
+__device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
 {
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
@@ -895,25 +1062,29 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
     a.cnp = p.ecn ? 1 : 0;
     a.ecn = 0;
     a.size = (uint16_t)ack_size(*c.P);
-    if (c.st.ackq_n >= s.ackq_cap)
+    hsel(c, s.fi[p.flow].rnic); // the receiving queue pair's NIC (GetNicIdxOfRxQp)
+    if (c.st().ackq_n >= s.ackq_cap)
     {
         atomicAdd(&s.ev[6], 1ull);
         return;
     }
-    s.ackq[(size_t)c.h * s.ackq_cap + (c.st.ackq_head + c.st.ackq_n) % s.ackq_cap] = a;
-    c.st.ackq_n++;
+    s.ackq[(size_t)c.nic() * s.ackq_cap + (c.st().ackq_head + c.st().ackq_n) % s.ackq_cap] = a;
+    c.st().ackq_n++;
     h_dequeue(c);
 }
 
 // RdmaClient::StartApplication -> RdmaHw::AddQueuePair -> QbbNetDevice::NewQp
-__device__ __forceinline__ void h_start(HCtx &c, int f)
+template <int ND>
+__device__ __forceinline__ void h_start(HCtx<ND> &c, int f)
 {
     const Sim &s = *c.s;
     const FlowInfo &fi = s.fi[f];
     SndQP &q = s.qp[f];
     q = SndQP{};
     q.size = fi.size;
-    const uint64_t nic = s.li[c.link].bps;
+    hsel(c, fi.snic); // GetNicIdxOfQp
+    q.nic = fi.snic;
+    const uint64_t nic = s.li[c.link()].bps;
     q.rate = q.max_rate = nic;
     q.win = fi.win;
     q.base_rtt = fi.base_rtt;
@@ -924,12 +1095,12 @@ __device__ __forceinline__ void h_start(HCtx &c, int f)
     q.cur_rate = nic;
     q.u = 1;
     q.next_avail = c.now;
-    if (c.st.qp_n >= s.qps_cap)
+    if (c.st().qp_n >= s.qps_cap)
     {
         atomicAdd(&s.ev[7], 1ull);
         return;
     }
-    s.qps[(size_t)c.h * s.qps_cap + c.st.qp_n++] = f;
+    s.qps[(size_t)c.nic() * s.qps_cap + c.st().qp_n++] = f;
     h_dequeue(c);
 }
 
@@ -964,36 +1135,49 @@ struct HArr
 };
 constexpr int HPOOL = 64;
 
-// A host's slot, run by the lanes of one wave: they load the slot's arrivals into LDS and compute
-// HPCC's per-hop utilizations of its ACKs (with FAST_REACT and without SAMPLE_FEEDBACK an ACK's
-// depend only on it and on the hops of the QP's previous ACK, so they need not wait for the
-// events); lane 0 then runs the events.
+// A host's slot, run by the lanes of one wave: they load the slot's arrivals (of all its devices)
+// into LDS and compute HPCC's per-hop utilizations of its ACKs (with FAST_REACT and without
+// SAMPLE_FEEDBACK an ACK's depend only on it and on the hops of the QP's previous ACK, so they need
+// not wait for the events; a flow's ACKs all arrive on one device); lane 0 then runs the events.
+// hints: [0] the arrivals, [1 + 2 d] device d's first frame in s.msg, [2 + 2 d] its count
+constexpr int HHINTS = 1 + 2 * MAXD;
+// ND: the most devices a host of this kind has (1: one NIC, its state stays in registers)
+template <int ND>
 __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints)
 {
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
-    const int link_in = s.in_link[(size_t)h * s.K];
-    const int64_t in_delay = s.li[link_in].delay;
     const Params &WP = s.Pw[s.h_world[h]];
+    const int nd = ND == 1 ? 1 : s.deg[h];
     (void)t0;
     if (lane == 0)
     {
-        uint32_t base;
-        hints[0] = bucket(s, link_in, slot, &base);
-        hints[1] = (int)base;
+        int total = 0;
+        for (int d = 0; d < nd; d++)
+        {
+            uint32_t base;
+            int n = bucket(s, s.in_link[(size_t)h * s.K + d], slot, &base);
+            hints[1 + 2 * d] = (int)base;
+            hints[2 + 2 * d] = n;
+            total += n;
+        }
+        hints[0] = total;
     }
     __syncthreads();
     const int total = hints[0];
-    const uint32_t abase = (uint32_t)hints[1];
     const bool pooled = total <= HPOOL;
     if (pooled)
         for (int j = lane; j < total; j += lanes)
         {
-            uint32_t fi = abase + j;
+            int d = 0, k = j;
+            while (k >= hints[2 + 2 * d])
+                k -= hints[2 + 2 * d++];
+            int link_in = s.in_link[(size_t)h * s.K + d];
+            uint32_t fi = (uint32_t)hints[1 + 2 * d] + k;
             const LFrame &f = s.msg[fi];
             HArr &a = pool[j];
             a.ts = f.ts;
             a.p = f.p;
-            a.acode = arrival_code(s, link_in, in_delay, f);
+            a.acode = arrival_code(s, link_in, s.li[link_in].delay, f);
             a.frame = fi;
             a.pre = 0;
         }
@@ -1017,125 +1201,168 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     __syncthreads();
     if (lane != 0)
         return false;
-    HCtx c;
+    HCtx<ND> c;
     c.s = &s;
     c.P = &WP;
     c.h = h;
-    c.st = s.hs[h];
     c.slot = slot;
-    c.link = s.out_link[(size_t)h * s.K];
-    c.ldelay = s.li[c.link].delay;
-    c.ob.hi = 0;
     c.nout = 0;
     c.pre_ok = false;
-    Arrivals in;
-    in.init(s, link_in, slot);
-    int ai = 0; // the next pooled arrival
+    c.nd = nd;
+    c.nic0 = s.nic_off[h];
+    // per device: its state, out link, arrivals (a range of the pool, or a cursor in its bucket)
+    Arrivals in[ND];
+    int ai[ND], aend[ND], lin[ND];
+    int64_t indl[ND];
+    for (int d = 0, b = 0; d < nd; d++)
+    {
+        c.stv[d] = s.hs[c.nic0 + d];
+        c.lk[d] = s.out_link[(size_t)h * s.K + d];
+        c.ldl[d] = s.li[c.lk[d]].delay;
+        c.obv[d].hi = 0;
+        lin[d] = s.in_link[(size_t)h * s.K + d];
+        indl[d] = s.li[lin[d]].delay;
+        if (pooled)
+        {
+            ai[d] = b;
+            aend[d] = b += hints[2 + 2 * d];
+        }
+        else
+            in[d].init(s, lin[d], slot);
+    }
+    hsel(c, 0);
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
     Due due[MAX_DUE];
-    int nd = 0;
-    const int *list = s.qps + (size_t)h * s.qps_cap;
+    int ndue = 0;
     if (WP.cc == 1)
-        for (int i = 0; i < c.st.qp_n; i++)
+        for (int d = 0; d < nd; d++)
         {
-            const SndQP &q = s.qp[list[i]];
-            int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
-            for (int k = 0; k < 3; k++)
-                if (t[k] >= 0 && t[k] < t1)
-                {
-                    if (nd == MAX_DUE)
+            const int *list = s.qps + (size_t)(c.nic0 + d) * s.qps_cap;
+            for (int i = 0; i < c.stv[d].qp_n; i++)
+            {
+                const SndQP &q = s.qp[list[i]];
+                int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
+                for (int k = 0; k < 3; k++)
+                    if (t[k] >= 0 && t[k] < t1)
                     {
-                        atomicAdd(&s.ev[12], 1ull);
-                        continue;
+                        if (ndue == MAX_DUE)
+                        {
+                            atomicAdd(&s.ev[12], 1ull);
+                            continue;
+                        }
+                        Due x = {t[k], list[i], k};
+                        int j = ndue++;
+                        while (j > 0 && before(s, x.at, 0, due_chain(s, x), due[j - 1].at, 0, due_chain(s, due[j - 1])))
+                        {
+                            due[j] = due[j - 1];
+                            j--;
+                        }
+                        due[j] = x;
                     }
-                    Due d = {t[k], list[i], k};
-                    int j = nd++;
-                    while (j > 0 && before(s, d.at, 0, due_chain(s, d), due[j - 1].at, 0, due_chain(s, due[j - 1])))
-                    {
-                        due[j] = due[j - 1];
-                        j--;
-                    }
-                    due[j] = d;
-                }
+            }
         }
     int di = 0;
-    uint32_t acode = 0;
-    int64_t ats = 0, sf_t = INT64_MAX;
+    uint32_t acode[ND];
+    int64_t ats[ND], sf_t = INT64_MAX;
+    const LFrame *af[ND];
+    for (int d = 0; d < nd; d++)
+        af[d] = nullptr;
     int sf = -1, sf_at = -1;
-    const LFrame *af = nullptr;
-    bool act = false;
+    Host &h0 = c.stv[0]; // the host's flow starts
     for (;;)
     {
-        // candidates: 0 arrival, 1 TransmitComplete, 2 m_nextSend, 3 a DCQCN timer, 4 a flow start
-        // (the arrival's and the flow start's times are kept between events)
-        if (!af)
-        {
-            if (pooled)
+        // candidates: 0 an arrival, 1 a TransmitComplete, 2 an m_nextSend (each per device), 3 a
+        // DCQCN timer, 4 a flow start (the arrivals' and the flow start's times are kept between
+        // events)
+        for (int d = 0; d < nd; d++)
+            if (!af[d])
             {
-                if (ai < total)
+                if (pooled)
                 {
-                    af = &s.msg[pool[ai].frame];
-                    acode = pool[ai].acode;
-                    ats = pool[ai].ts;
+                    if (ai[d] < aend[d])
+                    {
+                        af[d] = &s.msg[pool[ai[d]].frame];
+                        acode[d] = pool[ai[d]].acode;
+                        ats[d] = pool[ai[d]].ts;
+                    }
+                }
+                else
+                {
+                    af[d] = in[d].peek();
+                    if (af[d])
+                    {
+                        acode[d] = arrival_code(s, lin[d], indl[d], *af[d]);
+                        ats[d] = af[d]->ts;
+                    }
                 }
             }
-            else
-            {
-                af = in.peek();
-                if (af)
-                {
-                    acode = arrival_code(s, link_in, in_delay, *af);
-                    ats = af->ts;
-                }
-            }
-        }
-        while (di < nd && due_now(s, due[di]) != due[di].at)
+        while (di < ndue && due_now(s, due[di]) != due[di].at)
             di++; // cancelled or moved
-        if (sf_at != c.st.next_start)
+        if (sf_at != h0.next_start)
         {
-            sf_at = c.st.next_start;
-            sf = sf_at < c.st.start_end ? s.start_list[sf_at] : -1;
+            sf_at = h0.next_start;
+            sf = sf_at < h0.start_end ? s.start_list[sf_at] : -1;
             sf_t = sf >= 0 ? s.fi[sf].start : INT64_MAX;
         }
-        // a candidate's chain is cpush(code(k), chain(k)). The selection keeps only indices: a
+        // a candidate's chain is cpush(code(k, d), chain(k, d)). The selection keeps only indices: a
         // version that carried a pointer to the best candidate's chain along gave wrong results at
         // -O2 and above (the pointer was stale at a flow start), and right ones at -O1
-        auto code = [&](int k) -> uint32_t { return k == 0 ? acode : 0; };
-        auto chain = [&](int k) -> const Chain & {
-            return k == 0 ? af->c : k == 1 ? s.h_tc[h] : k == 2 ? s.h_ns[h] : k == 3 ? due_chain(s, due[di]) : s.fi[sf].start_chain;
+        auto code = [&](int k, int d) -> uint32_t { return k == 0 ? acode[d] : 0; };
+        auto chain = [&](int k, int d) -> const Chain & {
+            return k == 0   ? af[d]->c
+                   : k == 1 ? s.h_tc[c.nic0 + d]
+                   : k == 2 ? s.h_ns[c.nic0 + d]
+                   : k == 3 ? due_chain(s, due[di])
+                            : s.fi[sf].start_chain;
         };
-        int64_t ct[5];
-        ct[0] = af ? ats : INT64_MAX;
-        ct[1] = c.st.tc_at >= 0 && c.st.tc_at < t1 ? c.st.tc_at : INT64_MAX;
-        ct[2] = c.st.ns_at >= 0 && c.st.ns_at < t1 ? c.st.ns_at : INT64_MAX;
-        ct[3] = di < nd ? due[di].at : INT64_MAX;
-        ct[4] = sf_t < t1 ? sf_t : INT64_MAX;
-        int best = -1;
+        auto ctime = [&](int k, int d) -> int64_t {
+            if (k == 0)
+                return af[d] ? ats[d] : INT64_MAX;
+            if (k == 1)
+                return c.stv[d].tc_at >= 0 && c.stv[d].tc_at < t1 ? c.stv[d].tc_at : INT64_MAX;
+            if (k == 2)
+                return c.stv[d].ns_at >= 0 && c.stv[d].ns_at < t1 ? c.stv[d].ns_at : INT64_MAX;
+            if (k == 3)
+                return di < ndue ? due[di].at : INT64_MAX;
+            return sf_t < t1 ? sf_t : INT64_MAX;
+        };
+        int bk = -1, bd = 0;
+        int64_t bt = INT64_MAX;
         for (int k = 0; k < 5; k++)
-            if (ct[k] != INT64_MAX && (best < 0 || before(s, ct[k], code(k), chain(k), ct[best], code(best), chain(best))))
-                best = k;
-        if (best < 0)
+            for (int d = 0; d < (k < 3 ? nd : 1); d++)
+            {
+                int64_t t = ctime(k, d);
+                if (t != INT64_MAX && (bk < 0 || before(s, t, code(k, d), chain(k, d), bt, code(bk, bd), chain(bk, bd))))
+                {
+                    bk = k;
+                    bd = d;
+                    bt = t;
+                }
+            }
+        if (bk < 0)
             break;
-        c.now = ct[best];
-        if (code(best))
-            cpush(&c.cur, code(best), chain(best));
+        c.now = bt;
+        if (code(bk, bd))
+            cpush(&c.cur, code(bk, bd), chain(bk, bd));
         else
-            c.cur = chain(best);
+            c.cur = chain(bk, bd);
         c.ord = 0;
-        trace_event(h, c.now, best == 0 ? "arrival" : best == 1 ? "tc" : best == 2 ? "nextsend" : best == 3 ? "timer" : "start", 0, c.cur);
-        if (best == 0)
+        trace_event(h, c.now, bk == 0 ? "arrival" : bk == 1 ? "tc" : bk == 2 ? "nextsend" : bk == 3 ? "timer" : "start", bd, c.cur);
+        if (bk < 3)
+            hsel(c, bd);
+        if (bk == 0)
         {
-            Pkt p = af->p;
+            Pkt p = af[bd]->p;
             if (pooled)
             {
-                c.pre_ok = pool[ai].pre;
-                c.pre_U = pool[ai].U;
-                c.pre_dt = pool[ai].dt;
-                ai++;
+                c.pre_ok = pool[ai[bd]].pre;
+                c.pre_U = pool[ai[bd]].U;
+                c.pre_dt = pool[ai[bd]].dt;
+                ai[bd]++;
             }
             else
-                in.pop();
-            af = nullptr;
+                in[bd].pop();
+            af[bd] = nullptr;
             if (p.kind == K_DATA)
                 h_data(c, p);
             else if (p.kind == K_ACK || p.kind == K_NACK)
@@ -1146,62 +1373,69 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             else if (WP.qbb)
             {
                 if (p.kind == K_PAUSE)
-                    c.st.paused |= 1u << p.q;
+                    c.st().paused |= 1u << p.q;
                 else
                 {
-                    c.st.paused &= ~(1u << p.q);
+                    c.st().paused &= ~(1u << p.q);
                     h_dequeue(c);
                 }
             }
         }
-        else if (best == 1)
+        else if (bk == 1)
         {
-            c.st.tc_at = -1;
+            c.st().tc_at = -1;
             h_dequeue(c);
         }
-        else if (best == 2)
+        else if (bk == 2)
         {
-            c.st.ns_at = -1;
+            c.st().ns_at = -1;
             h_dequeue(c);
         }
-        else if (best == 3)
+        else if (bk == 3)
         {
-            Due d = due[di++];
-            dcqcn_timer(c, d.flow, d.kind);
+            Due x = due[di++];
+            dcqcn_timer(c, x.flow, x.kind);
         }
         else
         {
-            c.st.next_start++;
+            h0.next_start++;
             h_start(c, sf);
         }
     }
-    link_flush(s, c.ob);
-    act = c.nout > 0 || c.st.ackq_n > 0 || c.st.tc_at >= 0;
+    bool act = c.nout > 0;
     // the earliest event without input
     int64_t w = INT64_MAX;
-    if (c.st.ns_at >= 0)
-        w = c.st.ns_at;
-    if (c.st.next_start < c.st.start_end)
+    if (h0.next_start < h0.start_end)
+        w = s.fi[s.start_list[h0.next_start]].start;
+    for (int d = 0; d < nd; d++)
     {
-        int64_t t = s.fi[s.start_list[c.st.next_start]].start;
-        w = t < w ? t : w;
-    }
-    if (WP.cc == 1)
-        for (int i = 0; i < c.st.qp_n; i++)
+        link_flush(s, c.obv[d]);
+        const Host &st = c.stv[d];
+        if (st.ackq_n > 0 || st.tc_at >= 0)
+            act = true;
+        if (st.ns_at >= 0 && st.ns_at < w)
+            w = st.ns_at;
+        if (WP.cc == 1)
         {
-            const SndQP &q = s.qp[list[i]];
-            int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
-            for (int k = 0; k < 3; k++)
-                if (t[k] >= 0 && t[k] < w)
-                    w = t[k];
+            const int *list = s.qps + (size_t)(c.nic0 + d) * s.qps_cap;
+            for (int i = 0; i < st.qp_n; i++)
+            {
+                const SndQP &q = s.qp[list[i]];
+                int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
+                for (int k = 0; k < 3; k++)
+                    if (t[k] >= 0 && t[k] < w)
+                        w = t[k];
+            }
         }
+        s.hs[c.nic0 + d] = st;
+    }
     *wake = w;
-    s.hs[h] = c.st;
     return act;
 }
 
 // ------------------------------------------------------------------ switch
-constexpr int KMAX = 64;
+constexpr int KMAX = 192;  // ports of a switch (LDS: see switch_block)
+constexpr int KSMALL = 64; // switches with more ports run in rdma_slot_big
 
 // A switch's slot workspace in LDS, per port: its Port, its arrivals of this slot (a range of the
 // pool, or, when the pool overflows, a cursor in the frames of slots s - 2 then s - 1), and the
@@ -1254,6 +1488,7 @@ struct SCtx
     // a safe slot (see switch_step): each lane runs one egress port's events; the MMU's ingress
     // counters are summed with LDS atomics, and shared_used is recomputed at the end
     bool safe;
+    bool nvs; // an NVSwitch
 };
 
 __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
@@ -1414,7 +1649,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
                    port + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, p.inport), p.src, p.dst, p.seq, pt.q3_n);
 #endif
     }
-    if (P.ecn)
+    if (P.ecn && !c.nvs)
     {
         // SwitchMmu::ShouldSendCN
         bool mark = false;
@@ -1433,7 +1668,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
         }
     }
     // CheckAndSendResume (never in a safe slot: no port is paused)
-    if (!c.safe && in.mmu_paused)
+    if (!c.safe && in.mmu_paused && !c.nvs)
     {
         uint32_t su = shared_used(in);
         if (in.hdrm == 0 && (su == 0 || su + RESUME_OFFSET <= pfc_thresh(c, p.inport)))
@@ -1442,7 +1677,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
             in.mmu_paused = 0;
         }
     }
-    if (p.kind == K_DATA && P.cc == 3 && p.nhop < 0xFFFF)
+    if (p.kind == K_DATA && P.cc == 3 && p.nhop < 0xFFFF && !c.nvs)
     {
         p.hop[p.nhop % MAX_HOP] = hop_make((uint64_t)c.now, pt.tx_bytes, pt.bytes_total, pcfg(c, port).bps, P.int_multi);
         p.nhop++;
@@ -1466,7 +1701,7 @@ __device__ __forceinline__ int s_route(const Sim &s, const Params &P, int x, con
         return -1;
     uint32_t w2 = data ? (p.sport | 100u << 16) : (100u | (uint32_t)p.sport << 16);
     uint32_t hsh = ecmp_hash(node_ip(src), node_ip(dst), w2, si.seed);
-    return rt.port[hsh % rt.n];
+    return s.rtp[rt.off + hsh % rt.n];
 }
 
 __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, int q)
@@ -1509,7 +1744,7 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
                    out + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, inport), p.src, p.dst, p.seq, c.w[out].pt.q3_n);
 #endif
         // CheckAndSendPfc
-        if (!in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c, inport)))
+        if (!c.nvs && !in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c, inport)))
         {
             s_send_pfc(c, inport, 0);
             in.mmu_paused = 1;
@@ -1573,12 +1808,14 @@ __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPort
 //  - otherwise lane 0 runs all events in order.
 // Last, the lanes store the ports back together.
 constexpr int SAFE_LANES = 32; // safe slots need a lane per port
-// the LDS int workspace of a switch with K ports, then LK arrival keys: their times in the slot,
-// egress ports, and two index lists (uint16, uint8, 2 x uint16)
+// the LDS int workspace of a switch with K ports (the merge cursors only for safe slots, which
+// have at most SAFE_LANES ports), then LK arrival keys: their times in the slot, egress ports, and
+// two index lists (uint16, uint8, 2 x uint16)
 constexpr int LK = 512;
-__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)K * K + (LK * 7 + 3) / 4; }
+__host__ __device__ inline int sw_ks(int K) { return K < SAFE_LANES ? K : SAFE_LANES; }
+__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)sw_ks(K) * sw_ks(K) + (LK * 7 + 3) / 4; }
 __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
-                                            int *shared_int)
+                                            int *shared_int, int K)
 {
     Chain *tcs = s.p_tc + s.pbase[x];
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
@@ -1588,7 +1825,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     // ports, and the bounds of their arrivals: at most the last frame of slot s - 2 (a frame
     // arrives within one transmission of the link's delay), and the frames of slot s - 1 but
     // perhaps the last
-    const int K = s.K;
+    // (K: the ports its LDS workspace has room for)
+    const int KS = sw_ks(K);
     int *cnt = shared_int, *first = shared_int + K; // per port: arrivals, the first in slot s - 2's list
     uint32_t *abytes = (uint32_t *)(shared_int + 2 * K); // bytes arriving for queue PG
     uint32_t *ing0 = (uint32_t *)(shared_int + 3 * K);   // ing at the slot's start
@@ -1596,7 +1834,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     int *mcur = shared_int + 6 * K;                       // safe: merge cursors [egress][ingress]
     // safe: per arrival its time in the slot and its egress port; pool indices by egress port, in
     // order; the next arrival of its ingress with the same egress
-    uint16_t *kts = (uint16_t *)(mcur + K * K), *olist = kts + LK, *onext = olist + LK;
+    uint16_t *kts = (uint16_t *)(mcur + KS * KS), *olist = kts + LK, *onext = olist + LK;
     int8_t *own = (int8_t *)(onext + LK);
     (void)pidx;
     for (int p = lane; p < deg; p += lanes)
@@ -1690,14 +1928,14 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             for (int q = 0; q < p; q++)
                 b += cnt[q];
             for (int o = 0; o < deg; o++)
-                mcur[o * K + p] = -1;
+                mcur[o * KS + p] = -1;
             for (int k = b + cnt[p] - 1; k >= b; k--)
             {
                 int o = own[k];
                 if (o < 0)
                     continue;
-                onext[k] = (uint16_t)mcur[o * K + p]; // (-1, the end: 0xFFFF)
-                mcur[o * K + p] = k;
+                onext[k] = (uint16_t)mcur[o * KS + p]; // (-1, the end: 0xFFFF)
+                mcur[o * KS + p] = k;
             }
         }
         __syncthreads();
@@ -1707,7 +1945,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             for (int p = 0; p < o; p++)
                 base += ocnt[p];
             obase[o] = base;
-            int *cur = mcur + o * K;
+            int *cur = mcur + o * KS;
             // the ingress ports with arrivals left for o: their cursors packed at the front of
             // cur, in port order
             int na = 0;
@@ -1758,6 +1996,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             c.tc = tcs;
             c.pool = pool;
             c.safe = true;
+            c.nvs = s.si[x].nvs;
             c.P = &WP;
             int oi = obase[o], oe = obase[o] + ocnt[o];
             SwPortLds &me = w[o];
@@ -1841,6 +2080,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.tc = tcs;
         c.pool = pooled ? pool : nullptr;
         c.safe = false;
+        c.nvs = s.si[x].nvs;
         c.P = &WP;
         int base = 0;
         for (int p = 0; p < deg; p++)
@@ -2045,6 +2285,7 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
 // A block (one wave) per host and per switch. A block's lanes load its slot's inputs together,
 // then the first lane runs its events (entities sharing a wave would diverge and run in turn).
 // Their LDS is kept small: it bounds how many blocks a CU holds.
+template <int ND>
 __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
 {
     int64_t slot = *s.slot;
@@ -2055,7 +2296,7 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
     int64_t w = INT64_MAX;
     HArr *pool = reinterpret_cast<HArr *>(smem);
     int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
-    bool act = host_step(s, h, slot, &w, lane, lanes, pool, hints);
+    bool act = host_step<ND>(s, h, slot, &w, lane, lanes, pool, hints);
 #ifdef RDMA_PROF
     if (lane == 0)
         atomicMax(&s.ev[16], (unsigned long long)(clock64() - p0));
@@ -2064,7 +2305,7 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
         slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
 }
 
-__device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem)
+__device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, int kl)
 {
     int64_t slot = *s.slot;
     int lane = threadIdx.x, lanes = blockDim.x;
@@ -2074,14 +2315,14 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem)
     // a switch's workspace: its ports and ints in LDS, its arrival pool and its index lists in
     // global memory
     SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
-    int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds));
+    int *ints = reinterpret_cast<int *>(smem + (size_t)kl * sizeof(SwPortLds));
     ArrLds *pool = s.apool + (size_t)x * POOL;
     int *pidx = s.aidx + (size_t)x * 2 * POOL;
     __shared__ int blk_act;
     if (lane == 0)
         blk_act = 0;
     __syncthreads();
-    if (switch_step(s, x, slot, w, pool, pidx, lane, lanes, ints))
+    if (switch_step(s, x, slot, w, pool, pidx, lane, lanes, ints, kl))
         blk_act = 1; // (any lane: the ports are spread over them)
     __syncthreads();
 #ifdef RDMA_PROF
@@ -2098,10 +2339,28 @@ __global__ void rdma_slot(Sim s)
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
-    if (blockIdx.x < s.H)
-        host_block(s, blockIdx.x, smem);
+    if ((int)blockIdx.x < s.n1)
+        host_block<1>(s, s.hlist1[blockIdx.x], smem);
     else
-        switch_block(s, blockIdx.x - s.H, smem);
+        switch_block(s, s.slist_s[blockIdx.x - s.n1], smem, s.ks);
+}
+
+// the switches with many ports (spines), alongside rdma_slot
+__global__ void rdma_slot_big(Sim s)
+{
+    extern __shared__ __align__(16) char smem[];
+    if (*s.finished)
+        return;
+    switch_block(s, s.slist_b[blockIdx.x], smem, s.kb);
+}
+
+// the hosts with several devices (GPUs), alongside rdma_slot
+__global__ void rdma_slot_m(Sim s)
+{
+    extern __shared__ __align__(16) char smem[];
+    if (*s.finished)
+        return;
+    host_block<MAXD>(s, s.hlistm[blockIdx.x], smem);
 }
 
 } // namespace rdma

@@ -51,18 +51,22 @@ enum : uint8_t
 // where they differ (siblings in the order they were scheduled; see ccmp). A chain ends at a
 // flow's StartApplication (see the host), which records its own lineage and a root key, the
 // flow's place in the start order. When the runs overflow, the oldest spills into a TailNode.
+// hash: of the leads pushed since the root's StartApplication; anc: the hashes of its ancestors
+// NANC levels down (see ccmp: comparisons decided by the leads are remembered by these hashes)
 struct Run
 {
     uint32_t code, cnt;
 };
+constexpr int NANC = 4;
 struct Chain
 {
     Run r[RUNS];
     uint64_t tail;  // the runs after r[RUNS - 1]: a TailNode (its position + 1; 0: none)
-    uint32_t root;  // 1 + the flow's index in start order (0: none)
+    uint64_t hash, anc[NANC];
+    uint32_t root;  // 1 + the flow's index in start order, over all worlds (0: none)
     uint32_t pad;
 };
-static_assert(sizeof(Chain) == 8 * RUNS + 16, "Chain");
+static_assert(sizeof(Chain) == 8 * RUNS + 24 + 8 * NANC, "Chain");
 
 // The older runs of long chains, in a ring shared by all chains: a node is immutable, and pos
 // (its position + 1) tells whether the ring has since overwritten it.
@@ -111,6 +115,7 @@ struct SndQP
     uint32_t win;
     uint64_t base_rtt;
     uint8_t done;            // QpComplete ran (the QP left m_qpMap)
+    uint8_t nic;             // its device (GetNicIdxOfQp)
     // DCQCN, Mellanox's version (mlx)
     uint8_t alpha_cnp, dec_cnp, first_cnp;
     uint32_t rp_stage;
@@ -143,11 +148,11 @@ struct RcvQP
 };
 
 // a switch's equal-cost ports (in table order) towards a host
-constexpr int RT_PORTS = 15;
+// (ports s.rtp[off] .. s.rtp[off + n - 1])
 struct Route
 {
-    uint8_t n;
-    uint8_t port[RT_PORTS];
+    uint32_t off;
+    uint32_t n;
 };
 
 struct FlowInfo
@@ -159,6 +164,7 @@ struct FlowInfo
     uint32_t order;     // index in start order
     uint32_t win;       // its window and base RTT (maxBdp and maxRtt, or the pair's with GLOBAL_T 0)
     uint64_t base_rtt;
+    uint8_t snic, rnic; // its sender's device (GetNicIdxOfQp), its receiver's for ACKs (GetNicIdxOfRxQp)
     Chain start_chain;  // the chain of its StartApplication
 };
 
@@ -264,6 +270,7 @@ struct SwInfo
     uint32_t seed;
     int hbase;
     uint32_t rt_off;
+    uint32_t nvs; // an NVSwitch (NVSwitchNode: no PFC, ECN or INT)
 };
 
 // Worlds are independent networks run side by side (a batch): their hosts come first, then their
@@ -283,17 +290,28 @@ struct Sim
     int *deg, *out_link, *in_link, *link_dst, *link_dport;
     // routes: switch x towards host h of its world, rt[si[x].rt_off + h]
     struct Route *rt;
+    const uint8_t *rtp;
     FlowInfo *fi;
+    const Chain *root_chain; // [F] the start chain of root r at r - 1
     SndQP *qp;
     QPChains *qc;
     RcvQP *rx;
     int *start_list;   // flows by (src, start order)
-    // hosts
+    // hosts: per NIC (host h's devices are NICs nic_off[h] ..). Hosts with one device run in
+    // rdma_slot, those with more in rdma_slot_m (a kernel of its own: its larger per-lane state
+    // would hold back every block)
+    const int *nic_off; // [H + 1]
+    const int *hlist1, *hlistm; // the hosts of each kind
+    int n1, nm;
+    // switches with at most KSMALL ports run in rdma_slot, the others in rdma_slot_big; ks, kb:
+    // the ports each kernel's LDS has room for
+    const int *slist_s, *slist_b;
+    int ns_s, ns_b, ks, kb;
     Host *hs;
-    Chain *h_tc, *h_ns; // [H] chains of the pending TransmitComplete and m_nextSend
-    Pkt *ackq;          // [H][ackq_cap]
+    Chain *h_tc, *h_ns; // [NICs] chains of the pending TransmitComplete and m_nextSend
+    Pkt *ackq;          // [NICs][ackq_cap]
     int ackq_cap;
-    int *qps;           // [H][qps_cap] RdmaQueuePairGroup::m_qps
+    int *qps;           // [NICs][qps_cap] RdmaQueuePairGroup::m_qps
     int qps_cap;
     // switches
     Switch *sw;

@@ -1,0 +1,18 @@
+# GPU servers (NVSwitch, NVLink 2400-2880 Gb/s at 25 ns, NICs; HPN: two NICs per GPU) on SimAI's topologies
+g_sx16_ring sx16.topo g16_ring.csv
+g_sx16_cross sx16.topo g16_cross.csv
+g_sx16_intra sx16.topo g16_intra_a2a.csv
+g_sx16_incast sx16.topo g16_incast.csv
+g_sx16_incast_b1 sx16.topo g16_incast.csv BUFFER_SIZE=1
+g_sx16_mix sx16.topo g16_mix.csv
+g_dcn16_ring dcn16.topo g16_ring.csv
+g_dcn16_cross dcn16.topo g16_cross.csv
+g_dcn16_mix dcn16.topo g16_mix.csv
+g_dcn16_incast_b1 dcn16.topo g16_incast.csv BUFFER_SIZE=1
+g_hpn16_ring hpn16.topo g16_ring.csv
+g_hpn16_cross hpn16.topo g16_cross.csv
+g_hpn16_mix hpn16.topo g16_mix.csv
+g_hpn16_incast hpn16.topo g16_incast.csv
+g_sx16_mix_m1000 sx16.topo g16_mix.csv PACKET_PAYLOAD_SIZE=1000
+g_sx128_ring sx128.topo g128_ring.csv
+g_sx128_ring2 sx128.topo g128_ring2.csv
