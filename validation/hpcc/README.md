@@ -69,6 +69,11 @@ difference between the two transmission traces (`txdiff.py`).
 Both congestion controls run in each set. HPCC runs only where paths have at most 5 switches.
 Beyond that its INT header overflows and the fork writes past the end of `hp.hop[]`.
 
+Ties the chains do not decide, and ties decided on an overwritten tail node, are counted and
+reported. A larger `--tail` makes the ring longer. twins-rdma also warns about late data:
+data reaching a receiver after it already holds the flow's last byte (see below). Neither
+occurs in the 39 runs.
+
 **Finding differences.**
 1. `txdiff.py REF SIM` shows the first transmission that differs.
 2. `events.py TOPO TRACE NODE FROM UNTIL` lists one node's arrivals, starts and ends from a trace.

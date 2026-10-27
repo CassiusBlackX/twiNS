@@ -742,6 +742,10 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
     uint32_t payload = p.size - 48 - s.P.int_size;
+    // data for a flow received whole: if the sender has completed by now, ns-3 has deleted the
+    // receiving queue pair, and a new one would answer with a NACK (not modelled; needs a drop)
+    if (r.expected >= s.fi[p.flow].size)
+        atomicAdd(&s.ev[13], 1ull);
     // ReceiverCheckSeq (m_milestone_rx is reset to the ACK interval on every packet)
     int x;
     uint32_t expected = r.expected;

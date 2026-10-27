@@ -631,5 +631,11 @@ int main(int argc, char **argv)
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12];
     if (bad)
         fprintf(stderr, "warning: capacity overflow, results are not exact\n");
+    if (ev[13])
+        fprintf(stderr, "warning: %llu data frames reached receivers after their flows' last byte; if their senders had "
+                        "completed, ns-3 would answer them with NACKs (not modelled)\n", ev[13]);
+    if (ev[8] || ev[9])
+        fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
+                ev[8], ev[9]);
     return done == (unsigned)F && !bad ? 0 : 2;
 }

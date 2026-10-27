@@ -25,6 +25,18 @@ sweep below took 16 s, against 1,953 s for ns-3 on 32 cores.
 (Runs that need none of the general features, one message per connection, no FIN, per-flow ECMP
 on a FatTree or leaf-spine, use a lean kernel; the general model is 1.2–1.5× slower than it.)
 
+**RDMA.** A second program, `twins-rdma`, reproduces the HPCC simulator exactly. The HPCC
+simulator is the ns-3 fork that RDMA studies build on (ns3-rdma, ConWeave). twins-rdma models:
+- the RDMA NIC's queue pairs: rate pacing, windows, go-back-N;
+- PFC with the shared-buffer MMU's dynamic thresholds and headroom;
+- ECN marking at dequeue;
+- DCQCN and HPCC with INT.
+
+In 39 validation runs every flow's completion time equals the reference's. The runs span FatTree
+k=4–16, leaf-spine, Jellyfish, torus and Dragonfly, PFC storms, and every switch of the config.
+twins-rdma is 3.5–52× faster than the reference (30–52× on the larger workloads; incasts, whose
+hot switch serializes everything, 4–5×). See [RDMA](#rdma).
+
 ## Build
 
 ```shell
@@ -217,6 +229,56 @@ Short-flow tails are far from smooth in K. For example, with DCTCP at k=8, 30% l
 whether more than 1% of short flows hit the 1 ms minimum RTO. That is why approximate models are
 risky for such tuning.
 
+## RDMA
+
+```shell
+build/twins-rdma validation/hpcc/hpcc.cfg --topo=data/topo/fattree8.txt --flows=data/flows/k8_a2a30.csv \
+    --out=fct.txt [--txtrace=tx.txt] [CC_MODE=3 BUFFER_SIZE=2 KMAX_MAP=1,100000000000,800 ...]
+```
+
+- **Parameters.** twins-rdma reads the HPCC simulator's config files (`mix/config.txt`).
+  `KEY=VALUE` overrides a key; use `KEY=V1,V2,...` for keys with several values.
+- **Inputs.** The same topology files (`workloads/topo.py`) and flow files (`src,dst,flow_size,start_ns`)
+  as twins.
+- **Output.** One line per flow: `id start_ns fct_ns`.
+
+The reference is the HPCC fork's own scenario on these files. Two changes make it reproducible:
+- routes are ordered by node id instead of by heap address;
+- each switch port draws its ECN marks from its own random stream.
+
+The unpatched fork creates a new random variable per draw, whose stream depends on every
+variable created before it. `validation/hpcc/README.md` covers:
+- the reference and its container (the fork needs gcc 5);
+- the job files and the comparison tools;
+- what is not modelled: TIMELY, DCTCP-over-RDMA, HPCC-PINT, per-hop rates, link failures, mixed
+  link rates.
+
+**How it differs from the TCP model.**
+- **Switches.** A switch's MMU couples its ports: each PFC threshold depends on the
+  switch-wide shared buffer. So one wave runs a whole switch.
+  - Its lanes first load the slot's arriving frames (with their routes) and the heads of its
+    queues into LDS together.
+  - Lane 0 then runs the events in order.
+- **Chains.**
+  - Chains compare leads before ordinals. Ordinals order only the events one parent
+    schedules, and comparing them across parents was wrong.
+  - Chains are not truncated. Past 12 runs, the older runs spill into a shared ring of
+    immutable nodes, which a comparison follows when the recent runs tie. The 39 runs have no
+    undecided ties.
+
+| run | flows | reference | twins-rdma | speedup |
+|---|---|---|---|---|
+| k16 a2a30, DCQCN | 2253 | 199.8 s | 6.2 s | 32× |
+| k16 a2a30, HPCC | 2253 | 215.9 s | 7.0 s | 31× |
+| k8 a2a50s, HPCC | 12519 | 35.3 s | 1.08 s | 33× |
+| k8 permutation, HPCC | 382 | 10.6 s | 0.25 s | 43× |
+| leaf-spine a2a30, DCQCN | 541 | 30.4 s | 2.8 s | 11× |
+| Jellyfish a2a30, HPCC | 289 | 20.1 s | 1.6 s | 13× |
+| k8 incast64, 1 MB buffers (4315 pauses), DCQCN | 64 | 4.1 s | 0.90 s | 4.6× |
+
+These are wall times on the RX 9060 XT against the reference on one core of a Xeon Gold 5218.
+The reference times include the start of its container (about 0.4 s).
+
 ## Reproducing
 
 ```shell
@@ -242,6 +304,9 @@ them, see `validation/README.md`.
 | `data/ns3/sweep_k8/`, `sweep_k16/` | ns-3 outputs of the sweeps, `{workload}_{Tcp}_q{queue}_K{K}.csv` |
 | `data/gedes/` | GeDES-model outputs on the k=8 workloads, for `validation/noise.py` |
 | `data/twins_speed.csv` | TwiNS wall times behind the speed table |
+| `src/rdma/` | twins-rdma: `rdma.h` (state and execution model), `rstep.cuh` (NIC, switch, slot kernel), `rmain.cu` (driver) |
+| `validation/hpcc/` | the RDMA reference (`rdma-ref.cc`, `hpcc.patch`, container), job files, `check.sh`, `txdiff.py`, `events.py` |
+| `data/rdma/` | topologies and flow files of the RDMA runs |
 
 ## Limits
 
@@ -260,7 +325,8 @@ them, see `validation/README.md`.
   further back.
 - **Topology files.** Links all run at 100 Gbps with 1 µs delay (the slot is the propagation
   delay; mixed rates are not modelled yet); hosts have one link.
-- **Protocols.** Not yet modelled: RDMA with PFC (DCQCN, HPCC).
+- **Protocols.** RDMA (PFC, DCQCN, HPCC) is modelled by `twins-rdma`, against the HPCC
+  simulator rather than ns-3.46; see `validation/hpcc/README.md` for what it does not cover.
 - **What exactness is relative to.** It is defined against sequential ns-3.46.1 built with GCC
   `-march=native` on x86-64 (glibc 2.39). Other ns-3 versions or build flags may need
   realignment, which the queue-history diff makes mechanical.
