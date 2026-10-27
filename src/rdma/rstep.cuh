@@ -1493,6 +1493,8 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             }
         if (bk < 0)
             break;
+        if (bt < t0)
+            atomicAdd(&s.ev[32], 1ull); // an event of a slot not run (a bug: reported)
         c.now = bt;
         if (code(bk, bd))
             cpush(&c.cur, code(bk, bd), chain(bk, bd));

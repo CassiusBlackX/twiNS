@@ -1098,7 +1098,13 @@ int main(int argc, char **argv)
         s.wh_base = dev_copy(wh_base);
         s.wh_n = dev_copy(wh_n);
         s.wp_off = dev_copy(wp_off);
-        nbi = (int)(s.send_lat / D) + 3;
+        // a message is filed in the slot of the event that fires it (a SendCallback's: the frame's
+        // start, a tx earlier), so it arrives at most (send_lat + the longest tx) / D + 2 slots later
+        int64_t txmax = 0;
+        for (auto &w : worlds)
+            for (uint64_t r : w.lbps)
+                txmax = std::max(txmax, tx_ns(P.simai, r, w.P.mtu + 128));
+        nbi = (int)((s.send_lat + txmax) / D) + 3;
         s.nbi = nbi;
         s.dcap = 4096;
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
@@ -1242,8 +1248,8 @@ int main(int argc, char **argv)
         vector<long long> mc(ncnt, -(1ll << 16));
         s.msg_cnt = dev_copy(mc);
     }
-    s.pend_n = pend_n;
     pend_n = std::max(pend_n, nbi); // (a DAG message arrives send_lat after its event)
+    s.pend_n = pend_n;
     s.pend = dev_alloc<unsigned int>(pend_n);
     if (W == 1 && rates.size() > 1)
         printf("slot %lld ns, %zu link rates, %.1f MB of link buffers\n", (long long)D, rates.size(), nframes * sizeof(LFrame) / 1e6);
@@ -1270,7 +1276,7 @@ int main(int argc, char **argv)
         s.tx_from = tx_from;
         s.tx_until = tx_until;
     }
-    s.ev = dev_alloc<unsigned long long>(32);
+    s.ev = dev_alloc<unsigned long long>(40);
     {
         TailPool tp;
         uint64_t cap = 1ull << tail_log2;
@@ -1375,7 +1381,7 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
     if (s.dag) // the DAG flows' start times
         CK(cudaMemcpy(fi.data(), s.fi, F * sizeof(FlowInfo), cudaMemcpyDeviceToHost));
-    unsigned long long ev[32];
+    unsigned long long ev[40];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
     for (int wi = 0; wi < W; wi++)
     {
@@ -1457,7 +1463,9 @@ int main(int argc, char **argv)
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
     printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
 #endif
-    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12];
+    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32];
+    if (ev[14] || ev[15] || ev[32])
+        fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu\n", ev[14], ev[15], ev[32]);
     if (bad)
         fprintf(stderr, "warning: capacity overflow, results are not exact\n");
     if (ev[13])

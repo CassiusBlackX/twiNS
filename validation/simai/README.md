@@ -101,6 +101,7 @@ topologies to SimAI's format.
 | `jobs_net1.txt` | 13 | FatTree k=4 and k=8 in SimAI's format, uniform links (100 Gb/s at 1 µs, 400 Gb/s at 500 ns); SimAI.conf (MTU 9000, DCQCN, `GLOBAL_T 0`) and variants: MTU 1000, HPCC, `GLOBAL_T 1`, 1–2 MB buffers (up to 2456 pauses) | all |
 | `jobs_net2.txt` | 15 | FatTree k=4 and k=8 with host links and switch links of different rates (25–400 Gb/s) and delays (100 ns–2 µs, up to 20× apart); DCQCN and HPCC, 1–2 MB buffers | all |
 | `jobs_gpu1.txt` | 17 | SimAI's own topologies (`gen_Topo_Template.py`): Spectrum-X, AlibabaHPN (dual ToR: two NICs per GPU) and DCN+ with 16 GPUs, Spectrum-X with 128; NVSwitches, NVLink at 2400–2880 Gb/s and 25 ns; rings, cross-server pairs, all-to-all within servers, incasts, a mix of 200 flows; MTU 9000 and 1000 | all |
+| `jobs_dag1.txt` | 12 | DAGs (`workloads/gen_dag.py`, `docs/ai/dag.md`) against `simai-dag-ref.cc`: ring all-reduce (1 and 4 channels, within a server, over 16 and 128 GPUs: up to 32512 messages), all-to-all phases, a pipeline; Spectrum-X, HPN, DCN+ | all |
 
 The 28 runs also give identical results as one batch (`check_batch.sh` with `REF=out/simai/ref
 CFG=validation/simai/SimAI.conf OUT=out/simai/batch DATA=data/simai:data/rdma:data/topo:data/flows`).
