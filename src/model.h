@@ -114,20 +114,27 @@ enum : uint8_t
 // Per-connection state, structure of arrays (index = connection id; a connection carries one
 // or more flows, its messages). Sequence numbers are relative to the first data byte.
 // X(type, name, initial value)
-#define NS_FLOW_FIELDS(X)                \
-    /* static */                         \
+// read-only fields, in both records
+#define NS_STATIC_FIELDS(X) \
     X(int, src, 0)                       \
     X(int, dst, 0)                       \
     X(uint32_t, hash_data, 0)            \
-    X(uint32_t, hash_ack, 0)             \
+    X(uint32_t, hash_ack, 0)
+
+// the sending side (and the application)
+#define NS_SND_FIELDS(X) \
+    X(uint8_t, simple, 0)                /* one message: the sent list in compact form */ \
+    X(uint32_t, c_lost, 0)               /* compact: lost items [0, c_lost) */ \
+    X(uint32_t, c_rtx, 0)                /* compact: retransmitted [0, c_rtx), the head only if c_headrx */ \
+    X(uint8_t, c_headrx, 0)              \
+    X(uint64_t, it_off, 0)               /* its rings: it_cap entries at it_off */ \
+    X(uint32_t, it_cap, 0)               \
     X(int, m_first, 0)                   /* its messages: m_first .. m_first + m_cnt - 1 */ \
     X(int, m_cnt, 0)                     \
     X(uint8_t, fin_on, 0)                /* the application closes after its last message */ \
-    /* application */                    \
     X(int, m_due, 0)                     /* messages whose start has come */ \
     X(int, m_wr, 0)                      /* messages written to the socket */ \
     X(int, m_dn, 0)                      /* messages acknowledged */ \
-    /* sender */                         \
     X(uint8_t, st, S_IDLE)               \
     X(uint8_t, cong, C_OPEN)             \
     X(uint8_t, fin, 0)                   \
@@ -138,7 +145,6 @@ enum : uint8_t
     X(uint32_t, cwnd, INIT_CWND)         \
     X(uint32_t, ssthresh, 0xFFFFFFFFu)   \
     X(uint32_t, dupacks, 0)              \
-    /* TcpTxBuffer: the sent list (items it_head.., it_n of them), byte counters, cursor */ \
     X(uint32_t, it_head, 0)              \
     X(uint32_t, it_n, 0)                 \
     X(uint32_t, sack_b, 0)               /* m_sackedOut */ \
@@ -157,7 +163,6 @@ enum : uint8_t
     X(uint32_t, cwnd_cnt, 0)             \
     X(uint32_t, ack_rem, 0)              /* m_bytesAckedNotProcessed */ \
     X(uint8_t, cwnd_limited, 0)          \
-    /* TcpCubic (ns-3 member names in comments) */ \
     X(uint32_t, cub_cnt, 0)              /* m_cWndCnt */ \
     X(uint32_t, cub_lastmax, 0)          /* m_lastMaxCwnd */ \
     X(uint32_t, cub_origin, 0)           /* m_bicOriginPoint */ \
@@ -186,10 +191,14 @@ enum : uint8_t
     X(uint8_t, syn_tries, 0)             \
     X(int64_t, rto, MIN_RTO_PS)          \
     X(int64_t, rto_at, -1)               \
-    X(uint32_t, hist_lo, 0)              \
     X(int64_t, timing_time, 0)           \
-    X(int64_t, syn_at, -1)               /* SYN timer, or a pending SendPendingData (Send's TimeStep) */ \
-    /* receiver */                       \
+    X(int64_t, syn_at, -1)               /* SYN timer, or a pending SendPendingData (Send's TimeStep) */
+
+// the receiving side
+#define NS_RCV_FIELDS(X) \
+    X(uint32_t, r_size, 0)               /* the connection's bytes (the lean kernel's receiver) */ \
+    X(uint64_t, oo_off, 0)               /* its out-of-order blocks: oo_cap at oo_off */ \
+    X(uint32_t, oo_cap, 0)               \
     X(uint8_t, r_up, 0)                  \
     X(uint8_t, r_est, 0)                 \
     X(uint8_t, r_st, R_OPEN)             \
@@ -214,43 +223,56 @@ enum : uint8_t
     X(uint8_t, ecn_r, E_IDLE)            \
     X(int64_t, ecn_ce_seq, -1)
 
-// Flow state is stored as an array of records (one thread works through one host's flows,
-// and a record keeps a flow's fields in a few cache lines); F.field[f] addresses the field of
-// record f.
-struct FlowRec
+#define NS_FLOW_FIELDS(X) NS_STATIC_FIELDS(X) NS_SND_FIELDS(X) NS_RCV_FIELDS(X)
+
+// Connection state is stored as two arrays of records, one per side: the sender's host and the
+// receiver's host work on the same connection in the same slot, each on its own record (with a
+// copy of the read-only fields). F.field[f] addresses the field of record f through a Field: its
+// address in record 0 and the record size.
+struct SndRec
 {
 #define NS_REC(T, n, v) T n;
-    NS_FLOW_FIELDS(NS_REC)
+    NS_STATIC_FIELDS(NS_REC)
+    NS_SND_FIELDS(NS_REC)
 #undef NS_REC
 };
 
-template <typename T>
+struct RcvRec
+{
+#define NS_REC(T, n, v) T n;
+    NS_STATIC_FIELDS(NS_REC)
+    NS_RCV_FIELDS(NS_REC)
+#undef NS_REC
+};
+
+template <typename T, size_t STRIDE>
 struct Field
 {
     char *base; // address of the field in record 0
-    __host__ __device__ T &operator[](size_t i) const { return *reinterpret_cast<T *>(base + i * sizeof(FlowRec)); }
+    __host__ __device__ T &operator[](size_t i) const { return *reinterpret_cast<T *>(base + i * STRIDE); }
 };
 
 struct FlowSoA
 {
-    FlowRec *rec;
-#define NS_PTR(T, n, v) Field<T> n;
-    NS_FLOW_FIELDS(NS_PTR)
-#undef NS_PTR
+    SndRec *snd;
+    RcvRec *rcv;
+#define NS_PTR_S(T, n, v) Field<T, sizeof(SndRec)> n;
+#define NS_PTR_R(T, n, v) Field<T, sizeof(RcvRec)> n;
+    NS_STATIC_FIELDS(NS_PTR_S)
+    NS_SND_FIELDS(NS_PTR_S)
+    NS_RCV_FIELDS(NS_PTR_R)
+#undef NS_PTR_S
+#undef NS_PTR_R
     uint16_t *dchain;   // [conns][CHAIN] event-order chain of the delayed-ACK timer
     uint16_t *rchain;   // [conns][CHAIN] ... of the retransmission (or SYN) timer
     uint16_t *schain;   // [conns][CHAIN] ... of a pending SendPendingData (Send's TimeStep)
     // per-connection rings of cap[f] entries at off[f]: the sent list (item start, flags) and the
     // RTT history (seq, count with the retransmitted flag in bit 31, time)
-    uint64_t *it_off;
-    uint32_t *it_cap;
     uint32_t *it_start;
     uint8_t *it_fl;
     uint32_t *h_seq, *h_cnt;
     int64_t *h_t;
     // out-of-order blocks of the receiver, [start, end), sorted (oo_cap[f] at oo_off[f])
-    uint64_t *oo_off;
-    uint32_t *oo_cap;
     uint32_t *oo_s, *oo_e;
 };
 

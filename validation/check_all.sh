@@ -7,6 +7,8 @@ K8="k8_paper k8_fullsync k8_fullexp k8_a2a30 k8_incast16 k8_a2a50s"
 {
     validation/check_exact.sh "$K8 ls_paper ls_a2a30 ls_incast16 ls_a2a50s k16_paper k16_a2a30 k16_incast16 k16_a2a50s" "$T"
     for v in jit jit1 jit2 jit3 jit4; do validation/check_exact.sh "$K8" "$T" $v; done
+    # the general kernel on runs the lean one would take (both must agree with ns-3)
+    validation/check_exact.sh "k8_paper k8_a2a30 k8_a2a50s ls_a2a30 k16_a2a30" "$T" base --general | sed 's/: /, general kernel: /'
     # flow sizes that are not MSS multiples
     validation/check_exact.sh "k8_a2a30b k8_a2a50b k8_incastb ls_a2a30b k16_a2a30b" "$T"
     # persistent connections carrying several flows; with and without FIN

@@ -1,14 +1,33 @@
 // TwiNS device code: egress FIFO with RED, host TCP (ns-3 TcpSocketBase semantics),
 // switch forwarding. See model.h for the execution model.
-#ifndef TWINS_STEP_CUH
-#define TWINS_STEP_CUH
-
+//
+// main.cu compiles this twice, in two namespaces: TWINS_GENERAL 1 is the whole model; 0 is a
+// leaner kernel for runs that need none of the general features (connections with one message
+// each, no FIN, per-flow ECMP on a FatTree or leaf-spine), which keeps the hot paths smaller.
 #include "model.h"
 #include "nsmath.h"
 #include "rng.h"
 
-namespace nsm
+#ifndef TWINS_GENERAL
+#define TWINS_GENERAL 1
+#endif
+#ifndef TWINS_NS
+#define TWINS_NS nsm_full
+#endif
+
+namespace TWINS_NS
 {
+using namespace nsm;
+
+constexpr bool GENERAL = TWINS_GENERAL;
+
+// cold paths are out of line in the general kernel (its register pressure); the lean kernel
+// inlines everything, which keeps the host context and the NIC in registers
+#if TWINS_GENERAL
+#define TWINS_COLD __noinline__
+#else
+#define TWINS_COLD inline
+#endif
 
 __device__ inline void frame_copy(Frame *d, const Frame *s)
 {
@@ -497,7 +516,7 @@ __device__ inline bool it_insert(const Sim &s, Tx &t, uint32_t i, uint32_t start
 }
 
 // remove the start of item i, merging it into item i - 1 (flags reconciled by the caller)
-__device__ __noinline__ void it_remove_start(Tx &t, uint32_t i)
+__device__ TWINS_COLD void it_remove_start(Tx &t, uint32_t i)
 {
     for (uint32_t j = i; j + 1 < t.n; j++)
     {
@@ -526,11 +545,111 @@ __device__ inline uint32_t it_lower(const Tx &t, uint32_t seq)
     return lo;
 }
 
-__device__ inline uint32_t tb_sent(const FlowSoA &F, int f) { return F.it_n[f] ? F.high[f] - F.una[f] : 0u; }
+// ---- the compact form (F.simple): a connection with one message has MSS-long items, except
+// perhaps its last, and nothing merges or splits them; under the operations ns-3 applies
+// without SACK the flags then keep a compact shape:
+//   sacked  : the block [1, 1 + sacked_n)   (AddRenoSack sacks the first unsacked after the head)
+//   lost    : the prefix [0, c_lost)        (MarkHeadAsLost, SetSentListLost)
+//   retrans : the prefix [0, c_rtx), except the head when !c_headrx (MarkHeadAsLost clears it)
+__device__ inline uint32_t sb_sent(const FlowSoA &F, int f) { return F.una[f] < F.high[f] ? F.high[f] - F.una[f] : 0u; }
+__device__ inline uint32_t sb_items(const FlowSoA &F, int f) { return (sb_sent(F, f) + MSS - 1) / MSS; }
+__device__ inline uint32_t sb_bytes(const FlowSoA &F, int f, uint32_t n)
+{
+    uint32_t sent = sb_sent(F, f);
+    uint64_t b = (uint64_t)n * MSS;
+    return b < sent ? (uint32_t)b : sent;
+}
+
+__device__ inline void sb_add_reno_sack(const FlowSoA &F, int f)
+{
+    if (1 + F.sacked_n[f] < sb_items(F, f))
+        F.sacked_n[f]++;
+}
+
+__device__ inline void sb_mark_head_lost(const FlowSoA &F, int f)
+{
+    if (sb_items(F, f) == 0)
+        return;
+    if (F.c_rtx[f] >= 1 && F.c_headrx[f])
+    {
+        F.c_headrx[f] = 0;
+        if (F.c_rtx[f] == 1)
+            F.c_rtx[f] = 0;
+    }
+    if (F.c_lost[f] < 1)
+        F.c_lost[f] = 1;
+}
+
+// DiscardUpTo: drop m acknowledged items (una already advanced); a (wrongly guessed) sacked
+// head is unsacked, the sack moves on and the head is marked lost
+__device__ inline void sb_discard(const FlowSoA &F, int f, uint32_t m)
+{
+    if (m == 0)
+        return;
+    F.c_lost[f] = F.c_lost[f] > m ? F.c_lost[f] - m : 0;
+    if (F.c_rtx[f] > m)
+    {
+        F.c_rtx[f] -= m;
+        F.c_headrx[f] = 1;
+    }
+    else
+    {
+        F.c_rtx[f] = 0;
+        F.c_headrx[f] = 0;
+    }
+    uint32_t n = F.sacked_n[f];
+    if (n > 0 && m <= n)
+    {
+        F.sacked_n[f] = n - m;
+        sb_add_reno_sack(F, f);
+        sb_mark_head_lost(F, f);
+    }
+    else
+        F.sacked_n[f] = 0;
+}
+
+// a retransmission of the item at seq sets its retransmitted flag
+__device__ inline void sb_mark_retx(const FlowSoA &F, int f, uint32_t seq)
+{
+    uint32_t i = (seq - F.una[f]) / MSS;
+    if (i == 0)
+    {
+        if (F.c_rtx[f] == 0)
+            F.c_rtx[f] = 1;
+        F.c_headrx[f] = 1;
+    }
+    else
+    {
+        if (F.c_rtx[f] == 0)
+            F.c_headrx[f] = 0;
+        if (i + 1 > F.c_rtx[f])
+            F.c_rtx[f] = i + 1;
+    }
+}
+
+__device__ inline uint32_t tb_sent(const FlowSoA &F, int f)
+{
+    if ((!GENERAL || F.simple[f]))
+        return sb_sent(F, f);
+    return F.it_n[f] ? F.high[f] - F.una[f] : 0u;
+}
+
+// items in the sent list
+__device__ inline uint32_t tb_items(const FlowSoA &F, int f) { return (!GENERAL || F.simple[f]) ? sb_items(F, f) : F.it_n[f]; }
 
 // TcpTxBuffer::BytesInFlight = sent - (sacked + lost) + retrans (unsigned, as in ns-3)
 __device__ inline uint32_t inflight(const FlowSoA &F, int f)
 {
+    if ((!GENERAL || F.simple[f]))
+    {
+        int64_t sent = sb_sent(F, f);
+        int64_t sacked = F.sacked_n[f] ? sb_bytes(F, f, 1 + F.sacked_n[f]) - sb_bytes(F, f, 1) : 0;
+        int64_t lost = sb_bytes(F, f, F.c_lost[f]);
+        uint32_t r = F.c_rtx[f];
+        int64_t rtx = r == 0 ? 0 : sb_bytes(F, f, r) - (F.c_headrx[f] ? 0 : sb_bytes(F, f, 1));
+        int64_t v = sent - (sacked + lost) + rtx;
+        return v > 0 ? (uint32_t)v : 0;
+    }
     return tb_sent(F, f) - (F.sack_b[f] + F.lost_b[f]) + F.rtx_b[f];
 }
 
@@ -548,7 +667,13 @@ __device__ inline void tb_add_reno_sack(const Tx &t)
         F.hisack[t.f] = t.beg(i);
     }
 }
-__device__ inline void tb_add_reno_sack(const FlowSoA &F, int f) { tb_add_reno_sack(Tx(F, f)); }
+__device__ inline void tb_add_reno_sack(const FlowSoA &F, int f)
+{
+    if ((!GENERAL || F.simple[f]))
+        sb_add_reno_sack(F, f);
+    else
+        tb_add_reno_sack(Tx(F, f));
+}
 
 // TcpTxBuffer::MarkHeadAsLost
 __device__ inline void tb_mark_head_lost(const Tx &t)
@@ -557,11 +682,25 @@ __device__ inline void tb_mark_head_lost(const Tx &t)
         return;
     it_set(t, 0, (uint8_t)((t.flags(0) & ~(IT_SACKED | IT_RETX)) | IT_LOST));
 }
-__device__ inline void tb_mark_head_lost(const FlowSoA &F, int f) { tb_mark_head_lost(Tx(F, f)); }
+__device__ inline void tb_mark_head_lost(const FlowSoA &F, int f)
+{
+    if ((!GENERAL || F.simple[f]))
+        sb_mark_head_lost(F, f);
+    else
+        tb_mark_head_lost(Tx(F, f));
+}
 
 // TcpTxBuffer::ResetRenoSack + SetSentListLost(resetSack = true): everything outstanding is lost
-__device__ __noinline__ void tb_all_lost(const FlowSoA &F, int f)
+__device__ TWINS_COLD void tb_all_lost(const FlowSoA &F, int f)
 {
+    if ((!GENERAL || F.simple[f]))
+    {
+        F.sacked_n[f] = 0;
+        F.c_lost[f] = sb_items(F, f);
+        F.c_rtx[f] = 0;
+        F.c_headrx[f] = 0;
+        return;
+    }
     Tx t(F, f);
     for (uint32_t i = 0; i < t.n; i++)
         t.fl[t.at(i)] = IT_LOST;
@@ -579,6 +718,14 @@ __device__ __noinline__ void tb_all_lost(const FlowSoA &F, int f)
 // sampler counts as delivered, ProcessAck's currentDelivered)
 __device__ inline uint32_t tb_discard(const FlowSoA &F, int f, uint32_t ack)
 {
+    if ((!GENERAL || F.simple[f]))
+    {
+        uint32_t old = F.una[f], top = ack < F.high[f] ? ack : F.high[f];
+        uint32_t delivered = top > old ? top - old : 0;
+        F.una[f] = ack;
+        sb_discard(F, f, (delivered + MSS - 1) / MSS);
+        return delivered;
+    }
     Tx t(F, f);
     uint32_t delivered = 0, removed = 0;
     while (t.n > 0)
@@ -638,6 +785,30 @@ __device__ inline uint32_t tb_discard(const FlowSoA &F, int f, uint32_t ack)
 // retransmitted nor sacked, below the highest sack; else new data
 __device__ inline bool tb_next_seg(const FlowSoA &F, int f, uint32_t *seq)
 {
+    if ((!GENERAL || F.simple[f]))
+    {
+        uint32_t L = F.c_lost[f], R = F.c_rtx[f], n = F.sacked_n[f], una = F.una[f];
+        if (L >= 1 && !(R >= 1 && F.c_headrx[f]))
+        {
+            *seq = una;
+            return true;
+        }
+        if (n == 0)
+        {
+            uint32_t i = R > 1 ? R : 1;
+            if (i < L)
+            {
+                *seq = una + i * MSS;
+                return true;
+            }
+        }
+        if (F.tail[f] > F.high[f])
+        {
+            *seq = F.high[f];
+            return true;
+        }
+        return false;
+    }
     if (F.cand_n[f] > 0)
     {
         Tx t(F, f);
@@ -666,6 +837,8 @@ __device__ inline bool tb_next_seg(const FlowSoA &F, int f, uint32_t *seq)
 // TcpTxBuffer::IsLost(seq) for seq = SND.UNA: the head, if below the highest sack
 __device__ inline bool tb_head_lost(const FlowSoA &F, int f)
 {
+    if ((!GENERAL || F.simple[f]))
+        return F.sacked_n[f] > 0 && F.c_lost[f] >= 1; // (a sack lies above the head)
     if (!F.sack_seen[f] || F.una[f] >= F.hisack[f] || F.it_n[f] == 0)
         return false;
     Tx t(F, f);
@@ -675,6 +848,18 @@ __device__ inline bool tb_head_lost(const FlowSoA &F, int f)
 // TcpTxBuffer::IsRetransmittedDataAcked(x): an unsacked retransmitted item ends at x
 __device__ inline bool tb_retx_ends_at(const FlowSoA &F, int f, uint32_t x)
 {
+    if ((!GENERAL || F.simple[f]))
+    {
+        if (x <= F.una[f] || x > F.high[f])
+            return false;
+        uint32_t i = (x - F.una[f] + MSS - 1) / MSS - 1;
+        uint32_t e = F.una[f] + (i + 1) * MSS;
+        if ((e < F.high[f] ? e : F.high[f]) != x)
+            return false;
+        bool sacked = i >= 1 && i < 1 + F.sacked_n[f];
+        bool retx = i == 0 ? (F.c_rtx[f] >= 1 && F.c_headrx[f]) : i < F.c_rtx[f];
+        return !sacked && retx;
+    }
     if (F.it_n[f] == 0 || x <= F.una[f] || x > F.high[f])
         return false;
     Tx t(F, f);
@@ -688,7 +873,7 @@ __device__ inline bool tb_retx_ends_at(const FlowSoA &F, int f, uint32_t x)
 // TcpTxBuffer::GetTransmittedSegment(numBytes, seq) for item i (starting at seq): the size to
 // resend (merging with an unsacked successor of the same lost state), the list reshaped so that
 // one item covers it, marked retransmitted
-__device__ __noinline__ uint32_t tb_retransmit(const Sim &s, Tx &t, uint32_t i, uint32_t num)
+__device__ TWINS_COLD uint32_t tb_retransmit(const Sim &s, Tx &t, uint32_t i, uint32_t num)
 {
     const FlowSoA &F = t.F;
     const int f = t.f;
@@ -738,6 +923,25 @@ __device__ __noinline__ uint32_t tb_retransmit(const Sim &s, Tx &t, uint32_t i, 
 __device__ inline uint32_t tb_copy(const Sim &s, int f, uint32_t num, uint32_t seq, bool *retx)
 {
     const FlowSoA &F = s.fl;
+    if ((!GENERAL || F.simple[f]))
+    {
+        uint32_t avail = F.tail[f] > seq ? F.tail[f] - seq : 0;
+        uint32_t sz = num < avail ? num : avail;
+        if (sz == 0)
+            return 0;
+        if (F.high[f] <= seq)
+        {
+            F.high[f] = seq + sz; // new data
+            *retx = false;
+            return sz;
+        }
+        // an item (MSS long, or the flow's last): nothing to merge, nothing to split
+        uint32_t len = F.high[f] - seq < MSS ? F.high[f] - seq : MSS;
+        sz = sz < len ? sz : len;
+        sb_mark_retx(F, f, seq);
+        *retx = true;
+        return sz;
+    }
     for (;;)
     {
         uint32_t avail = F.tail[f] > seq ? F.tail[f] - seq : 0;
@@ -801,6 +1005,21 @@ struct Hist
 __device__ inline void rtt_history(const Sim &s, int f, uint32_t seq, uint32_t sz, bool retx, int64_t now)
 {
     const FlowSoA &F = s.fl;
+    if (!GENERAL)
+    {
+        // the lean form: one entry per MSS segment, by segment number (the ring's capacity); the
+        // tag is the segment number + 1, cleared by a retransmission
+        uint32_t sg = seq / MSS;
+        size_t ri = F.it_off[f] + sg % F.it_cap[f];
+        if (!retx)
+        {
+            F.h_t[ri] = now;
+            F.h_cnt[ri] = sg + 1;
+        }
+        else if (F.h_cnt[ri] == sg + 1)
+            F.h_cnt[ri] = 0;
+        return;
+    }
     Hist h(F, f);
     if (!retx)
     {
@@ -833,7 +1052,7 @@ __device__ inline void rtt_history(const Sim &s, int f, uint32_t seq, uint32_t s
 __device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now);
 
 
-__device__ __noinline__ uint32_t cub_ssthresh(const FlowSoA &F, int f);
+__device__ TWINS_COLD uint32_t cub_ssthresh(const FlowSoA &F, int f);
 
 __device__ inline uint32_t ssthresh_for(HostCtx &c, int f, uint32_t bytes_in_flight)
 {
@@ -874,6 +1093,20 @@ __device__ inline void rtt_sample(const FlowSoA &F, int f, int64_t m)
 __device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now)
 {
     const FlowSoA &F = s.fl;
+    if (!GENERAL)
+    {
+        // the oldest entry since the last RTO (h_head: the history starts there) not yet acked
+        uint32_t old = F.una[f], lo = old > F.h_head[f] ? old : F.h_head[f], sg = lo / MSS;
+        if (lo < F.high[f] && (ack >= lo + MSS || ack >= F.tail[f]))
+        {
+            size_t ri = F.it_off[f] + sg % F.it_cap[f];
+            if (F.h_cnt[ri] == sg + 1)
+                rtt_sample(F, f, now - F.h_t[ri]);
+            else if (lo >= F.h_head[f] && F.high[f] - lo > F.it_cap[f] * MSS)
+                atomicAdd(&s.ev[14], 1ull); // entry overwritten: more segments in flight than entries
+        }
+        return;
+    }
     if (F.h_n[f] == 0)
         return;
     Hist h(F, f);
@@ -913,7 +1146,7 @@ __device__ inline uint32_t send_segment(HostCtx &c, int f, uint32_t seq, uint32_
         flags |= F_CWR;
     }
     // Close() with data pending: the FIN rides on the segment that empties the buffer
-    if ((F.fin[f] & FIN_CLOSE) && seq + len == F.tail[f])
+    if (GENERAL && (F.fin[f] & FIN_CLOSE) && seq + len == F.tail[f])
     {
         flags |= F_FIN;
         F.fin[f] |= FIN_SENT;
@@ -933,7 +1166,7 @@ __device__ inline uint32_t send_segment(HostCtx &c, int f, uint32_t seq, uint32_
     rtt_history(*c.s, f, seq, len, retx, now);
     if (seq + len > F.high[f])
         F.high[f] = seq + len;
-    atomicMax(&c.s->ev[13], (unsigned long long)F.it_n[f]);
+    atomicMax(&c.s->ev[13], (unsigned long long)tb_items(F, f));
     return len;
 }
 
@@ -1000,7 +1233,7 @@ __device__ inline void cub_hystart_reset(const FlowSoA &F, int f, int64_t now)
     F.cub_samples[f] = 0;
 }
 
-__device__ __noinline__ uint32_t cub_update(const FlowSoA &F, int f, uint32_t segs, int64_t now)
+__device__ TWINS_COLD uint32_t cub_update(const FlowSoA &F, int f, uint32_t segs, int64_t now)
 {
     uint32_t seg_cwnd = F.cwnd[f] / MSS;
     F.cub_ackcnt[f] += segs;
@@ -1045,7 +1278,7 @@ __device__ __noinline__ uint32_t cub_update(const FlowSoA &F, int f, uint32_t se
     return cnt > 2 ? cnt : 2;
 }
 
-__device__ __noinline__ void cub_pkts_acked(const FlowSoA &F, int f, int64_t now)
+__device__ TWINS_COLD void cub_pkts_acked(const FlowSoA &F, int f, int64_t now)
 {
     if (F.cub_epoch[f] != INT64_MIN && now - F.cub_epoch[f] < CUB_DELTA)
         return; // delay samples right after fast recovery are discarded
@@ -1079,7 +1312,7 @@ __device__ __noinline__ void cub_pkts_acked(const FlowSoA &F, int f, int64_t now
         F.ssthresh[f] = cwnd;
 }
 
-__device__ __noinline__ void cub_increase(const FlowSoA &F, int f, uint32_t segs, uint32_t ack, int64_t now)
+__device__ TWINS_COLD void cub_increase(const FlowSoA &F, int f, uint32_t segs, uint32_t ack, int64_t now)
 {
     if (!F.cwnd_limited[f])
         return;
@@ -1102,7 +1335,7 @@ __device__ __noinline__ void cub_increase(const FlowSoA &F, int f, uint32_t segs
     }
 }
 
-__device__ __noinline__ uint32_t cub_ssthresh(const FlowSoA &F, int f)
+__device__ TWINS_COLD uint32_t cub_ssthresh(const FlowSoA &F, int f)
 {
     uint32_t seg_cwnd = F.cwnd[f] / MSS;
     if (seg_cwnd < F.cub_lastmax[f])
@@ -1115,7 +1348,7 @@ __device__ __noinline__ uint32_t cub_ssthresh(const FlowSoA &F, int f)
 }
 
 // CongestionStateSet(CA_LOSS): CubicReset and HystartReset
-__device__ __noinline__ void cub_loss(const FlowSoA &F, int f, int64_t now)
+__device__ TWINS_COLD void cub_loss(const FlowSoA &F, int f, int64_t now)
 {
     F.cub_origin[f] = 0;
     F.cub_k[f] = 0;
@@ -1246,7 +1479,7 @@ __device__ inline void new_ack(HostCtx &c, int f, uint32_t ack, bool reset_rto, 
 }
 
 // TcpSocketBase::EnterRecovery (no SACK, classic recovery)
-__device__ __noinline__ void enter_recovery(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void enter_recovery(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     tb_add_reno_sack(F, f); // one segment has left the network
@@ -1262,7 +1495,7 @@ __device__ __noinline__ void enter_recovery(HostCtx &c, int f, int64_t now)
 }
 
 // the application's view: every message whose last byte is now acknowledged is complete
-__device__ __noinline__ void messages_acked(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void messages_acked(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     const MsgSoA &M = c.s->mg;
@@ -1272,7 +1505,7 @@ __device__ __noinline__ void messages_acked(HostCtx &c, int f, int64_t now)
         F.m_dn[f]++;
         atomicAdd(c.s->flows_done, 1u);
     }
-    if (F.m_dn[f] == F.m_cnt[f] && (!F.fin_on[f] || (F.fin[f] & FIN_ACKED)))
+    if (F.m_dn[f] == F.m_cnt[f] && (!GENERAL || !F.fin_on[f] || (F.fin[f] & FIN_ACKED)))
     {
         F.st[f] = S_DONE;
         F.rto_at[f] = -1; // (a later timeout in FIN_WAIT_2 has nothing to do)
@@ -1289,7 +1522,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
     if (f == NS_TRACE)
         printf("ack %lld %u cwnd-before %u%s cong %d ssth %u recover %u high %u ecn_s %d inflight %u items %u\n", (long long)(now / 1000),
                ack + 1, F.cwnd[f], ece ? " ECE" : "", F.cong[f], F.ssthresh[f], F.recover[f] + 1, F.high[f] + 1, F.ecn_s[f],
-               inflight(F, f), F.it_n[f]);
+               inflight(F, f), tb_items(F, f));
 #endif
     uint32_t old = F.una[f];
     if (ack < old)
@@ -1443,7 +1676,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
         }
     }
     // ProcessWait: the ACK of the FIN moves FIN_WAIT_1 to FIN_WAIT_2
-    if ((F.fin[f] & FIN_SENT) && F.it_n[f] == 0 && ack == F.high[f] + 1)
+    if ((F.fin[f] & FIN_SENT) && tb_items(F, f) == 0 && ack == F.high[f] + 1)
         F.fin[f] |= FIN_ACKED;
     if (advancing)
     {
@@ -1458,7 +1691,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
     send_pending(c, f, now);
 }
 
-__device__ __noinline__ void on_rto(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void on_rto(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     F.rto_at[f] = -1;
@@ -1480,6 +1713,8 @@ __device__ __noinline__ void on_rto(HostCtx &c, int f, int64_t now)
     int64_t r = 2 * F.rto[f];
     F.rto[f] = r < 60000000000000ll ? r : 60000000000000ll;
     F.h_n[f] = 0; // m_history.clear()
+    if (!GENERAL)
+        F.h_head[f] = F.high[f];
     // the condition (state != LOSS || !IsHeadRetransmitted) always holds after SetSentListLost
     F.ssthresh[f] = ssthresh_for(c, f, before);
     if (c.cubic)
@@ -1491,7 +1726,7 @@ __device__ __noinline__ void on_rto(HostCtx &c, int f, int64_t now)
 
 // SendEmptyPacket(SYN|ACK) at the receiver: every SYN-ACK backs off the connection timeout;
 // a retransmission is scheduled unless one is pending (cancelled on ESTABLISHED)
-__device__ __noinline__ void send_synack(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void send_synack(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     int64_t rto = CONN_TIMEOUT_PS << F.srv_syn_n[f];
@@ -1666,11 +1901,57 @@ __device__ inline bool rx_add(const Sim &s, int f, uint32_t seq, uint32_t end)
     return true;
 }
 
+// the lean kernel's TcpRxBuffer::Add: segments are MSS-aligned (one message per connection), so
+// out-of-order data is a bitmap of segments beyond rcv_nxt (oo_cap words, a ring)
+__device__ inline bool rx_add_bitmap(const Sim &s, int f, uint32_t seq, uint32_t end)
+{
+    const FlowSoA &F = s.fl;
+    uint32_t expected = F.rcv_nxt[f];
+    if (end <= expected)
+        return false;
+    const uint32_t OW = F.oo_cap[f];
+    uint32_t *bm = F.oo_s + F.oo_off[f];
+    uint32_t n = F.ooo_n[f];
+    if (seq <= expected)
+    {
+        uint32_t nxt = end, size = F.r_size[f];
+        while (n > 0)
+        {
+            uint32_t sg = nxt / MSS;
+            uint32_t &w = bm[(sg / 32) % OW];
+            uint32_t bit = 1u << (sg % 32);
+            if (!(w & bit))
+                break;
+            w &= ~bit;
+            n--;
+            nxt = nxt + MSS < size ? nxt + MSS : size;
+        }
+        F.rcv_nxt[f] = nxt;
+    }
+    else
+    {
+        uint32_t sg = seq / MSS;
+        if (sg - expected / MSS >= OW * 32)
+        {
+            atomicAdd(&s.ev[6], 1ull);
+            return false;
+        }
+        uint32_t &w = bm[(sg / 32) % OW];
+        uint32_t bit = 1u << (sg % 32);
+        if (w & bit)
+            return false; // held already
+        w |= bit;
+        n++;
+    }
+    F.ooo_n[f] = n;
+    return true;
+}
+
 __device__ inline bool rx_finished(const FlowSoA &F, int f) { return F.r_fin[f] >= 0 && (uint32_t)F.r_fin[f] < F.rcv_nxt[f]; }
 
 // the receiving socket's FIN+ACK (SendEmptyPacket): it cancels the delayed ACK and, unless
 // one is pending, arms its own retransmission after the RTO
-__device__ __noinline__ void send_fin_ack(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void send_fin_ack(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     F.delack_at[f] = -1;
@@ -1695,7 +1976,7 @@ __device__ inline int64_t last_rto(const FlowSoA &F, int f)
 
 // TcpSocketBase::DoPeerClose: CLOSE_WAIT; the PacketSink's sockets have ShutdownSend set, so
 // Close() follows at once: FIN+ACK and LAST_ACK
-__device__ __noinline__ void do_peer_close(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void do_peer_close(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     F.r_st[f] = R_LAST_ACK;
@@ -1719,7 +2000,7 @@ __device__ inline void received_data(HostCtx &c, int f, uint32_t seq, uint32_t l
 {
     const FlowSoA &F = c.s->fl;
     uint32_t expected = F.rcv_nxt[f];
-    if (!rx_add(*c.s, f, seq, seq + len))
+    if (!GENERAL ? !rx_add_bitmap(*c.s, f, seq, seq + len) : !rx_add(*c.s, f, seq, seq + len))
     {
         send_ack(c, f, F.rcv_nxt[f], false, false, now); // insert failed: ACK now
         return;
@@ -1763,7 +2044,7 @@ __device__ inline void on_data(HostCtx &c, int f, const Frame &p, int64_t now)
     if (!F.r_up[f] || F.r_st[f] == R_CLOSED)
         return; // (a closed connection's segments reach the listening socket, which ignores them)
     uint32_t seq = p.sa, len = payload_of(p), end = seq + len;
-    bool fin = p.flags & F_FIN;
+    bool fin = GENERAL && (p.flags & F_FIN);
     // TcpSocketBase::IsValidTcpSegment: data entirely below rcv_nxt (OutOfRange; in LAST_ACK
     // anything but the next sequence number; never before ESTABLISHED) is answered with a plain
     // ACK before any ECN processing
@@ -1839,7 +2120,7 @@ __device__ inline void add_active(const Sim &s, int *list, int *n, int f, int h)
 // the application hands every due message to the socket (FlowSender::Write); Socket::Send
 // schedules SendPendingData one time step (1 ps) later, unless one is pending or the window is
 // closed. After the last message the application closes the connection (if it does).
-__device__ __noinline__ void app_write(HostCtx &c, int f, int64_t now)
+__device__ TWINS_COLD void app_write(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     const MsgSoA &M = c.s->mg;
@@ -1852,7 +2133,7 @@ __device__ __noinline__ void app_write(HostCtx &c, int f, int64_t now)
         F.tail[f] = M.end[m];
         F.m_wr[f]++;
     }
-    if (F.fin_on[f] && F.m_wr[f] == F.m_cnt[f])
+    if (GENERAL && F.fin_on[f] && F.m_wr[f] == F.m_cnt[f])
         F.fin[f] |= FIN_CLOSE; // Close() with data pending: m_closeOnEmpty
     uint32_t pipe = inflight(F, f);
     if (F.cwnd[f] > pipe && F.syn_at[f] < 0)
@@ -1890,7 +2171,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
                 app_write(c, f, now);
             }
         }
-        else if (p.flags & F_FIN)
+        else if (GENERAL && (p.flags & F_FIN))
         {
             // the receiver's FIN+ACK, in FIN_WAIT_1/2 (ProcessWait): ReceivedAck, then the FIN
             // completes the close (TimeWait) and is acknowledged; TIME_WAIT ignores everything
@@ -1966,7 +2247,7 @@ __device__ inline const uint16_t *due_chain(const FlowSoA &F, const Due &d)
 }
 
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
-__device__ __noinline__ bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p)
+__device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p)
 {
     uint16_t arr[CHAIN];
     chain_push(arr, chain_arrival(p.len), p.chain);
@@ -2274,7 +2555,7 @@ __device__ inline int route_up(const Sim &s, int sw, int dst_node, int up, int e
 {
     int dst = dst_node % s.H1; // within the world
     sw %= s.S1;
-    if (s.topo == TOPO_GRAPH)
+    if (GENERAL && s.topo == TOPO_GRAPH)
     {
         int e = s.host_sw[dst];
         if (e == sw)
@@ -2310,7 +2591,7 @@ __device__ inline int route_up(const Sim &s, int sw, int dst_node, int up, int e
 
 __device__ inline int route(const Sim &s, int sw, const Frame &p, int ep = 0)
 {
-    if (s.topo == TOPO_GRAPH)
+    if (GENERAL && s.topo == TOPO_GRAPH)
     {
         // per-flow ECMP: the flow hash modulo the number of routes at this switch
         int dst = p.dst_node % s.H1, x = sw % s.S1, e = s.host_sw[dst];
@@ -2325,7 +2606,7 @@ __device__ inline int route(const Sim &s, int sw, const Frame &p, int ep = 0)
 // a frame arriving on a port whose interface is down is dropped before routing
 __device__ inline bool port_down(const Sim &s, int sw, int q, int ep)
 {
-    return s.n_fail && s.port_dn[((size_t)ep * s.S1 + sw % s.S1) * s.k + q];
+    return GENERAL && s.n_fail && s.port_dn[((size_t)ep * s.S1 + sw % s.S1) * s.k + q];
 }
 
 // the number of equal-cost routes Ipv4GlobalRouting finds from switch sw towards host dst_node
@@ -2335,7 +2616,7 @@ __device__ inline int routes_to(const Sim &s, int sw, int dst_node, int ep = 0)
 {
     int dst = dst_node % s.H1;
     sw %= s.S1;
-    if (s.topo == TOPO_GRAPH)
+    if (GENERAL && s.topo == TOPO_GRAPH)
         return s.host_sw[dst] == sw ? 0 : s.rt_n[((size_t)ep * s.S1 + sw) * s.S1 + s.host_sw[dst]];
     if (s.topo == TOPO_LEAFSPINE)
         return sw < s.leaves ? (dst / s.hpl == sw ? 0 : s.ecmp_n) : 1;
@@ -2425,7 +2706,7 @@ __device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b
 // per-packet ECMP: Ipv4GlobalRouting::RouteInput draws GetInteger(0, routes - 1) from the
 // switch's random variable for every packet it forwards, in the order the packets arrive at the
 // node (all ports merged), whatever the number of routes
-__device__ __noinline__ void spray_draws(const Sim &s, const SwScratch &sc, int sw, int64_t t)
+__device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw, int64_t t)
 {
     const int k = s.k;
     for (int q = 0; q < k; q++)
@@ -2471,10 +2752,10 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
     int port = sw * k + q;
     Input in{nullptr, nullptr, 0, 0, 0};
     int *my_row = sc.rows + q * (k + 1);
-    const bool spray = s.sw_rng != nullptr;
+    const bool spray = GENERAL && s.sw_rng != nullptr;
     auto egress_of = [&](int j) {
         const Frame &p = in.at(j);
-        int ep = s.n_fail ? epoch_of(s, p.ts) : 0;
+        int ep = GENERAL && s.n_fail ? epoch_of(s, p.ts) : 0;
         if (port_down(s, sw, q, ep))
             return -1; // dropped on arrival
         return spray ? route_up(s, sw, p.dst_node, sc.up[q * 2 * MAX_TX + j], ep) : route(s, sw, p, ep);
@@ -2604,6 +2885,6 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
     return (eg.sent > 0 || eg.size > 0) ? 1 : 0;
 }
 
-} // namespace nsm
+} // namespace TWINS_NS
 
-#endif
+#undef TWINS_COLD

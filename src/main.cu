@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "step.cuh"
+#include "model.h"
 
 using namespace nsm;
 
@@ -33,115 +33,19 @@ constexpr int BLOCK = 32;
 // adding a slow dependent load to every state access.
 __constant__ Sim c_sim;
 
-__global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t *sw_up)
-{
-    const Sim &s = c_sim;
-    if (*s.finished)
-        return;
-    int64_t t = *s.slot;
-    __shared__ int rows[BLOCK * 33];
-    __shared__ int base[BLOCK], cnt[BLOCK];
-    __shared__ int in_win[BLOCK * 3];
-    __shared__ int mpos[BLOCK];
-    __shared__ int blk_act;
-    __shared__ unsigned long long blk_wake;
-    if (threadIdx.x == 0)
-    {
-        blk_act = 0;
-        blk_wake = ~0ull;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        if (blk_act)
-            atomicAdd(&s.activity[0], 1u);
-        if (blk_wake != ~0ull)
-            atomicMin(s.next_wake, blk_wake);
-    }
-#ifdef NS_PROF
-    long long p0 = wall_clock64();
-#endif
-    if (blockIdx.x < s.host_blocks)
-    {
-        int h = blockIdx.x * s.host_lanes + threadIdx.x;
-        if (threadIdx.x < s.host_lanes && h < s.H)
-        {
-            int64_t w = INT64_MAX;
-            if (host_step(s, h, t, due_buf + (size_t)h * MAX_DUE, &w))
-                blk_act = 1;
-            atomicMin(&blk_wake, (unsigned long long)w);
-        }
-    }
-    else
-    {
-        int b = blockIdx.x - s.host_blocks;
-        int local = threadIdx.x / s.k, q = threadIdx.x % s.k;
-        int sw = b * s.sw_per_block + local;
-        bool active = local < s.sw_per_block && sw < s.S;
-        int l = active ? local : 0;
-        size_t per_sw = (size_t)s.k * 2 * MAX_TX;
-        SwScratch sc;
-        sc.rows = rows + l * s.k * (s.k + 1);
-        sc.base = base + l * s.k;
-        sc.cnt = cnt + l * s.k;
-        sc.in_win = in_win + l * s.k * 3;
-        sc.mpos = mpos + l * s.k;
-        sc.up = sw_up + (size_t)(active ? sw : 0) * per_sw;
-        sc.ts = sw_ts + (size_t)(active ? sw : 0) * per_sw;
-        sc.ref = sw_ref + (size_t)(active ? sw : 0) * per_sw;
-        if (switch_step(s, sw, q, t, active, sc))
-            blk_act = 1;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        if (blk_act)
-            atomicAdd(&s.activity[0], 1u);
-        if (blk_wake != ~0ull)
-            atomicMin(s.next_wake, blk_wake);
-    }
-#ifdef NS_PROF
-    if (threadIdx.x == 0)
-    {
-        unsigned long long d = (unsigned long long)(wall_clock64() - p0);
-        atomicMax(&s.ev[blockIdx.x < s.host_blocks ? 9 + 6 : 10 + 6], d); // per-slot maxima (ev[15], ev[16])
-    }
-#endif
-    if (threadIdx.x == 0)
-    {
-        __threadfence();
-        unsigned int ticket = atomicAdd(s.done_blocks, 1u);
-        if (ticket == gridDim.x - 1)
-        {
-            __threadfence();
-            unsigned int fd = atomicAdd(s.flows_done, 0u);
-            if (fd >= (unsigned int)s.M || t + 1 >= s.max_slots)
-            {
-                *s.finished = 1;
-                *s.finished_host = 1;
-            }
-            // exact idle skip: nothing sent in this or the previous slot (so nothing arrives in
-            // the next) and no queued frames: run next at the earliest host timer or flow start
-            unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
-            unsigned long long nw = atomicAdd(s.next_wake, 0ull);
-            int64_t next = t + 1;
-            if (cur == 0 && prev == 0 && nw != ~0ull && (int64_t)nw > next)
-                next = (int64_t)nw < s.max_slots ? (int64_t)nw : s.max_slots;
-            s.activity[1] = cur;
-            s.activity[0] = 0;
-            *s.next_wake = ~0ull;
-            *s.slot = next;
-            *s.done_blocks = 0;
-#ifdef NS_PROF
-            s.ev[17] += s.ev[15];
-            s.ev[18] += s.ev[16];
-            s.ev[15] = 0;
-            s.ev[16] = 0;
-#endif
-            __threadfence();
-        }
-    }
-}
+// the two variants of the model (see step.cuh)
+#define TWINS_GENERAL 0
+#define TWINS_NS kbasic
+#include "step.cuh"
+#include "kernel.cuh"
+#undef TWINS_GENERAL
+#undef TWINS_NS
+#define TWINS_GENERAL 1
+#define TWINS_NS kfull
+#include "step.cuh"
+#include "kernel.cuh"
+using kfull::Due;
+
 
 template <typename T>
 static T *dalloc(size_t n)
@@ -168,6 +72,31 @@ static std::vector<T> ddown(const T *p, size_t n)
     if (n)
         CHECK(cudaMemcpy(v.data(), p, sizeof(T) * n, cudaMemcpyDeviceToHost));
     return v;
+}
+
+// a whole connection on the host (for set-up and reports); the device keeps it as SndRec + RcvRec
+struct FlowRec
+{
+#define NS_REC(T, n, v) T n;
+    NS_FLOW_FIELDS(NS_REC)
+#undef NS_REC
+};
+
+static void split(const std::vector<FlowRec> &r, std::vector<SndRec> &a, std::vector<RcvRec> &b)
+{
+    a.resize(r.size());
+    b.resize(r.size());
+    for (size_t i = 0; i < r.size(); i++)
+    {
+#define NS_CP_A(T, n, v) a[i].n = r[i].n;
+#define NS_CP_B(T, n, v) b[i].n = r[i].n;
+        NS_STATIC_FIELDS(NS_CP_A)
+        NS_SND_FIELDS(NS_CP_A)
+        NS_STATIC_FIELDS(NS_CP_B)
+        NS_RCV_FIELDS(NS_CP_B)
+#undef NS_CP_A
+#undef NS_CP_B
+    }
 }
 
 struct FlowIn
@@ -217,6 +146,8 @@ int main(int argc, char **argv)
     std::string topo = "fattree", worlds_file, topo_file, dump_routes, fail_spec;
     int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0, spray = 0;
     long long rng_seed = 1, rng_run = 1;
+    bool force_general = false;
+    bool no_compact = false; // --general: the general model (sent list, kernel) for everything (tests)
     int leaves = 16, spines = 8, hpl = 16;
     int64_t max_slots = 2000000;
     for (int i = 1; i < argc; i++)
@@ -269,6 +200,8 @@ int main(int argc, char **argv)
             hpl = std::stoi(val("--hpl="));
         else if (a.rfind("--fin=", 0) == 0)
             fin = std::stoi(val("--fin="));
+        else if (a == "--general")
+            no_compact = true;
         else if (a.rfind("--spray=", 0) == 0)
             spray = std::stoi(val("--spray="));
         else if (a.rfind("--RngSeed=", 0) == 0)
@@ -728,6 +661,10 @@ int main(int argc, char **argv)
             recs[c].m_cnt = (int)conn_msgs[c].size();
             recs[c].fin_on = (uint8_t)(worlds[first.src / H1].fin != 0);
             for (int m : conn_msgs[c])
+                recs[c].r_size += (uint32_t)flows[m].size;
+            recs[c].simple = (uint8_t)(conn_msgs[c].size() == 1 && !no_compact);
+            force_general |= no_compact;
+            for (int m : conn_msgs[c])
                 conn_bytes[c] += flows[m].size;
         }
         // ECMP hashes: from an ns-3 run of the same flows (identical paths; a connection's rows
@@ -780,10 +717,6 @@ int main(int argc, char **argv)
             }
         }
     }
-    s.fl.rec = dupload(recs);
-#define NS_BASE(T, n, v) s.fl.n.base = reinterpret_cast<char *>(s.fl.rec) + offsetof(FlowRec, n);
-    NS_FLOW_FIELDS(NS_BASE)
-#undef NS_BASE
     // per connection: the sent list and the RTT history (one entry per segment in flight; a
     // connection's segments are at most its bytes / MSS plus one per message), and the receiver's
     // out-of-order blocks (at most one per two segments), each capped (overflows: rtt-ovf, ooo-ovf)
@@ -799,16 +732,20 @@ int main(int argc, char **argv)
         {
             uint64_t segs = (conn_bytes[i] + MSS - 1) / MSS + recs[i].m_cnt + 1;
             icap[i] = (uint32_t)std::min<uint64_t>(segs, rtt_ring);
-            ocap[i] = (uint32_t)std::min<uint64_t>(segs / 2 + 2, ooo_segs);
+            // blocks (the general receiver), or bitmap words (the lean one: up to 32768 segments)
+            ocap[i] = (uint32_t)std::max(std::min<uint64_t>(segs / 2 + 2, ooo_segs), std::min<uint64_t>((segs + 31) / 32, 1024));
             ioff[i] = it;
             ooff[i] = ot;
             it += icap[i];
             ot += ocap[i];
         }
-        s.fl.it_off = dupload(ioff);
-        s.fl.it_cap = dupload(icap);
-        s.fl.oo_off = dupload(ooff);
-        s.fl.oo_cap = dupload(ocap);
+        for (int i = 0; i < F; i++)
+        {
+            recs[i].it_off = ioff[i];
+            recs[i].it_cap = icap[i];
+            recs[i].oo_off = ooff[i];
+            recs[i].oo_cap = ocap[i];
+        }
         s.fl.it_start = dalloc<uint32_t>(it);
         s.fl.it_fl = dalloc<uint8_t>(it);
         s.fl.h_seq = dalloc<uint32_t>(it);
@@ -817,6 +754,22 @@ int main(int argc, char **argv)
         s.fl.oo_s = dalloc<uint32_t>(ot);
         s.fl.oo_e = dalloc<uint32_t>(ot);
     }
+    {
+        std::vector<SndRec> sr;
+        std::vector<RcvRec> rr;
+        split(recs, sr, rr);
+        s.fl.snd = dupload(sr);
+        s.fl.rcv = dupload(rr);
+    }
+    // the global view: static and sender fields in the sender records, receiver fields in the
+    // receiver records
+#define NS_BASE_S(T, n, v) s.fl.n.base = reinterpret_cast<char *>(s.fl.snd) + offsetof(SndRec, n);
+#define NS_BASE_R(T, n, v) s.fl.n.base = reinterpret_cast<char *>(s.fl.rcv) + offsetof(RcvRec, n);
+    NS_STATIC_FIELDS(NS_BASE_S)
+    NS_SND_FIELDS(NS_BASE_S)
+    NS_RCV_FIELDS(NS_BASE_R)
+#undef NS_BASE_S
+#undef NS_BASE_R
     s.fl.dchain = dalloc<uint16_t>((size_t)F * CHAIN);
     s.fl.rchain = dalloc<uint16_t>((size_t)F * CHAIN);
     s.fl.schain = dalloc<uint16_t>((size_t)F * CHAIN);
@@ -1011,6 +964,12 @@ int main(int argc, char **argv)
         s.sw_rng = dupload(st);
     }
 
+    // the lean kernel unless a general feature is needed
+    bool basic = !is_graph && !spray && !force_general;
+    for (int c = 0; c < F && basic; c++)
+        basic = recs[c].simple && !recs[c].fin_on;
+    if (getenv("TWINS_VERBOSE"))
+        printf("kernel: %s\n", basic ? "basic" : "general");
     // ---- run
     int grid = s.host_blocks + (S + s.sw_per_block - 1) / s.sw_per_block;
 #if defined(TWINS_USE_HIP)
@@ -1024,7 +983,10 @@ int main(int argc, char **argv)
     cudaGraphExec_t exec;
     CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (int i = 0; i < graph_k; i++)
-        ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
+        if (basic)
+            kbasic::ns_slot<<<grid, BLOCK, 0, stream>>>(reinterpret_cast<kbasic::Due *>(due), sw_ts, sw_ref, sw_up);
+        else
+            kfull::ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
     CHECK(cudaStreamEndCapture(stream, &graph));
     CHECK(cudaGraphInstantiate(&exec, graph, 0));
     CHECK(cudaDeviceSynchronize());
@@ -1086,7 +1048,21 @@ int main(int argc, char **argv)
         fclose(o);
         printf("qtrace: %llu records\n", n);
     }
-    std::vector<FlowRec> out_rec = ddown(s.fl.rec, F);
+    std::vector<FlowRec> out_rec(F);
+    {
+        std::vector<SndRec> sr = ddown(s.fl.snd, F);
+        std::vector<RcvRec> rr = ddown(s.fl.rcv, F);
+        for (int i = 0; i < F; i++)
+        {
+#define NS_CP_A(T, n, v) out_rec[i].n = sr[i].n;
+#define NS_CP_B(T, n, v) out_rec[i].n = rr[i].n;
+            NS_STATIC_FIELDS(NS_CP_A)
+            NS_SND_FIELDS(NS_CP_A)
+            NS_RCV_FIELDS(NS_CP_B)
+#undef NS_CP_A
+#undef NS_CP_B
+        }
+    }
     auto field = [&](auto member) {
         std::vector<std::remove_reference_t<decltype(out_rec[0].*member)>> v(F);
         for (int i = 0; i < F; i++)
