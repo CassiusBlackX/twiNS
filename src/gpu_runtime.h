@@ -11,6 +11,7 @@
 #define cudaSuccess hipSuccess
 #define cudaGetErrorString hipGetErrorString
 #define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaGetLastError hipGetLastError
 
 #define cudaMalloc hipMalloc
 #define cudaMemset hipMemset

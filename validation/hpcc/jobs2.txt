@@ -1,0 +1,32 @@
+# scale and topologies
+k16_a2a30_cc1 ft16.topo k16_a2a30.csv CC_MODE=1
+k16_a2a30_cc3 ft16.topo k16_a2a30.csv CC_MODE=3
+k16_incast16_cc1 ft16.topo k16_incast16.csv CC_MODE=1
+k16_incast16_b2_cc3 ft16.topo k16_incast16.csv CC_MODE=3 BUFFER_SIZE=2
+ls_a2a30_cc1 ls16x8.topo ls_a2a30.csv CC_MODE=1
+ls_a2a30_cc3 ls16x8.topo ls_a2a30.csv CC_MODE=3
+ls_incast16_b2_cc1 ls16x8.topo ls_incast16.csv CC_MODE=1 BUFFER_SIZE=2
+jf32_a2a30_cc1 jf32.txt jf32_a2a30.csv CC_MODE=1
+jf32_a2a30_cc3 jf32.txt jf32_a2a30.csv CC_MODE=3
+jf32_incast_b1_cc1 jf32.txt jf32_incast.csv CC_MODE=1 BUFFER_SIZE=1
+torus6_a2a30_cc1 torus6.txt torus6_a2a30.csv CC_MODE=1
+df4x9_a2a30_cc1 df4x9.txt df4x9_a2a30.csv CC_MODE=1
+df4x9_a2a30_cc3 df4x9.txt df4x9_a2a30.csv CC_MODE=3
+# heavy congestion
+k8_incast64_b1_cc1 fattree8.txt k8_incast64.csv CC_MODE=1 BUFFER_SIZE=1
+k8_incast64_b1_cc3 fattree8.txt k8_incast64.csv CC_MODE=3 BUFFER_SIZE=1
+k8_perm_cc1 fattree8.txt k8_perm.csv CC_MODE=1
+k8_perm_cc3 fattree8.txt k8_perm.csv CC_MODE=3
+k8_perm_lowk_cc1 fattree8.txt k8_perm.csv CC_MODE=1 KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160
+# parameters
+k8_inc16_ackhi_cc1 fattree8.txt k8_incast16.csv CC_MODE=1 BUFFER_SIZE=2 ACK_HIGH_PRIO=1
+k8_inc16_ackhi_cc3 fattree8.txt k8_incast16.csv CC_MODE=3 BUFFER_SIZE=2 ACK_HIGH_PRIO=1
+k8_perm_novarwin_cc3 fattree8.txt k8_perm.csv CC_MODE=3 VAR_WIN=0
+k8_perm_nowin_cc1 fattree8.txt k8_perm.csv CC_MODE=1 HAS_WIN=0
+k8_perm_nofast_cc3 fattree8.txt k8_perm.csv CC_MODE=3 FAST_REACT=0
+k8_perm_mi5_cc3 fattree8.txt k8_perm.csv CC_MODE=3 MI_THRESH=5 U_TARGET=0.9
+k8_perm_clamp_cc1 fattree8.txt k8_perm.csv CC_MODE=1 CLAMP_TARGET_RATE=1 FAST_RECOVERY_TIMES=5 RATE_AI=5Mb/s KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160
+k8_perm_nobound_cc1 fattree8.txt k8_perm.csv CC_MODE=1 RATE_BOUND=0
+k8_perm_mtu1500_cc3 fattree8.txt k8_perm.csv CC_MODE=3 PACKET_PAYLOAD_SIZE=1500
+k8_perm_ack4k_cc1 fattree8.txt k8_perm.csv CC_MODE=1 L2_ACK_INTERVAL=4000
+k8_perm_g16_cc1 fattree8.txt k8_perm.csv CC_MODE=1 EWMA_GAIN=0.0625 ALPHA_RESUME_INTERVAL=55 RP_TIMER=300 KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160

@@ -1,0 +1,113 @@
+diff --git a/simulation/src/point-to-point/model/switch-mmu.cc b/simulation/src/point-to-point/model/switch-mmu.cc
+index 4baa387..fe08451 100644
+--- a/simulation/src/point-to-point/model/switch-mmu.cc
++++ b/simulation/src/point-to-point/model/switch-mmu.cc
+@@ -11,6 +11,8 @@
+ #include "ns3/simulator.h"
+ #include "ns3/random-variable.h"
+ #include "switch-mmu.h"
++#include "ns3/rng-stream.h"
++#include "ns3/rng-seed-manager.h"
+ 
+ NS_LOG_COMPONENT_DEFINE("SwitchMmu");
+ namespace ns3 {
+@@ -32,6 +34,7 @@ namespace ns3 {
+ 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
+ 		memset(paused, 0, sizeof(paused));
+ 		memset(egress_bytes, 0, sizeof(egress_bytes));
++		memset(ecn_rng, 0, sizeof(ecn_rng));
+ 	}
+ 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
+ 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
+@@ -103,7 +106,7 @@ namespace ns3 {
+ 			return true;
+ 		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
+ 			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
+-			if (UniformVariable(0, 1).GetValue() < p)
++			if ((ecn_rng[ifindex] ? ecn_rng[ifindex]->RandU01() : UniformVariable(0, 1).GetValue()) < p)
+ 				return true;
+ 		}
+ 		return false;
+@@ -113,6 +116,9 @@ namespace ns3 {
+ 		kmax[port] = _kmax * 1000;
+ 		pmax[port] = _pmax;
+ 	}
++	void SwitchMmu::ConfigEcnStream(uint32_t port, uint64_t stream){
++		ecn_rng[port] = new RngStream(RngSeedManager::GetSeed(), (1ull << 63) + stream, RngSeedManager::GetRun());
++	}
+ 	void SwitchMmu::ConfigHdrm(uint32_t port, uint32_t size){
+ 		headroom[port] = size;
+ 	}
+diff --git a/simulation/src/point-to-point/model/switch-mmu.h b/simulation/src/point-to-point/model/switch-mmu.h
+index aa29244..679deee 100644
+--- a/simulation/src/point-to-point/model/switch-mmu.h
++++ b/simulation/src/point-to-point/model/switch-mmu.h
+@@ -7,6 +7,7 @@
+ namespace ns3 {
+ 
+ class Packet;
++class RngStream;
+ 
+ class SwitchMmu: public Object{
+ public:
+@@ -37,6 +38,11 @@ public:
+ 	bool ShouldSendCN(uint32_t ifindex, uint32_t qIndex);
+ 
+ 	void ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax);
++	// TwiNS patch: the ECN marking draws of each egress port come from its own stream
++	// (RngStream(seed, 2^63 + stream, run), as SetStream(stream) gives) instead of a new
++	// UniformVariable per draw, whose stream depends on how many were created before it
++	void ConfigEcnStream(uint32_t port, uint64_t stream);
++	RngStream *ecn_rng[pCnt];
+ 	void ConfigHdrm(uint32_t port, uint32_t size);
+ 	void ConfigNPort(uint32_t n_port);
+ 	void ConfigBufferSize(uint32_t size);
+diff --git a/simulation/src/point-to-point/model/switch-node.cc b/simulation/src/point-to-point/model/switch-node.cc
+index ccbd284..6dfb02e 100644
+--- a/simulation/src/point-to-point/model/switch-node.cc
++++ b/simulation/src/point-to-point/model/switch-node.cc
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <cstdio>
+ #include "ns3/ipv4.h"
+ #include "ns3/packet.h"
+ #include "ns3/ipv4-header.h"
+@@ -14,6 +16,20 @@
+ 
+ namespace ns3 {
+ 
++// TwiNS debugging: TRACE_MMU=node,from_ns,until_ns prints that switch's MMU updates (stderr)
++static bool mmu_trace(uint32_t node){
++	static int init = 0;
++	static uint32_t tn; static uint64_t t0, t1;
++	if (!init){
++		init = 1;
++		const char *e = getenv("TRACE_MMU");
++		if (e) { unsigned long long a, b; unsigned n; if (sscanf(e, "%u,%llu,%llu", &n, &a, &b) == 3) { tn = n; t0 = a; t1 = b; init = 2; } }
++	}
++	if (init != 2 || node != tn) return false;
++	uint64_t now = Simulator::Now().GetTimeStep();
++	return now >= t0 && now <= t1;
++}
++
+ TypeId SwitchNode::GetTypeId (void)
+ {
+   static TypeId tid = TypeId ("ns3::SwitchNode")
+@@ -127,6 +143,8 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
+ 			}else{
+ 				return; // Drop
+ 			}
++			if (mmu_trace(m_id))
++				fprintf(stderr, "mmu %lu node %u in %u out %d enq %u ing %u hdrm %u shared %u thresh %u\n", Simulator::Now().GetTimeStep(), m_id, inDev, idx, p->GetSize(), m_mmu->ingress_bytes[inDev][qIndex], m_mmu->hdrm_bytes[inDev][qIndex], m_mmu->shared_used_bytes, m_mmu->GetPfcThreshold(inDev));
+ 			CheckAndSendPfc(inDev, qIndex);
+ 		}
+ 		m_bytes[inDev][idx][qIndex] += p->GetSize();
+@@ -200,6 +218,8 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
+ 		m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
+ 		m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
+ 		m_bytes[inDev][ifIndex][qIndex] -= p->GetSize();
++		if (mmu_trace(m_id))
++			fprintf(stderr, "mmu %lu node %u in %u out %u deq %u ing %u hdrm %u shared %u thresh %u\n", Simulator::Now().GetTimeStep(), m_id, inDev, ifIndex, p->GetSize(), m_mmu->ingress_bytes[inDev][qIndex], m_mmu->hdrm_bytes[inDev][qIndex], m_mmu->shared_used_bytes, m_mmu->GetPfcThreshold(inDev));
+ 		if (m_ecnEnabled){
+ 			bool egressCongested = m_mmu->ShouldSendCN(ifIndex, qIndex);
+ 			if (egressCongested){
