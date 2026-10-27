@@ -1907,93 +1907,102 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
 }
 
 // ------------------------------------------------------------------ the slot kernel
-__global__ void rdma_slot(Sim s)
+// The end of a block's slot: its activity and wake-up time; the last block of the slot (of either
+// kernel) decides the next slot.
+__device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act, unsigned long long blk_wake)
+{
+    if (blk_act)
+        atomicAdd(&s.activity[0], 1u);
+    if (blk_wake != ~0ull)
+        atomicMin(s.next_wake, blk_wake);
+    __threadfence();
+    unsigned int ticket = atomicAdd(s.done_blocks, 1u);
+    if (ticket != (unsigned int)(s.H + s.S) - 1)
+        return;
+    __threadfence();
+    unsigned int fd = atomicAdd(s.flows_done, 0u);
+    if (fd >= (unsigned int)s.F || slot + 1 >= s.max_slots)
+        *s.finished = 1;
+    // idle skip: nothing sent in this slot or the previous one (so nothing arrives in the
+    // next) and nothing queued: go on at the slot of the earliest host event
+    unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
+    unsigned long long nw = atomicAdd(s.next_wake, 0ull);
+    int64_t next = slot + 1;
+    if (cur == 0 && prev == 0 && nw != ~0ull)
+    {
+        int64_t ws = (int64_t)nw / s.P.delay;
+        if (ws > next)
+            next = ws < s.max_slots ? ws : s.max_slots;
+    }
+#ifdef RDMA_PROF
+    s.ev[18] += s.ev[16];
+    s.ev[19] += s.ev[17];
+    s.ev[23] += s.ev[16] > s.ev[17] ? s.ev[16] : s.ev[17];
+    s.ev[16] = s.ev[17] = 0;
+    s.ev[21] += s.ev[22];
+    s.ev[22] = 0;
+#endif
+    s.activity[1] = cur;
+    s.activity[0] = 0;
+    *s.next_wake = ~0ull;
+    *s.slot = next;
+    *s.done_blocks = 0;
+    __threadfence();
+}
+
+// The slot kernels: a block (one wave) per host, and per switch. A block's lanes load its slot's
+// inputs together, then the first lane runs its events (entities sharing a wave would diverge and
+// run in turn). Hosts and switches are separate kernels, so that each requests only its own LDS:
+// a switch's workspace is several times a host's, and LDS bounds how many blocks a CU holds.
+__global__ void rdma_hosts(Sim s)
 {
     if (*s.finished)
         return;
     int64_t slot = *s.slot;
-    __shared__ int blk_act;
-    __shared__ unsigned long long blk_wake;
-    if (threadIdx.x == 0)
-    {
-        blk_act = 0;
-        blk_wake = ~0ull;
-    }
-    __syncthreads();
-    // one host or switch per block (one wave): its lanes load its slot's inputs together, then
-    // the first lane runs its events (entities sharing a wave would diverge and run in turn)
     extern __shared__ __align__(16) char smem[];
-    int lane = threadIdx.x, lanes = blockDim.x;
+    int lane = threadIdx.x, lanes = blockDim.x, h = blockIdx.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
 #endif
-    if (blockIdx.x < s.H)
-    {
-        int h = blockIdx.x;
-        int64_t w = INT64_MAX;
-        HArr *pool = reinterpret_cast<HArr *>(smem);
-        int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
-        if (host_step(s, h, slot, &w, lane, lanes, pool, hints))
-            blk_act = 1;
-        if (lane == 0 && w != INT64_MAX)
-            atomicMin(&blk_wake, (unsigned long long)w);
-    }
-    else
-    {
-        // a switch's workspace: its ports, its arrival pool, its ints
-        int x = blockIdx.x - s.H;
-        SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
-        ArrLds *pool = reinterpret_cast<ArrLds *>(smem + (size_t)s.K * sizeof(SwPortLds));
-        int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds));
-        if (switch_step(s, x, slot, w, pool, lane, lanes, ints))
-            blk_act = 1;
-    }
+    int64_t w = INT64_MAX;
+    HArr *pool = reinterpret_cast<HArr *>(smem);
+    int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
+    bool act = host_step(s, h, slot, &w, lane, lanes, pool, hints);
 #ifdef RDMA_PROF
-    // per slot: the slowest host and switch thread (cycles, ev[16], ev[17]), summed over slots in
-    // ev[18], ev[19]
-    atomicMax(&s.ev[blockIdx.x < s.H ? 16 : 17], (unsigned long long)(clock64() - p0));
+    if (lane == 0)
+        atomicMax(&s.ev[16], (unsigned long long)(clock64() - p0));
 #endif
+    if (lane == 0)
+        slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
+}
+
+__global__ void rdma_switches(Sim s)
+{
+    if (*s.finished)
+        return;
+    int64_t slot = *s.slot;
+    extern __shared__ __align__(16) char smem[];
+    int lane = threadIdx.x, lanes = blockDim.x, x = blockIdx.x;
+#ifdef RDMA_PROF
+    long long p0 = clock64();
+#endif
+    // a switch's workspace: its ports, its arrival pool, its ints
+    SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
+    ArrLds *pool = reinterpret_cast<ArrLds *>(smem + (size_t)s.K * sizeof(SwPortLds));
+    int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds));
+    __shared__ int blk_act;
+    if (lane == 0)
+        blk_act = 0;
     __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        if (blk_act)
-            atomicAdd(&s.activity[0], 1u);
-        if (blk_wake != ~0ull)
-            atomicMin(s.next_wake, blk_wake);
-        __threadfence();
-        unsigned int ticket = atomicAdd(s.done_blocks, 1u);
-        if (ticket == gridDim.x - 1)
-        {
-            __threadfence();
-            unsigned int fd = atomicAdd(s.flows_done, 0u);
-            if (fd >= (unsigned int)s.F || slot + 1 >= s.max_slots)
-                *s.finished = 1;
-            // idle skip: nothing sent in this slot or the previous one (so nothing arrives in the
-            // next) and nothing queued: go on at the slot of the earliest host event
-            unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
-            unsigned long long nw = atomicAdd(s.next_wake, 0ull);
-            int64_t next = slot + 1;
-            if (cur == 0 && prev == 0 && nw != ~0ull)
-            {
-                int64_t ws = (int64_t)nw / s.P.delay;
-                if (ws > next)
-                    next = ws < s.max_slots ? ws : s.max_slots;
-            }
+    if (switch_step(s, x, slot, w, pool, lane, lanes, ints))
+        blk_act = 1; // (any lane: the ports are spread over them)
+    __syncthreads();
 #ifdef RDMA_PROF
-            s.ev[18] += s.ev[16];
-            s.ev[19] += s.ev[17];
-            s.ev[16] = s.ev[17] = 0;
-            s.ev[21] += s.ev[22];
-            s.ev[22] = 0;
+    if (lane == 0)
+        atomicMax(&s.ev[17], (unsigned long long)(clock64() - p0));
 #endif
-            s.activity[1] = cur;
-            s.activity[0] = 0;
-            *s.next_wake = ~0ull;
-            *s.slot = next;
-            *s.done_blocks = 0;
-            __threadfence();
-        }
-    }
+    if (lane == 0)
+        slot_end(s, slot, blk_act, ~0ull);
 }
 
 } // namespace rdma

@@ -564,21 +564,43 @@ int main(int argc, char **argv)
     }
     int BS = spread;
     s.host_blocks = H;
-    int blocks = H + S;
-    size_t lds = std::max(per_sw, per_h);
-    if (lds > 48 * 1024)
-        CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
+    if (per_sw > 48 * 1024)
+        CK(hipFuncSetAttribute((const void *)rdma_switches, hipFuncAttributeMaxDynamicSharedMemorySize, (int)per_sw));
 
     auto t_start = std::chrono::steady_clock::now();
     int fin = 0;
     long long launches = 0;
+    // a graph of 64 slots: in each, the host and the switch kernel run side by side, and both end
+    // before the next slot's begin
+    hipStream_t sa, sb;
+    CK(hipStreamCreate(&sa));
+    CK(hipStreamCreate(&sb));
+    const int GS = 64;
+    vector<hipEvent_t> evs(2 * GS + 1);
+    for (auto &e : evs)
+        CK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+    hipGraph_t graph;
+    hipGraphExec_t gexec;
+    CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
+    CK(hipEventRecord(evs[0], sa));
+    for (int i = 0; i < GS; i++)
+    {
+        CK(hipStreamWaitEvent(sb, evs[2 * i], 0));
+        rdma_hosts<<<H, BS, per_h, sa>>>(s);
+        rdma_switches<<<S, BS, per_sw, sb>>>(s);
+        CK(hipEventRecord(evs[2 * i + 1], sb));
+        CK(hipStreamWaitEvent(sa, evs[2 * i + 1], 0));
+        CK(hipEventRecord(evs[2 * i + 2], sa));
+    }
+    CK(hipStreamEndCapture(sa, &graph));
+    CK(hipGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
     while (!fin)
     {
-        for (int i = 0; i < 64; i++)
-            rdma_slot<<<blocks, BS, lds>>>(s);
-        launches += 64;
+        CK(hipGraphLaunch(gexec, sa));
+        launches += 2 * GS;
         CK(cudaGetLastError());
-        CK(cudaMemcpy(&fin, s.finished, sizeof(int), cudaMemcpyDeviceToHost));
+        CK(hipMemcpyAsync(&fin, s.finished, sizeof(int), hipMemcpyDeviceToHost, sa));
+        CK(hipStreamSynchronize(sa));
     }
     CK(cudaDeviceSynchronize());
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -625,6 +647,12 @@ int main(int argc, char **argv)
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);
+    {
+        int khz = 0;
+        CK(hipDeviceGetAttribute(&khz, hipDeviceAttributeClockRate, 0));
+        printf("prof: the slowest wave of each slot sums to %.3f Gcycles = %.3f s at %d MHz (wall %.3f s, %lld launches)\n", ev[23] * 1e-9,
+               ev[23] / (khz * 1e3), khz / 1000, wall, launches);
+    }
     printf("prof: switch cycles per event: select %.0f, arrival chain %.0f, tc events %.0f, arrival handling %.0f\n", (double)ev[24] / ev[20],
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
     printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
