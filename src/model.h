@@ -14,6 +14,7 @@
 #include <climits>
 #include <cstdint>
 #include "gpu_runtime.h"
+#include "rng.h"
 
 namespace nsm
 {
@@ -39,7 +40,10 @@ constexpr int64_t INIT_RTT_PS = 100000000;       // RttEstimator::InitialEstimat
 constexpr uint32_t DELACK_COUNT = 2;
 constexpr uint32_t INIT_CWND = 10 * MSS;
 constexpr int DUPTHRESH = 3;
-constexpr int CHAIN_RUNS = 9;              // recorded runs; then the root (2 words)
+#ifndef TWINS_CHAIN_RUNS
+#define TWINS_CHAIN_RUNS 9 // 64-byte frames; 25 gives 128-byte frames with longer histories
+#endif
+constexpr int CHAIN_RUNS = TWINS_CHAIN_RUNS; // recorded runs; then the root (2 words)
 constexpr int CHAIN = 2 * CHAIN_RUNS + 2;
 constexpr double DCTCP_G = 0.0625;
 
@@ -60,7 +64,7 @@ enum : uint8_t
 };
 constexpr int DATA_RETRIES = 6; // TcpSocket::DataRetries
 
-// A frame: 64 bytes.
+// A frame: 64 bytes (128 with TWINS_CHAIN_RUNS=25).
 //
 // chain[] records the frame's place in ns-3's event order (run-length encoded, see chain_push). ns-3 runs simultaneous events in the
 // order they were scheduled, and every transmission start has one parent event: the frame's
@@ -81,7 +85,7 @@ struct alignas(16) Frame
     uint16_t up;        // upward port index (flow hash % k/2), the same at every tier
     uint16_t chain[CHAIN]; // queued: the enqueue event's chain; on a link: the start's
 };
-static_assert(sizeof(Frame) == 64, "Frame layout");
+static_assert(sizeof(Frame) == 24 + 2 * CHAIN && sizeof(Frame) % 16 == 0, "Frame layout");
 
 enum : uint8_t
 {
@@ -302,7 +306,8 @@ enum : uint8_t
 enum : int
 {
     TOPO_FATTREE = 0,
-    TOPO_LEAFSPINE = 1
+    TOPO_LEAFSPINE = 1,
+    TOPO_GRAPH = 2 // a topology file: routes from tables
 };
 
 struct Sim
@@ -313,6 +318,17 @@ struct Sim
     int topo;              // TOPO_FATTREE, TOPO_LEAFSPINE
     int leaves, spines, hpl; // leaf-spine: switches 0..leaves-1 are leaves, then the spines
     int ecmp_n;            // equal-cost uplinks a flow hash chooses among (FatTree k/2, spines)
+    // TOPO_GRAPH (world-local ids): a host's switch and port; for switch x and destination
+    // switch e, the equal-cost ports (in interface order) rt_ports[rt_off[x S1 + e] ..], rt_n of them
+    int *host_sw;
+    uint8_t *host_port;
+    uint32_t *rt_off;
+    uint8_t *rt_n, *rt_ports;
+    // link failures (TOPO_GRAPH): epoch i starts at fail_t[i - 1] (epoch 0 at the start); the
+    // tables above are per epoch ([epoch][S1 S1]); port_dn[epoch][S1 k]: the port's interface is down
+    int n_fail;
+    int64_t *fail_t;
+    uint8_t *port_dn;
     int host_blocks, host_lanes, sw_per_block; // host_lanes: hosts per block (one per lane)
     // TCP of a host (its world): CC_NEWRENO, CC_DCTCP (ECN), CC_CUBIC
     int ring; // egress FIFO capacity: the largest queue limit + the device queue + 1
@@ -321,6 +337,7 @@ struct Sim
     int *mg_first_of_world; // [worlds] the first message of each world (message keys are world-local)
     HostSoA hs;
     PortSoA ps;
+    nsm_rng::State *sw_rng; // [S] per-packet ECMP: each switch's random variable (null: per-flow ECMP)
     int *host_in_link; // [H]
     int *sw_in_link;   // [S*k]
     Frame *msg;        // [NB][L][MAX_TX]

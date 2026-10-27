@@ -239,7 +239,14 @@ int main(int argc, char *argv[])
     cmd.AddValue("k", "FatTree k", k);
     std::string topo = "fattree";
     uint32_t leaves = 16, spines = 8, hpl = 16;
-    cmd.AddValue("topo", "fattree or leafspine", topo);
+    cmd.AddValue("topo", "fattree, leafspine or file", topo);
+    std::string topoFile;
+    cmd.AddValue("topofile", "topology file (--topo=file; workloads/topo.py)", topoFile);
+    std::string failSpec;
+    cmd.AddValue("fail",
+                 "link failures (--topo=file): T:sA:sB[:up],... at T ns the first link between switches A and B "
+                 "goes down (or up again): its Ipv4 interfaces change state and the global routes are recomputed",
+                 failSpec);
     cmd.AddValue("leaves", "leaf-spine: leaf switches", leaves);
     cmd.AddValue("spines", "leaf-spine: spine switches (each leaf connects to every spine)", spines);
     cmd.AddValue("hpl", "leaf-spine: hosts per leaf", hpl);
@@ -296,9 +303,34 @@ int main(int argc, char *argv[])
     if (tcp == "ns3::TcpDctcp")
         Config::SetDefault("ns3::TcpSocketBase::UseEcn", StringValue("On"));
 
+    // ---- a topology file: hosts, switches, links in installation order
+    bool fromFile = topo == "file";
+    std::vector<std::pair<std::string, std::string>> fileLinks;
+    uint32_t fileHosts = 0, fileSwitches = 0;
+    if (fromFile)
+    {
+        std::ifstream in(topoFile);
+        NS_ABORT_MSG_IF(!in, "cannot open " << topoFile);
+        std::string key;
+        while (in >> key)
+        {
+            if (key == "hosts")
+                in >> fileHosts;
+            else if (key == "switches")
+                in >> fileSwitches;
+            else if (key == "link")
+            {
+                std::string a, b;
+                in >> a >> b;
+                fileLinks.push_back({a, b});
+            }
+            else
+                std::getline(in, key);
+        }
+    }
     // ---- flows
     bool leafSpine = topo == "leafspine";
-    uint32_t H = leafSpine ? leaves * hpl : k * k * k / 4;
+    uint32_t H = fromFile ? fileHosts : leafSpine ? leaves * hpl : k * k * k / 4;
     {
         std::ifstream in(flowFile);
         std::string line;
@@ -328,7 +360,9 @@ int main(int argc, char *argv[])
     uint32_t hk = k / 2;
     NodeContainer hosts, edges, aggs, cores;
     hosts.Create(H);
-    if (leafSpine)
+    if (fromFile)
+        edges.Create(fileSwitches); // all switches, in file order
+    else if (leafSpine)
     {
         edges.Create(leaves); // the leaves
         cores.Create(spines); // the spines
@@ -357,7 +391,38 @@ int main(int argc, char *argv[])
         subnet++;
         addr.SetBase(s.str().c_str(), "255.255.255.0");
     };
-    for (uint32_t h = 0; h < H; h++)
+    std::map<std::pair<uint32_t, uint32_t>, NetDeviceContainer> switchLink; // the first link between two switches
+    if (fromFile)
+    {
+        auto node = [&](const std::string &x) { return x[0] == 'h' ? hosts.Get(std::stoul(x.substr(1))) : edges.Get(std::stoul(x.substr(1))); };
+        std::vector<int> hostLinks(H, 0);
+        for (auto &l : fileLinks)
+        {
+            NS_ABORT_MSG_IF(l.second[0] == 'h', "a host must be the first endpoint of its link");
+            NetDeviceContainer d = p2p.Install(node(l.first), node(l.second));
+            red.Install(d.Get(1));
+            if (l.first[0] == 'h')
+            {
+                uint32_t h = std::stoul(l.first.substr(1));
+                NS_ABORT_MSG_IF(hostLinks[h]++, "host " << h << " has two links");
+                if (hostQ == "red")
+                    red.Install(d.Get(0));
+                else if (hostQ == "big")
+                    bigq.Install(d.Get(0));
+                nextSubnet();
+                hostAddr[h] = addr.Assign(d).GetAddress(0);
+            }
+            else
+            {
+                red.Install(d.Get(0));
+                nextSubnet();
+                addr.Assign(d);
+                uint32_t a = std::stoul(l.first.substr(1)), b = std::stoul(l.second.substr(1));
+                switchLink.insert({{std::min(a, b), std::max(a, b)}, d});
+            }
+        }
+    }
+    for (uint32_t h = 0; h < (fromFile ? 0 : H); h++)
     {
         uint32_t e = leafSpine ? h / hpl : h / hk;
         NetDeviceContainer d = p2p.Install(hosts.Get(h), edges.Get(e));
@@ -369,7 +434,7 @@ int main(int argc, char *argv[])
         nextSubnet();
         hostAddr[h] = addr.Assign(d).GetAddress(0);
     }
-    if (leafSpine)
+    if (leafSpine && !fromFile)
         for (uint32_t l = 0; l < leaves; l++)
             for (uint32_t sp = 0; sp < spines; sp++)
             {
@@ -378,7 +443,7 @@ int main(int argc, char *argv[])
                 nextSubnet();
                 addr.Assign(d);
             }
-    for (uint32_t pod = 0; pod < (leafSpine ? 0 : k); pod++)
+    for (uint32_t pod = 0; pod < (leafSpine || fromFile ? 0 : k); pod++)
         for (uint32_t a = 0; a < hk; a++)
             for (uint32_t e = 0; e < hk; e++)
             {
@@ -387,7 +452,7 @@ int main(int argc, char *argv[])
                 nextSubnet();
                 addr.Assign(d);
             }
-    for (uint32_t i = 0; i < (leafSpine ? 0 : hk); i++)
+    for (uint32_t i = 0; i < (leafSpine || fromFile ? 0 : hk); i++)
         for (uint32_t j = 0; j < hk; j++)
             for (uint32_t pod = 0; pod < k; pod++)
             {
@@ -398,6 +463,69 @@ int main(int argc, char *argv[])
                 addr.Assign(d);
             }
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+    if (const char *dr = getenv("DUMP_ROUTES"))
+    {
+        // the routes Ipv4GlobalRouting::LookupGlobal finds from every switch to every host: host
+        // routes, else the longest-prefix network routes; as their output interfaces, sorted
+        std::ofstream o(dr);
+        for (uint32_t n = H; n < NodeList::GetNNodes(); n++)
+        {
+            Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>(NodeList::GetNode(n)->GetObject<Ipv4>()->GetRoutingProtocol());
+            Ptr<Ipv4GlobalRouting> g;
+            for (uint32_t i = 0; lr && i < lr->GetNRoutingProtocols(); i++)
+            {
+                int16_t prio;
+                if (auto x = DynamicCast<Ipv4GlobalRouting>(lr->GetRoutingProtocol(i, prio)))
+                    g = x;
+            }
+            for (uint32_t h = 0; h < H; h++)
+            {
+                std::vector<uint32_t> ifs;
+                for (uint32_t i = 0; i < g->GetNRoutes(); i++)
+                {
+                    Ipv4RoutingTableEntry *r = g->GetRoute(i);
+                    if (r->IsHost() && r->GetDest() == hostAddr[h])
+                        ifs.push_back(r->GetInterface());
+                }
+                if (ifs.empty())
+                {
+                    int best = -1;
+                    for (uint32_t i = 0; i < g->GetNRoutes(); i++)
+                    {
+                        Ipv4RoutingTableEntry *r = g->GetRoute(i);
+                        if (r->IsNetwork() && r->GetDestNetworkMask().IsMatch(hostAddr[h], r->GetDestNetwork()))
+                        {
+                            int len = r->GetDestNetworkMask().GetPrefixLength();
+                            if (len > best)
+                            {
+                                best = len;
+                                ifs.clear();
+                            }
+                            if (len == best)
+                                ifs.push_back(r->GetInterface());
+                        }
+                    }
+                }
+                std::stable_sort(ifs.begin(), ifs.end());
+                o << "route " << n << " " << h;
+                for (uint32_t x : ifs)
+                    o << " " << x;
+                o << "\n";
+            }
+        }
+    }
+    // per-packet ECMP (--flowEcmp=0) draws from each node's Ipv4GlobalRouting random variable:
+    // deterministic streams, stream = node id, so that TwiNS can reproduce the draws
+    for (NodeList::Iterator it = NodeList::Begin(); it != NodeList::End(); ++it)
+    {
+        Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>((*it)->GetObject<Ipv4>()->GetRoutingProtocol());
+        for (uint32_t i = 0; lr && i < lr->GetNRoutingProtocols(); i++)
+        {
+            int16_t prio;
+            if (Ptr<Ipv4GlobalRouting> g = DynamicCast<Ipv4GlobalRouting>(lr->GetRoutingProtocol(i, prio)))
+                g->AssignStreams((*it)->GetId());
+        }
+    }
     for (NodeList::Iterator it = NodeList::Begin(); it != NodeList::End(); ++it)
     {
         Ptr<TrafficControlLayer> tc = (*it)->GetObject<TrafficControlLayer>();
@@ -474,6 +602,37 @@ int main(int argc, char *argv[])
             }
             q->TraceConnectWithoutContext("Mark", MakeBoundCallback(+[](int, Ptr<const QueueDiscItem>, const char *) { g_marks++; }, 0));
         }
+    }
+
+    // ---- link failures, scheduled first: at their instant they precede every other event
+    for (std::stringstream fs(failSpec); fs.good();)
+    {
+        std::string item;
+        std::getline(fs, item, ',');
+        if (item.empty())
+            continue;
+        std::vector<std::string> v;
+        std::stringstream is(item);
+        for (std::string x; std::getline(is, x, ':');)
+            v.push_back(x);
+        NS_ABORT_MSG_IF(v.size() < 3 || !fromFile, "--fail needs --topo=file and T:sA:sB[:up]");
+        uint32_t a = std::stoul(v[1].substr(1)), b = std::stoul(v[2].substr(1));
+        auto it = switchLink.find({std::min(a, b), std::max(a, b)});
+        NS_ABORT_MSG_IF(it == switchLink.end(), "no link between " << v[1] << " and " << v[2]);
+        bool up = v.size() > 3 && v[3] == "up";
+        NetDeviceContainer d = it->second;
+        Simulator::Schedule(NanoSeconds(std::stoll(v[0])), [d, up]() {
+            for (uint32_t i = 0; i < 2; i++)
+            {
+                Ptr<Ipv4> ip = d.Get(i)->GetNode()->GetObject<Ipv4>();
+                int32_t ifc = ip->GetInterfaceForDevice(d.Get(i));
+                if (up)
+                    ip->SetUp(ifc);
+                else
+                    ip->SetDown(ifc);
+            }
+            Ipv4GlobalRoutingHelper::RecomputeRoutingTables();
+        });
     }
 
     // ---- applications: one sink per destination host, one sender per flow

@@ -5,6 +5,7 @@
 
 #include "model.h"
 #include "nsmath.h"
+#include "rng.h"
 
 namespace nsm
 {
@@ -13,11 +14,12 @@ __device__ inline void frame_copy(Frame *d, const Frame *s)
 {
     const uint4 *a = reinterpret_cast<const uint4 *>(s);
     uint4 *b = reinterpret_cast<uint4 *>(d);
-    uint4 x = a[0], y = a[1], z = a[2], w = a[3];
-    b[0] = x;
-    b[1] = y;
-    b[2] = z;
-    b[3] = w;
+    constexpr int N = sizeof(Frame) / 16;
+    uint4 v[N];
+    for (int i = 0; i < N; i++)
+        v[i] = a[i];
+    for (int i = 0; i < N; i++)
+        b[i] = v[i];
 }
 
 // ------------------------------------------------------------------ ns-3 event order
@@ -1935,12 +1937,14 @@ __device__ inline const uint16_t *due_chain(const FlowSoA &F, const Due &d)
 }
 
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
-__device__ __noinline__ bool timer_before_arrival(const FlowSoA &F, const Due &d, const Frame &p)
+__device__ __noinline__ bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p)
 {
     uint16_t arr[CHAIN];
     chain_push(arr, chain_arrival(p.len), p.chain);
     int r = chain_cmp(due_chain(F, d), arr);
-    return r <= 0; // (undecided: the timer, as before)
+    if (r == 0)
+        atomicAdd(&s.ev[25], 1ull);
+    return r <= 0; // (undecided: the timer)
 }
 
 // One slot of host h: all of its events in [slot start, slot end) in timestamp order.
@@ -2082,7 +2086,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
         }
-        else if (now == td && (now != tr || timer_before_arrival(F, due[id], i2 < n2 ? m2[i2] : m1[i1])))
+        else if (now == td && (now != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1])))
         {
             Due d = due[id++];
             const uint16_t *tc = due_chain(F, d);
@@ -2224,15 +2228,33 @@ __device__ inline uint32_t mix32(uint32_t x)
 // Output port at switch sw (FatTree: edges, aggregations, cores) for a frame to host dst.
 // Upward ports follow ns-3's per-flow ECMP: route index = flow hash % (k/2), the same hash at
 // every switch (Ipv4GlobalRouting uses one 5-tuple hash), equal-cost routes in interface order.
-__device__ inline int route(const Sim &s, int sw, const Frame &p)
+// the routing epoch at time ts (link failures: an event at ts comes first)
+__device__ inline int epoch_of(const Sim &s, int64_t ts)
 {
-    int dst = p.dst_node % s.H1; // within the world
+    int e = 0;
+    while (e < s.n_fail && ts >= s.fail_t[e])
+        e++;
+    return e;
+}
+
+// up: the index into the equal-cost routes (all upward; a downward route is unique)
+__device__ inline int route_up(const Sim &s, int sw, int dst_node, int up, int ep = 0)
+{
+    int dst = dst_node % s.H1; // within the world
     sw %= s.S1;
+    if (s.topo == TOPO_GRAPH)
+    {
+        int e = s.host_sw[dst];
+        if (e == sw)
+            return s.host_port[dst];
+        size_t r = ((size_t)ep * s.S1 + sw) * s.S1 + e;
+        return s.rt_ports[s.rt_off[r] + up];
+    }
     if (s.topo == TOPO_LEAFSPINE)
     {
         // leaf: own hosts on ports 0..hpl-1, spine j on port hpl + j; spine: leaf l on port l
         if (sw < s.leaves)
-            return dst / s.hpl == sw ? dst % s.hpl : s.hpl + p.up;
+            return dst / s.hpl == sw ? dst % s.hpl : s.hpl + up;
         return dst / s.hpl;
     }
     const int k = s.k, hk = s.hk, E = k * hk;
@@ -2242,16 +2264,56 @@ __device__ inline int route(const Sim &s, int sw, const Frame &p)
         int pod = sw / hk, j = sw % hk;
         if (dst_pod == pod && dst_edge == j)
             return dst % hk;
-        return hk + p.up;
+        return hk + up;
     }
     if (sw < 2 * E)
     {
         int pod = (sw - E) / hk;
         if (dst_pod == pod)
             return dst_edge;
-        return hk + p.up;
+        return hk + up;
     }
     return dst_pod;
+}
+
+__device__ inline int route(const Sim &s, int sw, const Frame &p, int ep = 0)
+{
+    if (s.topo == TOPO_GRAPH)
+    {
+        // per-flow ECMP: the flow hash modulo the number of routes at this switch
+        int dst = p.dst_node % s.H1, x = sw % s.S1, e = s.host_sw[dst];
+        if (e == x)
+            return s.host_port[dst];
+        uint32_t h = p.to_sender ? s.fl.hash_ack[p.flow] : s.fl.hash_data[p.flow];
+        return route_up(s, sw, p.dst_node, (int)(h % s.rt_n[((size_t)ep * s.S1 + x) * s.S1 + e]), ep);
+    }
+    return route_up(s, sw, p.dst_node, p.up);
+}
+
+// a frame arriving on a port whose interface is down is dropped before routing
+__device__ inline bool port_down(const Sim &s, int sw, int q, int ep)
+{
+    return s.n_fail && s.port_dn[((size_t)ep * s.S1 + sw % s.S1) * s.k + q];
+}
+
+// the number of equal-cost routes Ipv4GlobalRouting finds from switch sw towards host dst_node
+// (allRoutes): s.ecmp_n upwards, one downwards; 0 for a host attached to sw, whose network
+// Ipv4StaticRouting (first in the list) serves, so that global routing draws nothing
+__device__ inline int routes_to(const Sim &s, int sw, int dst_node, int ep = 0)
+{
+    int dst = dst_node % s.H1;
+    sw %= s.S1;
+    if (s.topo == TOPO_GRAPH)
+        return s.host_sw[dst] == sw ? 0 : s.rt_n[((size_t)ep * s.S1 + sw) * s.S1 + s.host_sw[dst]];
+    if (s.topo == TOPO_LEAFSPINE)
+        return sw < s.leaves ? (dst / s.hpl == sw ? 0 : s.ecmp_n) : 1;
+    const int hk = s.hk, E = s.k * hk;
+    int dst_pod = dst / (hk * hk), dst_edge = (dst / hk) % hk;
+    if (sw < E)
+        return dst_pod == sw / hk && dst_edge == sw % hk ? 0 : s.ecmp_n;
+    if (sw < 2 * E)
+        return dst_pod == (sw - E) / hk ? 1 : s.ecmp_n;
+    return 1;
 }
 
 struct SwScratch
@@ -2262,6 +2324,8 @@ struct SwScratch
     int *base;        // [k] shared: region of each egress in ts/ref
     int *cnt;         // [k] shared
     int *in_win;      // [k][3] shared: each ingress port's input window (i2, n2, n1)
+    uint8_t *up;      // [k * 2 * MAX_TX] (global) per-packet ECMP: the route drawn for each arrival
+    int *mpos;        // [k] shared: merge positions
 };
 
 // The ingress frames of port q this slot: tail of msg[t-2] (ts >= S0), head of msg[t-1] (ts < E0).
@@ -2311,6 +2375,59 @@ __device__ inline Input input_cached(const Sim &s, const SwScratch &sc, int sw, 
     return in;
 }
 
+// arrivals at the same instant, as ns-3 orders their Receive events: the longer frame started
+// earlier upstream; else by the chains of the upstream transmission starts
+__device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b)
+{
+    if (a.len != b.len)
+        return a.len > b.len;
+    int c = chain_cmp(a.chain, b.chain);
+    if (c == 0)
+        atomicAdd(&s.ev[25], 1ull); // the recorded histories do not tell: a guess
+    return c != 0 ? c < 0 : a.flow < b.flow;
+}
+
+// per-packet ECMP: Ipv4GlobalRouting::RouteInput draws GetInteger(0, routes - 1) from the
+// switch's random variable for every packet it forwards, in the order the packets arrive at the
+// node (all ports merged), whatever the number of routes
+__device__ __noinline__ void spray_draws(const Sim &s, const SwScratch &sc, int sw, int64_t t)
+{
+    const int k = s.k;
+    for (int q = 0; q < k; q++)
+        sc.mpos[q] = 0;
+    nsm_rng::State st = s.sw_rng[sw];
+    for (;;)
+    {
+        int best = -1;
+        const Frame *bf = nullptr;
+        for (int q = 0; q < k; q++)
+        {
+            Input in = input_cached(s, sc, sw, q, t);
+            if (sc.mpos[q] >= in.count())
+                continue;
+            const Frame &f = in.at(sc.mpos[q]);
+            if (best < 0 || f.ts < bf->ts || (f.ts == bf->ts && frame_before(s, f, *bf)))
+            {
+                best = q;
+                bf = &f;
+            }
+        }
+        if (best < 0)
+            break;
+        int ep = s.n_fail ? epoch_of(s, bf->ts) : 0;
+        if (port_down(s, sw, best, ep))
+        {
+            sc.mpos[best]++; // dropped on arrival: no lookup
+            continue;
+        }
+        int nr = routes_to(s, sw, bf->dst_node, ep);
+        uint32_t up = nr ? nsm_rng::get_integer(st, (uint32_t)nr) : 0;
+        sc.up[best * 2 * MAX_TX + sc.mpos[best]] = (uint8_t)up;
+        sc.mpos[best]++;
+    }
+    s.sw_rng[sw] = st;
+}
+
 // One slot of switch sw, port q (all ports of the switch call it together).
 __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool active, SwScratch sc)
 {
@@ -2319,6 +2436,14 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
     int port = sw * k + q;
     Input in{nullptr, nullptr, 0, 0, 0};
     int *my_row = sc.rows + q * (k + 1);
+    const bool spray = s.sw_rng != nullptr;
+    auto egress_of = [&](int j) {
+        const Frame &p = in.at(j);
+        int ep = s.n_fail ? epoch_of(s, p.ts) : 0;
+        if (port_down(s, sw, q, ep))
+            return -1; // dropped on arrival
+        return spray ? route_up(s, sw, p.dst_node, sc.up[q * 2 * MAX_TX + j], ep) : route(s, sw, p, ep);
+    };
     if (active)
     {
         in = input_of(s, s.sw_in_link[port], t);
@@ -2327,9 +2452,25 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
         sc.in_win[3 * q + 2] = in.n1;
         for (int i = 0; i <= k; i++)
             my_row[i] = 0;
+    }
+    if (spray)
+    {
+        __syncthreads();
+        if (active && q == 0)
+            spray_draws(s, sc, sw, t);
+        __syncthreads();
+    }
+    if (active)
+    {
         int n = in.count();
         for (int j = 0; j < n; j++)
-            my_row[route(s, sw, in.at(j))]++;
+        {
+            int e = egress_of(j);
+            if (e >= 0)
+                my_row[e]++;
+            else
+                atomicAdd(&s.ev[0], 1ull); // dropped on arrival at a down interface
+        }
     }
     __syncthreads();
     if (active)
@@ -2358,7 +2499,9 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
         for (int j = 0; j < n; j++)
         {
             const Frame &p = in.at(j);
-            int e = route(s, sw, p);
+            int e = egress_of(j);
+            if (e < 0)
+                continue;
             int r = my_row[e]++;
             int at = sc.base[e] + r;
             sc.ts[at] = p.ts;
@@ -2378,13 +2521,7 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
         Input src = input_cached(s, sc, sw, (int)(r >> 16), t);
         return src.at(r & 0xFFFF);
     };
-    auto before = [&](uint32_t ra, uint32_t rb) {
-        const Frame &a = frame_at(ra), &b = frame_at(rb);
-        if (a.len != b.len)
-            return a.len > b.len; // the longer frame started earlier upstream
-        int c = chain_cmp(a.chain, b.chain);
-        return c != 0 ? c < 0 : a.flow < b.flow;
-    };
+    auto before = [&](uint32_t ra, uint32_t rb) { return frame_before(s, frame_at(ra), frame_at(rb)); };
     for (int i = 1; i < n; i++)
     {
         int64_t x = ts[i];

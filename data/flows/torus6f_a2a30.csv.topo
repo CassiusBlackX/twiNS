@@ -1,0 +1,1 @@
+# twins --topo=graph --topofile=data/topo/torus6.txt --fail=300000:s0:s1

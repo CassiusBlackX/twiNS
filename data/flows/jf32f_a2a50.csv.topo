@@ -1,0 +1,1 @@
+# twins --topo=graph --topofile=data/topo/jf32.txt --fail=200000:s2:s10,400000:s15:s29,700000:s2:s10:up

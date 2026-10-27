@@ -5,10 +5,13 @@ ns-3 exactly**. Given ns-3's ECMP hashes, every flow's connection-establishment 
 time equals ns-3's, to the nanosecond.
 
 It models:
-- TCP NewReno, DCTCP and Cubic as in ns-3's TcpSocketBase;
+- TCP NewReno, DCTCP and Cubic as in ns-3's TcpSocketBase, with ns-3's TcpTxBuffer and
+  TcpRxBuffer: any flow size, persistent connections carrying several flows, and closing (FIN);
 - RED queues with ECN;
 - point-to-point links;
-- per-flow ECMP on FatTrees and leaf-spines.
+- per-flow ECMP or per-packet spraying (ns-3's random ECMP, its MRG32k3a draws reproduced);
+- FatTrees, leaf-spines, or any topology from a file (Jellyfish, tori, Dragonflies, ...), with
+  link failures and recoveries.
 
 On one consumer GPU (AMD RX 9060 XT) it is:
 - 55–970× faster than sequential ns-3;
@@ -37,12 +40,29 @@ cmake --build build -j
 ./build/twins --k=8 --flows=data/flows/k8_paper.csv --out=fct.csv --tcp=dctcp|newreno|cubic \
               [--ecmp_from=data/ns3/ref/k8_paper_TcpDctcp.csv] [--ecnK=30] [--queue=200]
 ./build/twins --topo=leafspine --leaves=16 --spines=8 --hpl=16 --flows=data/flows/ls_paper.csv ...
+./build/twins --topo=graph --topofile=data/topo/jf32.txt --flows=... [--fail=300000:s2:s10,700000:s2:s10:up]
+./build/twins --k=8 --flows=... --spray=1 [--RngRun=1]   # per-packet ECMP
+./build/twins --k=8 --flows=... --fin=1                  # senders close their connections
 ./build/twins --k=8 --worlds=worlds.txt   # a batch of independent simulations
 ```
 
 - **Flow files** are `src,dst,flow_size,start_ns` (all-to-all, incast) or `node,flow_size,start_ns`
   (GeDES's host pairing). `workloads/gen.py` generates both. Every flow gets its own TCP
-  connection.
+  connection, unless a fifth column `conn` groups flows: rows with the same `conn` (same hosts,
+  later starts) are messages written to one persistent connection at their start times
+  (`gen.py --reuse 1`). Flow sizes are any byte counts (`gen.py --align byte`).
+- **`--fin=1`**: the sender closes the connection after its last flow (FIN with the last
+  segment); the receiving PacketSink closes too (its sockets have ShutdownSend set).
+- **`--spray=1`**: per-packet ECMP. Each switch draws its route from ns-3's random variable
+  (MRG32k3a, stream = the switch's ns-3 node id, as the scenario assigns; `--RngSeed`,
+  `--RngRun` as in ns-3).
+- **`--topo=graph --topofile=F`**: any topology (`workloads/topo.py`: FatTree, leaf-spine,
+  Jellyfish, torus, Dragonfly). Hosts are single-homed; links are 100 Gbps with 1 µs delay;
+  switches have at most 32 ports. Routes are the shortest-path equal-cost sets that ns-3's global
+  routing installs (`--dump_routes` prints them in the format of the scenario's `DUMP_ROUTES`).
+- **`--fail=T:sA:sB[:up],...`** (topology files): at T ns the first link between switches A and
+  B goes down (or up): both interfaces drop what arrives, and routes are recomputed at that
+  instant (`Ipv4::SetDown` + `RecomputeRoutingTables` in ns-3).
 - **Output** has the columns of the ns-3 scenario: `src,dst,flow_size,start_ns,established_ns,completed_ns`.
   FCT is `completed_ns - established_ns`.
 - **`--ecmp_from`** takes an ns-3 output of the same flows. Its `hash_data,hash_ack` columns make
@@ -216,9 +236,9 @@ them, see `validation/README.md`.
   most 32 ports.
 - **Batch size.** Batches are limited by GPU memory: a 16 GB GPU holds 69 k=8 worlds or 16 k=16
   worlds.
-- **Connections.** One flow per connection, without FIN. Flow sizes must be multiples of the MSS.
-- **Protocols.** Not yet modelled: PFC/RDMA (DCQCN, HPCC), packet spraying, link failures and
-  arbitrary topologies.
+- **Topology files.** Links all run at 100 Gbps with 1 µs delay (the slot is the propagation
+  delay; mixed rates are not modelled yet); hosts have one link.
+- **Protocols.** Not yet modelled: RDMA with PFC (DCQCN, HPCC).
 - **What exactness is relative to.** It is defined against sequential ns-3.46.1 built with GCC
   `-march=native` on x86-64 (glibc 2.39). Other ns-3 versions or build flags may need
   realignment, which the queue-history diff makes mechanical.

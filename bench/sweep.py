@@ -25,6 +25,25 @@ def configs(workloads, queues, Ks):
                         yield w, t, q, K
 
 
+def run_long(k, lines, wf):
+    r = subprocess.run(["./build/twins128", f"--k={k}", f"--worlds={wf}"], capture_output=True, text=True)
+    if r.returncode == 0 or len(lines) == 1:
+        if r.returncode:
+            raise SystemExit(r.stderr)
+        return r
+    half = len(lines) // 2
+    out = []
+    for i, part in enumerate((lines[:half], lines[half:])):
+        pf = f"{wf}.{i}"
+        open(pf, "w").write("\n".join(part) + "\n")
+        out.append(run_long(k, part, pf))
+    # the simulation times of the parts add up; keep the last one's report
+    d = sum(float(re.search(r"Simulation Duration: ([0-9.]+)s", x.stdout).group(1)) for x in out)
+    out[-1].stdout = re.sub(r"Simulation Duration: [0-9.]+s", f"Simulation Duration: {d:.6f}s", out[-1].stdout)
+    out[-1].stderr = "".join(x.stderr for x in out)
+    return out[-1]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -49,6 +68,11 @@ def main():
                         f"out={a.out}/{w}_{TCP[t]}_q{q}_K{K}.csv\n")
         t0 = time.time()
         r = subprocess.run(["./build/twins", f"--k={a.k}", f"--worlds={wf}"], capture_output=True, text=True, check=True)
+        if "undecided" in r.stderr:
+            # ties the recorded histories could not decide: the batch again, with longer histories
+            # (twice the frame memory: in halves if it does not fit)
+            print(f"batch {b // a.batch}: undecided ties, rerun with twins128", flush=True)
+            r = run_long(a.k, open(wf).read().splitlines(), wf)
         total += time.time() - t0
         if "warning" in r.stderr:
             raise SystemExit(f"batch {b // a.batch}: {r.stderr.strip()}")

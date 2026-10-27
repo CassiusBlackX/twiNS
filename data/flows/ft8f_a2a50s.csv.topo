@@ -1,0 +1,1 @@
+# twins --topo=graph --topofile=data/topo/fattree8.txt --fail=300000:s32:s0,500000:s64:s32,800000:s32:s0:up

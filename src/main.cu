@@ -33,7 +33,7 @@ constexpr int BLOCK = 32;
 // adding a slow dependent load to every state access.
 __constant__ Sim c_sim;
 
-__global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref)
+__global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t *sw_up)
 {
     const Sim &s = c_sim;
     if (*s.finished)
@@ -42,6 +42,7 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref)
     __shared__ int rows[BLOCK * 33];
     __shared__ int base[BLOCK], cnt[BLOCK];
     __shared__ int in_win[BLOCK * 3];
+    __shared__ int mpos[BLOCK];
     __shared__ int blk_act;
     __shared__ unsigned long long blk_wake;
     if (threadIdx.x == 0)
@@ -84,6 +85,8 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref)
         sc.base = base + l * s.k;
         sc.cnt = cnt + l * s.k;
         sc.in_win = in_win + l * s.k * 3;
+        sc.mpos = mpos + l * s.k;
+        sc.up = sw_up + (size_t)(active ? sw : 0) * per_sw;
         sc.ts = sw_ts + (size_t)(active ? sw : 0) * per_sw;
         sc.ref = sw_ref + (size_t)(active ? sw : 0) * per_sw;
         if (switch_step(s, sw, q, t, active, sc))
@@ -211,8 +214,9 @@ int main(int argc, char **argv)
     int host_lanes = 0; // 0: chosen from the host count
     int ooo_segs = 0;   // per-flow caps; 0: default
     int rtt_ring = 0;
-    std::string topo = "fattree", worlds_file;
-    int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0;
+    std::string topo = "fattree", worlds_file, topo_file, dump_routes, fail_spec;
+    int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0, spray = 0;
+    long long rng_seed = 1, rng_run = 1;
     int leaves = 16, spines = 8, hpl = 16;
     int64_t max_slots = 2000000;
     for (int i = 1; i < argc; i++)
@@ -251,6 +255,12 @@ int main(int argc, char **argv)
             queue_pkts = std::stoi(val("--queue="));
         else if (a.rfind("--topo=", 0) == 0)
             topo = val("--topo=");
+        else if (a.rfind("--topofile=", 0) == 0)
+            topo_file = val("--topofile=");
+        else if (a.rfind("--fail=", 0) == 0)
+            fail_spec = val("--fail=");
+        else if (a.rfind("--dump_routes=", 0) == 0)
+            dump_routes = val("--dump_routes=");
         else if (a.rfind("--leaves=", 0) == 0)
             leaves = std::stoi(val("--leaves="));
         else if (a.rfind("--spines=", 0) == 0)
@@ -259,6 +269,12 @@ int main(int argc, char **argv)
             hpl = std::stoi(val("--hpl="));
         else if (a.rfind("--fin=", 0) == 0)
             fin = std::stoi(val("--fin="));
+        else if (a.rfind("--spray=", 0) == 0)
+            spray = std::stoi(val("--spray="));
+        else if (a.rfind("--RngSeed=", 0) == 0)
+            rng_seed = std::stoll(val("--RngSeed="));
+        else if (a.rfind("--RngRun=", 0) == 0)
+            rng_run = std::stoll(val("--RngRun="));
         else if (a.rfind("--graph_k=", 0) == 0)
             graph_k = std::stoi(val("--graph_k="));
         else
@@ -267,14 +283,44 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    bool ls = topo == "leafspine";
-    bool bad_topo = ls ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > BLOCK || leaves * hpl > 65535)
-                       : (topo != "fattree" || k < 4 || k > 32 || (k & (k - 1)));
+    bool ls = topo == "leafspine", is_graph = topo == "graph";
+    // a topology file: hosts, switches, links in installation order (workloads/topo.py)
+    int g_hosts = 0, g_switches = 0;
+    std::vector<std::pair<int, int>> g_links; // endpoints: host h -> h, switch j -> -1 - j
+    if (is_graph)
+    {
+        std::ifstream in(topo_file);
+        if (!in)
+        {
+            fprintf(stderr, "cannot open %s\n", topo_file.c_str());
+            return 1;
+        }
+        std::string key;
+        auto node = [](const std::string &x) { return x[0] == 'h' ? std::stoi(x.substr(1)) : -1 - std::stoi(x.substr(1)); };
+        while (in >> key)
+        {
+            if (key == "hosts")
+                in >> g_hosts;
+            else if (key == "switches")
+                in >> g_switches;
+            else if (key == "link")
+            {
+                std::string a, b;
+                in >> a >> b;
+                g_links.push_back({node(a), node(b)});
+            }
+            else
+                std::getline(in, key);
+        }
+    }
+    bool bad_topo = is_graph ? (g_hosts < 1 || g_switches < 1)
+                    : ls  ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > BLOCK || leaves * hpl > 65535)
+                          : (topo != "fattree" || k < 4 || k > 32 || (k & (k - 1)));
     if ((flow_file.empty() && worlds_file.empty()) || bad_topo || (tcp != "dctcp" && tcp != "newreno" && tcp != "cubic"))
     {
-        fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N)\n"
+        fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N | --topo=graph --topofile=F)\n"
                         "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--fin=0|1]\n"
-                        "          [--ecmp_from=csv]\n"
+                        "          [--ecmp_from=csv] [--spray=1 [--RngSeed=1 --RngRun=1]]\n"
                         "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,ecmp_from=..,out=..)\n"
                         "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
         return 1;
@@ -341,7 +387,172 @@ int main(int argc, char **argv)
         }
     }
     const int W = (int)worlds.size();
-    if (ls)
+    // graph: the ports of each node in link order, the hosts' switches, the equal-cost tables
+    std::vector<int> g_deg, g_hsw, g_hport;
+    std::vector<std::vector<std::pair<int, int>>> g_adj; // switch -> (port, neighbour)
+    std::vector<uint32_t> g_rtoff;
+    std::vector<uint8_t> g_rtn, g_rtports, g_portdn;
+    std::vector<int64_t> g_failt;
+    if (is_graph)
+    {
+        g_deg.assign(g_switches, 0);
+        g_hsw.assign(g_hosts, -1);
+        g_hport.assign(g_hosts, 0);
+        g_adj.assign(g_switches, {});
+        for (auto &l : g_links)
+        {
+            if (l.second >= 0 || (l.first >= 0 && g_hsw[l.first] >= 0))
+            {
+                fprintf(stderr, "%s: hosts need exactly one link, as its first endpoint\n", topo_file.c_str());
+                return 1;
+            }
+            int b = -1 - l.second, pb = g_deg[b]++;
+            if (l.first >= 0)
+            {
+                g_hsw[l.first] = b;
+                g_hport[l.first] = pb;
+            }
+            else
+            {
+                int a = -1 - l.first, pa = g_deg[a]++;
+                g_adj[a].push_back({pa, b});
+                g_adj[b].push_back({pb, a});
+            }
+        }
+        for (int h = 0; h < g_hosts; h++)
+            if (g_hsw[h] < 0)
+            {
+                fprintf(stderr, "%s: host %d has no link\n", topo_file.c_str(), h);
+                return 1;
+            }
+        k = 0;
+        for (int d : g_deg)
+            k = std::max(k, d);
+        if (k > BLOCK)
+        {
+            fprintf(stderr, "%s: a switch has %d ports (at most %d)\n", topo_file.c_str(), k, BLOCK);
+            return 1;
+        }
+        // link failures: T:sA:sB[:up], the first link between two switches; epoch i follows the
+        // i-th event in time order
+        struct Fail
+        {
+            int64_t t;
+            int a, pa, b, pb;
+            bool up;
+        };
+        std::vector<Fail> fails;
+        for (std::stringstream fs(fail_spec); fs.good();)
+        {
+            std::string item;
+            std::getline(fs, item, ',');
+            if (item.empty())
+                continue;
+            std::vector<std::string> v;
+            std::stringstream is(item);
+            for (std::string x; std::getline(is, x, ':');)
+                v.push_back(x);
+            if (v.size() < 3)
+            {
+                fprintf(stderr, "--fail: T:sA:sB[:up]\n");
+                return 1;
+            }
+            Fail fl{std::stoll(v[0]) * 1000, std::stoi(v[1].substr(1)), -1, std::stoi(v[2].substr(1)), -1, v.size() > 3 && v[3] == "up"};
+            for (auto &pn : g_adj[fl.a])
+                if (pn.second == fl.b && fl.pa < 0)
+                    fl.pa = pn.first;
+            for (auto &pn : g_adj[fl.b])
+                if (pn.second == fl.a && fl.pb < 0)
+                    fl.pb = pn.first;
+            if (fl.pa < 0)
+            {
+                fprintf(stderr, "--fail: no link between s%d and s%d\n", fl.a, fl.b);
+                return 1;
+            }
+            fails.push_back(fl);
+        }
+        std::stable_sort(fails.begin(), fails.end(), [](const Fail &x, const Fail &y) { return x.t < y.t; });
+        int NE = (int)fails.size() + 1;
+        s.n_fail = NE - 1;
+        std::vector<int64_t> fail_t;
+        for (auto &fl : fails)
+            fail_t.push_back(fl.t);
+        // shortest paths (hop count) to every switch e: from x, the ports towards a neighbour one
+        // hop closer, in interface (port) order, as Ipv4GlobalRouting installs equal-cost routes;
+        // per epoch, without the links that are down
+        g_rtoff.assign((size_t)NE * g_switches * g_switches, 0);
+        g_rtn.assign((size_t)NE * g_switches * g_switches, 0);
+        g_portdn.assign((size_t)NE * g_switches * k, 0);
+        std::vector<uint8_t> dn((size_t)g_switches * k, 0); // port down now
+        for (int ep = 0; ep < NE; ep++)
+        {
+            if (ep > 0)
+            {
+                const Fail &fl = fails[ep - 1];
+                dn[(size_t)fl.a * k + fl.pa] = dn[(size_t)fl.b * k + fl.pb] = fl.up ? 0 : 1;
+            }
+            std::copy(dn.begin(), dn.end(), g_portdn.begin() + (size_t)ep * g_switches * k);
+            for (int e = 0; e < g_switches; e++)
+            {
+                std::vector<int> dist(g_switches, -1), todo{e};
+                dist[e] = 0;
+                for (size_t i = 0; i < todo.size(); i++)
+                    for (auto &pn : g_adj[todo[i]])
+                        if (!dn[(size_t)todo[i] * k + pn.first] && dist[pn.second] < 0)
+                        {
+                            dist[pn.second] = dist[todo[i]] + 1;
+                            todo.push_back(pn.second);
+                        }
+                for (int x = 0; x < g_switches; x++)
+                {
+                    if (x == e)
+                        continue;
+                    if (dist[x] < 0)
+                    {
+                        fprintf(stderr, "%s: switch %d cannot reach switch %d (epoch %d)\n", topo_file.c_str(), x, e, ep);
+                        return 1;
+                    }
+                    std::vector<int> ports;
+                    for (auto &pn : g_adj[x])
+                        if (!dn[(size_t)x * k + pn.first] && dist[pn.second] == dist[x] - 1)
+                            ports.push_back(pn.first);
+                    std::sort(ports.begin(), ports.end());
+                    size_t r = ((size_t)ep * g_switches + x) * g_switches + e;
+                    g_rtoff[r] = (uint32_t)g_rtports.size();
+                    g_rtn[r] = (uint8_t)ports.size();
+                    for (int p : ports)
+                        g_rtports.push_back((uint8_t)p);
+                }
+            }
+        }
+        g_failt = fail_t;
+        if (!dump_routes.empty())
+        {
+            // in the format of the scenario's DUMP_ROUTES: ns-3 node, host, output interfaces
+            FILE *o = fopen(dump_routes.c_str(), "w");
+            for (int x = 0; x < g_switches; x++)
+                for (int h = 0; h < g_hosts; h++)
+                {
+                    fprintf(o, "route %d %d", g_hosts + x, h);
+                    int e = g_hsw[h];
+                    if (e == x)
+                        fprintf(o, " %d", g_hport[h] + 1);
+                    else
+                    {
+                        size_t r = (size_t)x * g_switches + e;
+                        for (int i = 0; i < g_rtn[r]; i++)
+                            fprintf(o, " %d", g_rtports[g_rtoff[r] + i] + 1);
+                    }
+                    fprintf(o, "\n");
+                }
+            fclose(o);
+        }
+        s.topo = TOPO_GRAPH;
+        s.H1 = g_hosts;
+        s.S1 = g_switches;
+        s.ecmp_n = 1;
+    }
+    else if (ls)
     {
         k = std::max(hpl + spines, leaves); // ports per switch (unused ones stay idle)
         s.topo = TOPO_LEAFSPINE;
@@ -659,6 +870,30 @@ int main(int argc, char **argv)
     for (int w = 0; w < W; w++)
     {
         const int hb = w * H1, sb = w * S1; // the world's first host and switch
+        if (is_graph)
+        {
+            for (int h = 0; h < H1; h++)
+            {
+                host_in[hb + h] = sw_link(sb + g_hsw[h], g_hport[h]);
+                sw_in[(size_t)(sb + g_hsw[h]) * k + g_hport[h]] = hb + h;
+            }
+            for (int x = 0; x < S1; x++)
+                for (auto &pn : g_adj[x])
+                {
+                    // the neighbour's port on this link: the one whose neighbour is x, in order
+                    int y = pn.second, nth = 0;
+                    for (auto &q : g_adj[x])
+                        if (q.second == y && q.first < pn.first)
+                            nth++;
+                    for (auto &q : g_adj[y])
+                        if (q.second == x && nth-- == 0)
+                        {
+                            sw_in[(size_t)(sb + x) * k + pn.first] = sw_link(sb + y, q.first);
+                            break;
+                        }
+                }
+            continue;
+        }
         if (ls)
         {
             for (int h = 0; h < H1; h++)
@@ -706,6 +941,22 @@ int main(int argc, char **argv)
             }
     }
     s.host_in_link = dupload(host_in);
+    if (is_graph)
+    {
+        std::vector<uint8_t> hp(g_hport.begin(), g_hport.end());
+        s.host_sw = dupload(g_hsw);
+        s.host_port = dupload(hp);
+        s.rt_off = dupload(g_rtoff);
+        s.rt_n = dupload(g_rtn);
+        s.rt_ports = dupload(g_rtports);
+        s.port_dn = dupload(g_portdn);
+        s.fail_t = dupload(g_failt);
+    }
+    else if (!fail_spec.empty())
+    {
+        fprintf(stderr, "--fail needs --topo=graph\n");
+        return 1;
+    }
     s.sw_in_link = dupload(sw_in);
     s.msg = dalloc<Frame>((size_t)NB * s.L * MAX_TX);
     s.msg_cnt = dalloc<long long>((size_t)NB * s.L);
@@ -726,7 +977,7 @@ int main(int argc, char **argv)
     s.flows_done = dalloc<unsigned int>(1);
     s.finished = dalloc<int>(1);
     s.error = dalloc<int>(1);
-    s.ev = dalloc<unsigned long long>(20);
+    s.ev = dalloc<unsigned long long>(32);
     s.qtrace = nullptr;
     s.qtrace_cnt = dalloc<unsigned long long>(1);
     s.qtrace_n = 0;
@@ -747,6 +998,17 @@ int main(int argc, char **argv)
     size_t per_sw = (size_t)k * 2 * MAX_TX;
     int64_t *sw_ts = dalloc<int64_t>((size_t)S * per_sw);
     uint32_t *sw_ref = dalloc<uint32_t>((size_t)S * per_sw);
+    uint8_t *sw_up = spray ? dalloc<uint8_t>((size_t)S * per_sw) : nullptr;
+    s.sw_rng = nullptr;
+    if (spray)
+    {
+        // per-packet ECMP: the scenario gives node i's Ipv4GlobalRouting the stream i; switches are
+        // nodes H1.. of their world
+        std::vector<nsm_rng::State> st(S);
+        for (int sw = 0; sw < S; sw++)
+            st[sw] = nsm_rng::stream_state((uint32_t)rng_seed, (uint64_t)(H1 + sw % S1), (uint64_t)rng_run);
+        s.sw_rng = dupload(st);
+    }
 
     // ---- run
     int grid = s.host_blocks + (S + s.sw_per_block - 1) / s.sw_per_block;
@@ -761,7 +1023,7 @@ int main(int argc, char **argv)
     cudaGraphExec_t exec;
     CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (int i = 0; i < graph_k; i++)
-        ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref);
+        ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
     CHECK(cudaStreamEndCapture(stream, &graph));
     CHECK(cudaGraphInstantiate(&exec, graph, 0));
     CHECK(cudaDeviceSynchronize());
@@ -776,7 +1038,7 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(&slots, s.slot, 8, cudaMemcpyDeviceToHost));
     unsigned int fd;
     CHECK(cudaMemcpy(&fd, s.flows_done, 4, cudaMemcpyDeviceToHost));
-    std::vector<unsigned long long> ev = ddown(s.ev, 20);
+    std::vector<unsigned long long> ev = ddown(s.ev, 32);
 #ifdef NS_PROF
     {
         int khz = 0;
@@ -789,10 +1051,15 @@ int main(int argc, char **argv)
     printf("Simulation Duration: %.6fs\n", sec);
     printf("Executed Slots: %lld\n", (long long)slots);
     printf("flows %d completed %u wall %.4f s drops %llu marks %llu retx %llu rto %llu | tx-cap %llu active-ovf %llu ooo-ovf %llu due-ovf %llu"
-           " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu\n",
-           M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19]);
+           " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
+           " | undecided-ties %llu\n",
+           M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25]);
     if (ev[5] || ev[6] || ev[7] || ev[14] || ev[19])
         fprintf(stderr, "warning: a capacity overflowed (active/ooo/due/rtt/ring-ovf); the results may differ from ns-3\n");
+    if (ev[25])
+        fprintf(stderr, "warning: %llu ties between simultaneous events were undecided by their recorded histories (%d runs); "
+                        "the results may differ from ns-3: rerun with twins128 (longer histories)\n",
+                ev[25], CHAIN_RUNS);
 
     if (s.qtrace)
     {
