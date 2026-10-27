@@ -248,6 +248,8 @@ struct Sim
     Port *ps;           // [S K]
     Chain *p_tc;        // [S K]
     Pkt *q0, *q3;       // [S K][q0_cap], [S K][q3_cap]
+    struct ArrLds *apool; // [S][POOL] a switch's arrivals of the slot
+    int *aidx;          // [S][2 POOL] their order per egress port (safe slots)
     int q0_cap, q3_cap;
     // links
     LFrame *msg;        // [NB][L][MAXF]

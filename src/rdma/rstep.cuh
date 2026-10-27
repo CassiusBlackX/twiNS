@@ -1119,10 +1119,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
 // ------------------------------------------------------------------ switch
 constexpr int KMAX = 64;
 
-// A switch's slot workspace in LDS. Per port: its Port, its arrivals of this slot (a range of the
-// pool, or, when the pool overflows, a cursor in the frames of slots s - 2 then s - 1), the
-// pending TransmitComplete's chain, and the first WIN frames of its queue PG.
-constexpr int WIN = 8;
+// A switch's slot workspace in LDS, per port: its Port, its arrivals of this slot (a range of the
+// pool, or, when the pool overflows, a cursor in the frames of slots s - 2 then s - 1), and the
+// prefixes of its next arrival's chain and of its pending TransmitComplete's (whose chain is
+// tc[port], in global memory). It is kept small: LDS bounds how many switches a CU holds.
 struct SwPortLds
 {
     Port pt;
@@ -1131,9 +1131,6 @@ struct SwPortLds
     int an2, an1, link_in, nout; // the fallback cursor (ai) and its frame counts; link; frames sent
     uint32_t acode;    // the next arrival's code
     Run ap[PRE], tp[PRE]; // the prefixes of the next arrival's chain and of tc's
-    int win_h, win_n;  // the window: ring positions win_h.. of win, win_n entries (the queue's head)
-    Chain tc;          // the pending TransmitComplete's chain
-    Pkt win[WIN];
 };
 
 // an arrival of the slot in the pool: its frame's contents, the code and prefix of its arrival's
@@ -1148,13 +1145,14 @@ struct ArrLds
     int16_t out;    // the egress port (-1: a PFC frame, or no route)
     uint8_t q, in;  // its queue; the ingress port
 };
-constexpr int POOL = 256; // arrivals per switch and slot in the pool
+constexpr int POOL = 1024; // arrivals per switch and slot in the pool (global memory)
 
 struct SCtx
 {
     const Sim *s;
     int x, node;
     SwPortLds *w; // [deg]
+    Chain *tc;    // [deg] the pending TransmitCompletes' chains (s.p_tc)
     ArrLds *pool; // null: this slot uses the fallback
     Switch sw;
     int64_t now, slot;
@@ -1196,8 +1194,10 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     int64_t tx = link_tx(s, p.size);
     c.w[port].pt.tc_at = c.now + tx;
     const Chain &cur = sc_cur(c);
-    cpush(&c.w[port].tc, ccode(tx, c.ord++), cur);
-    cprefix(c.w[port].tp, 0, c.w[port].tc);
+    Chain tcc;
+    cpush(&tcc, ccode(tx, c.ord++), cur);
+    c.tc[port] = tcc;
+    cprefix(c.w[port].tp, 0, tcc);
     int link = s.out_link[(size_t)c.node * s.K + port];
     if (c.w[port].nout >= MAXF)
     {
@@ -1236,12 +1236,6 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
             return;
         }
         s.q3[pi * s.q3_cap + (pt.q3_head + pt.q3_n) % s.q3_cap] = p;
-        SwPortLds &w = c.w[port];
-        if (w.win_n == pt.q3_n && w.win_n < WIN) // the window holds the whole queue: append
-        {
-            w.win[(w.win_h + w.win_n) % WIN] = p;
-            w.win_n++;
-        }
         pt.q3_n++;
     }
     pt.bytes_total += p.size;
@@ -1294,16 +1288,7 @@ __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
     }
     if ((pt.paused >> PG & 1) || pt.q3_n == 0)
         return;
-    Pkt p;
-    SwPortLds &w = c.w[port];
-    if (w.win_n > 0)
-    {
-        p = w.win[w.win_h];
-        w.win_h = (w.win_h + 1) % WIN;
-        w.win_n--;
-    }
-    else
-        p = s.q3[((size_t)c.x * s.K + port) * s.q3_cap + pt.q3_head];
+    Pkt p = s.q3[((size_t)c.x * s.K + port) * s.q3_cap + pt.q3_head];
     pt.q3_head = (pt.q3_head + 1) % s.q3_cap;
     pt.q3_n--;
     pt.bytes_total -= p.size;
@@ -1500,23 +1485,26 @@ __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPort
 //  - otherwise lane 0 runs all events in order.
 // Last, the lanes store the ports back together.
 constexpr int SAFE_LANES = 32; // safe slots need a lane per port
-constexpr int SW_INTS = 6 * KMAX + 2 * POOL + SAFE_LANES * SAFE_LANES; // the int workspace of a switch
-__device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int lane, int lanes,
+// the LDS int workspace of a switch with K ports (the pool's index lists are in global memory)
+__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)K * K; }
+__device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
                                             int *shared_int)
 {
+    Chain *tcs = s.p_tc + (size_t)x * s.K;
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const int node = s.H + x, deg = s.deg[node];
     Port *gp = s.ps + (size_t)x * s.K;
     // ports, and the bounds of their arrivals: at most the last frame of slot s - 2 (a frame
     // arrives within one transmission of the link's delay), and the frames of slot s - 1 but
     // perhaps the last
-    int *cnt = shared_int, *first = shared_int + KMAX; // per port: arrivals, the first in slot s - 2's list
-    uint32_t *abytes = (uint32_t *)(shared_int + 2 * KMAX); // bytes arriving for queue PG
-    uint32_t *ing0 = (uint32_t *)(shared_int + 3 * KMAX);   // ing at the slot's start
-    int *ocnt = shared_int + 4 * KMAX, *obase = shared_int + 5 * KMAX; // safe: arrivals per egress port
-    int *olist = shared_int + 6 * KMAX;                     // safe: pool indices by egress port, in order
-    int *mcur = olist + POOL;                                // safe: merge cursors [egress][ingress]
-    int *onext = mcur + SAFE_LANES * SAFE_LANES;             // safe: the next arrival of its ingress with the same egress
+    const int K = s.K;
+    int *cnt = shared_int, *first = shared_int + K; // per port: arrivals, the first in slot s - 2's list
+    uint32_t *abytes = (uint32_t *)(shared_int + 2 * K); // bytes arriving for queue PG
+    uint32_t *ing0 = (uint32_t *)(shared_int + 3 * K);   // ing at the slot's start
+    int *ocnt = shared_int + 4 * K, *obase = shared_int + 5 * K; // safe: arrivals per egress port
+    int *mcur = shared_int + 6 * K;                       // safe: merge cursors [egress][ingress]
+    int *olist = pidx, *onext = pidx + POOL;              // safe: pool indices by egress port, in order;
+                                                          // the next arrival of its ingress with the same egress
     for (int p = lane; p < deg; p += lanes)
     {
         SwPortLds &q = w[p];
@@ -1538,12 +1526,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         first[p] = f2;
         cnt[p] = (q.an2 - f2) + n1;
         if (q.pt.tc_at >= 0)
-        {
-            q.tc = s.p_tc[(size_t)x * s.K + p];
-            cprefix(q.tp, 0, q.tc);
-        }
-        q.win_h = 0;
-        q.win_n = q.pt.q3_n < WIN ? q.pt.q3_n : WIN;
+            cprefix(q.tp, 0, tcs[p]);
     }
     __syncthreads();
     // the pool: ports' arrivals in order, if they fit
@@ -1551,12 +1534,6 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     for (int p = 0; p < deg; p++)
         total += cnt[p];
     bool pooled = total <= POOL;
-    for (int j = lane; j < deg * WIN; j += lanes)
-    {
-        int p = j / WIN, i = j % WIN;
-        if (i < w[p].win_n)
-            w[p].win[i] = s.q3[((size_t)x * s.K + p) * s.q3_cap + (w[p].pt.q3_head + i) % s.q3_cap];
-    }
     if (pooled)
         for (int j = lane; j < total; j += lanes)
         {
@@ -1619,14 +1596,14 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             for (int q = 0; q < p; q++)
                 b += cnt[q];
             for (int o = 0; o < deg; o++)
-                mcur[o * SAFE_LANES + p] = -1;
+                mcur[o * K + p] = -1;
             for (int k = b + cnt[p] - 1; k >= b; k--)
             {
                 int o = owner(pool[k]);
                 if (o < 0)
                     continue;
-                onext[k] = mcur[o * SAFE_LANES + p];
-                mcur[o * SAFE_LANES + p] = k;
+                onext[k] = mcur[o * K + p];
+                mcur[o * K + p] = k;
             }
         }
         __syncthreads();
@@ -1636,7 +1613,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             for (int p = 0; p < o; p++)
                 base += ocnt[p];
             obase[o] = base;
-            int *cur = mcur + o * SAFE_LANES;
+            int *cur = mcur + o * K;
             for (int n = 0; n < ocnt[o]; n++)
             {
                 int bp = -1;
@@ -1671,6 +1648,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             c.sw = s.sw[x];
             c.slot = slot;
             c.w = w;
+            c.tc = tcs;
             c.pool = pool;
             c.safe = true;
             int oi = obase[o], oe = obase[o] + ocnt[o];
@@ -1690,14 +1668,14 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 {
                     const ArrLds &a = pool[olist[oi]];
                     int r = pcmp(a.ap, me.tp);
-                    arr = r ? r < 0 : before(s, ta, a.acode, s.msg[a.frame].c, tc, 0, me.tc);
+                    arr = r ? r < 0 : before(s, ta, a.acode, s.msg[a.frame].c, tc, 0, tcs[o]);
                 }
                 c.ord = 0;
                 c.cur_ok = false;
                 if (!arr)
                 {
                     c.now = tc;
-                    c.cur_src = &me.tc;
+                    c.cur_src = &tcs[o];
                     c.cur_code = 0;
                     trace_event(c.node, c.now, "tc", o, sc_cur(c));
                     me.pt.tc_at = -1;
@@ -1752,6 +1730,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.sw = s.sw[x];
         c.slot = slot;
         c.w = w;
+        c.tc = tcs;
         c.pool = pooled ? pool : nullptr;
         c.safe = false;
         int base = 0;
@@ -1801,8 +1780,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                     if (r == 0)
                     {
                         uint32_t ca = k ? 0 : w[p].acode, cb = bk ? 0 : w[best].acode;
-                        const Chain &xa = k ? w[p].tc : sw_arr_chain(c, w[p]);
-                        const Chain &xb = bk ? w[best].tc : sw_arr_chain(c, w[best]);
+                        const Chain &xa = k ? tcs[p] : sw_arr_chain(c, w[p]);
+                        const Chain &xb = bk ? tcs[best] : sw_arr_chain(c, w[best]);
                         r = before(s, t, ca, xa, bt, cb, xb) ? -1 : 1;
                     }
                     if (r < 0)
@@ -1823,7 +1802,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
 #endif
             if (bk == 1)
             {
-                c.cur_src = &w[p].tc;
+                c.cur_src = &tcs[p];
                 c.cur_code = 0;
                 trace_event(c.node, c.now, "tc", p, sc_cur(c));
                 w[p].pt.tc_at = -1;
@@ -1900,8 +1879,6 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         if (w[p].nout > 0 || w[p].pt.q0_n > 0 || w[p].pt.q3_n > 0 || w[p].pt.tc_at >= 0)
             act = true;
         gp[p] = w[p].pt;
-        if (w[p].pt.tc_at >= 0)
-            s.p_tc[(size_t)x * s.K + p] = w[p].tc;
     }
     return act;
 }
@@ -1986,15 +1963,17 @@ __global__ void rdma_switches(Sim s)
 #ifdef RDMA_PROF
     long long p0 = clock64();
 #endif
-    // a switch's workspace: its ports, its arrival pool, its ints
+    // a switch's workspace: its ports and ints in LDS, its arrival pool and its index lists in
+    // global memory
     SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
-    ArrLds *pool = reinterpret_cast<ArrLds *>(smem + (size_t)s.K * sizeof(SwPortLds));
-    int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds));
+    int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds));
+    ArrLds *pool = s.apool + (size_t)x * POOL;
+    int *pidx = s.aidx + (size_t)x * 2 * POOL;
     __shared__ int blk_act;
     if (lane == 0)
         blk_act = 0;
     __syncthreads();
-    if (switch_step(s, x, slot, w, pool, lane, lanes, ints))
+    if (switch_step(s, x, slot, w, pool, pidx, lane, lanes, ints))
         blk_act = 1; // (any lane: the ports are spread over them)
     __syncthreads();
 #ifdef RDMA_PROF

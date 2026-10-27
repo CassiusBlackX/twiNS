@@ -555,7 +555,9 @@ int main(int argc, char **argv)
     // a block (one wave) per host and per switch; a switch keeps its ports in LDS
     s.spread = spread;
     s.serial = serial || spread < SAFE_LANES;
-    size_t per_sw = (size_t)K * sizeof(SwPortLds) + POOL * sizeof(ArrLds) + SW_INTS * sizeof(int);
+    size_t per_sw = (size_t)K * sizeof(SwPortLds) + sw_ints(K) * sizeof(int);
+    s.apool = dev_alloc<ArrLds>((size_t)S * POOL);
+    s.aidx = dev_alloc<int>((size_t)S * 2 * POOL);
     size_t per_h = HPOOL * sizeof(HArr) + 4 * sizeof(int);
     if (per_sw > 64 * 1024)
     {
