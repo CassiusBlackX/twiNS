@@ -3,6 +3,12 @@
 //
 //   twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns]
 //              [--rate=100Gbps --delay=1000] [--q3cap=N] [--tail=log2] [--serial] [KEY=VALUE ...]
+//   twins-rdma CONFIG --batch=JOBFILE --outdir=DIR [--path=DIR:DIR...] [options] [KEY=VALUE ...]
+//
+// --batch: every line "name topo flows [KEY=VALUE ...]" of the job file is a world of its own
+// (its overrides on top of CONFIG's and the command line's), run side by side with the others;
+// world name's results go to DIR/name.fct. The worlds share the link rate and delay.
+// --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
 // overwritten tail are reported as "on lost tails"
@@ -54,11 +60,49 @@ static T *dev_copy(const vector<T> &v)
 }
 
 // ---------------------------------------------------------------- configuration (rdma-ref's)
-static std::map<string, vector<string>> cfg;
-static bool has(const char *k) { return cfg.count(k) && !cfg[k].empty(); }
-static string str(const char *k, const string &d) { return has(k) ? cfg[k][0] : d; }
-static double num(const char *k, double d) { return has(k) ? atof(cfg[k][0].c_str()) : d; }
-static uint32_t u32(const char *k, uint32_t d) { return has(k) ? (uint32_t)strtoul(cfg[k][0].c_str(), 0, 10) : d; }
+typedef std::map<string, vector<string>> Config;
+struct Cfg
+{
+    const Config &c;
+    bool has(const char *k) const { return c.count(k) && !c.at(k).empty(); }
+    string str(const char *k, const string &d) const { return has(k) ? c.at(k)[0] : d; }
+    double num(const char *k, double d) const { return has(k) ? atof(c.at(k)[0].c_str()) : d; }
+    uint32_t u32(const char *k, uint32_t d) const { return has(k) ? (uint32_t)strtoul(c.at(k)[0].c_str(), 0, 10) : d; }
+};
+
+static bool read_config(const string &path, Config &cfg)
+{
+    std::ifstream f(path);
+    if (!f)
+    {
+        fprintf(stderr, "cannot open %s\n", path.c_str());
+        return false;
+    }
+    string line;
+    while (std::getline(f, line))
+    {
+        std::istringstream is(line);
+        string key, v;
+        if (!(is >> key))
+            continue;
+        vector<string> vals;
+        while (is >> v)
+            vals.push_back(v);
+        cfg[key] = vals;
+    }
+    return true;
+}
+
+// KEY=VALUE, or KEY=V1,V2,... for a key with several values (KMAX_MAP=1,100000000000,800)
+static void set_override(Config &cfg, const string &k, const string &v)
+{
+    vector<string> vals;
+    size_t b = 0;
+    for (size_t c; (c = v.find(',', b)) != string::npos; b = c + 1)
+        vals.push_back(v.substr(b, c - b));
+    vals.push_back(v.substr(b));
+    cfg[k] = vals;
+}
 
 // ns-3 DataRate strings: a number and a unit (bps, Kbps, Mbps, Gbps; b/s, Kb/s, Mb/s, Gb/s)
 static uint64_t parse_rate(const string &s)
@@ -80,141 +124,82 @@ static uint64_t parse_rate(const string &s)
 
 static void host_push(Chain *c, int64_t lead, int ord) { cpush(c, ccode(lead, ord), Chain(*c)); }
 
-int main(int argc, char **argv)
+// One network: its parameters, topology, routes and flows, numbered within it.
+struct World
 {
-    if (argc < 2)
-    {
-        fprintf(stderr, "usage: twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns] [KEY=VALUE ...]\n");
-        return 1;
-    }
-    {
-        std::ifstream f(argv[1]);
-        if (!f)
-        {
-            fprintf(stderr, "cannot open %s\n", argv[1]);
-            return 1;
-        }
-        string line;
-        while (std::getline(f, line))
-        {
-            std::istringstream is(line);
-            string key, v;
-            if (!(is >> key))
-                continue;
-            vector<string> vals;
-            while (is >> v)
-                vals.push_back(v);
-            cfg[key] = vals;
-        }
-    }
-    string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps";
-    int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 8192, tail_log2 = 24, spread = 32, serial = 0;
-    for (int i = 2; i < argc; i++)
-    {
-        string a = argv[i];
-        size_t eq = a.find('=');
-        string k = a.substr(0, eq), v = eq == string::npos ? "" : a.substr(eq + 1);
-        if (k == "--topo")
-            topo_file = v;
-        else if (k == "--flows")
-            flow_file = v;
-        else if (k == "--out")
-            out_file = v;
-        else if (k == "--txtrace")
-            tx_file = v;
-        else if (k == "--from")
-            tx_from = atoll(v.c_str());
-        else if (k == "--until")
-            tx_until = atoll(v.c_str());
-        else if (k == "--rate")
-            rate_s = v;
-        else if (k == "--delay")
-            delay = atoll(v.c_str());
-        else if (k == "--q3cap")
-            q3cap = atoi(v.c_str());
-        else if (k == "--tail")
-            tail_log2 = atoi(v.c_str());
-        else if (k == "--spread")
-            spread = atoi(v.c_str());
-        else if (k == "--serial")
-            serial = 1;
-        else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
-        {
-            // KEY=VALUE, or KEY=V1,V2,... for a key with several values (KMAX_MAP=1,100000000000,800)
-            vector<string> vals;
-            size_t b = 0;
-            for (size_t c; (c = v.find(',', b)) != string::npos; b = c + 1)
-                vals.push_back(v.substr(b, c - b));
-            vals.push_back(v.substr(b));
-            cfg[k] = vals;
-        }
-        else
-        {
-            fprintf(stderr, "unknown argument %s\n", argv[i]);
-            return 1;
-        }
-    }
+    string name;
+    Params P;
+    int H = 0, S = 0, N = 0, L = 0, K = 1;
+    vector<int> deg, out_link, in_link, link_dst, link_dport; // [N K] with the world's K
+    vector<Route> rt;                                         // [S H]
+    vector<FlowInfo> fi;
+    vector<int> start_list, start_off;
+    int64_t max_slots = 0;
+};
 
-    Params P = {};
-    P.cc = u32("CC_MODE", 1);
+static bool build_world(World &w, const Config &config, const string &topo_file, const string &flow_file, uint64_t bps, int64_t delay)
+{
+    Cfg cfg{config};
+    Params &P = w.P;
+    P = Params{};
+    P.cc = cfg.u32("CC_MODE", 1);
     if (P.cc != 1 && P.cc != 3)
     {
-        fprintf(stderr, "CC_MODE %d: only 1 (DCQCN) and 3 (HPCC) are modelled\n", P.cc);
-        return 1;
+        fprintf(stderr, "%s: CC_MODE %d: only 1 (DCQCN) and 3 (HPCC) are modelled\n", w.name.c_str(), P.cc);
+        return false;
     }
-    if (u32("MULTI_RATE", 1) && P.cc == 3)
+    if (cfg.u32("MULTI_RATE", 1) && P.cc == 3)
     {
-        fprintf(stderr, "MULTI_RATE 1 is not modelled\n");
-        return 1;
+        fprintf(stderr, "%s: MULTI_RATE 1 is not modelled\n", w.name.c_str());
+        return false;
     }
-    if (u32("L2_BACK_TO_ZERO", 0))
+    if (cfg.u32("L2_BACK_TO_ZERO", 0))
     {
-        fprintf(stderr, "L2_BACK_TO_ZERO 1 is not modelled\n");
-        return 1;
+        fprintf(stderr, "%s: L2_BACK_TO_ZERO 1 is not modelled\n", w.name.c_str());
+        return false;
     }
     P.int_size = P.cc == 3 ? 42 : 0;
-    P.mtu = u32("PACKET_PAYLOAD_SIZE", 1000);
-    P.ack_interval = u32("L2_ACK_INTERVAL", 0);
-    P.chunk = u32("L2_CHUNK_SIZE", 0);
+    P.mtu = cfg.u32("PACKET_PAYLOAD_SIZE", 1000);
+    P.ack_interval = cfg.u32("L2_ACK_INTERVAL", 0);
+    P.chunk = cfg.u32("L2_CHUNK_SIZE", 0);
     if (P.ack_interval == 0)
     {
-        fprintf(stderr, "L2_ACK_INTERVAL 0 is not modelled\n");
-        return 1;
+        fprintf(stderr, "%s: L2_ACK_INTERVAL 0 is not modelled\n", w.name.c_str());
+        return false;
     }
     P.nack_interval = 500000; // RdmaHw "NACK Generation Interval", 500 us
-    P.bps = parse_rate(rate_s);
+    P.bps = bps;
     P.delay = delay;
-    P.var_win = u32("VAR_WIN", 0);
-    P.rate_bound = u32("RATE_BOUND", 1);
-    P.ack_high_prio = u32("ACK_HIGH_PRIO", 0);
-    P.ecn = u32("ENABLE_QCN", 1);
+    P.var_win = cfg.u32("VAR_WIN", 0);
+    P.rate_bound = cfg.u32("RATE_BOUND", 1);
+    P.ack_high_prio = cfg.u32("ACK_HIGH_PRIO", 0);
+    P.ecn = cfg.u32("ENABLE_QCN", 1);
     P.qbb = 1;
-    P.g = num("EWMA_GAIN", 1.0 / 16);
+    P.g = cfg.num("EWMA_GAIN", 1.0 / 16);
     P.rate_first_cnp = 1.0;
-    P.clamp = u32("CLAMP_TARGET_RATE", 0);
+    P.clamp = cfg.u32("CLAMP_TARGET_RATE", 0);
     // MicroSeconds(double): the attribute is a double, MicroSeconds takes an integer
-    P.alpha_int = (int64_t)(uint64_t)num("ALPHA_RESUME_INTERVAL", 55) * 1000;
-    P.dec_int = (int64_t)(uint64_t)num("RATE_DECREASE_INTERVAL", 4) * 1000;
-    P.rp_int = (int64_t)(uint64_t)num("RP_TIMER", 1500) * 1000;
-    P.rpg_threshold = u32("FAST_RECOVERY_TIMES", 5);
-    P.rai = parse_rate(str("RATE_AI", "5Mb/s"));
-    P.rhai = parse_rate(str("RATE_HAI", "50Mb/s"));
-    P.min_rate = parse_rate(str("MIN_RATE", "100Mb/s"));
-    P.u_target = num("U_TARGET", 0.95);
-    P.mi_thresh = u32("MI_THRESH", 5);
-    P.fast_react = u32("FAST_REACT", 1);
+    P.alpha_int = (int64_t)(uint64_t)cfg.num("ALPHA_RESUME_INTERVAL", 55) * 1000;
+    P.dec_int = (int64_t)(uint64_t)cfg.num("RATE_DECREASE_INTERVAL", 4) * 1000;
+    P.rp_int = (int64_t)(uint64_t)cfg.num("RP_TIMER", 1500) * 1000;
+    P.rpg_threshold = cfg.u32("FAST_RECOVERY_TIMES", 5);
+    P.rai = parse_rate(cfg.str("RATE_AI", "5Mb/s"));
+    P.rhai = parse_rate(cfg.str("RATE_HAI", "50Mb/s"));
+    P.min_rate = parse_rate(cfg.str("MIN_RATE", "100Mb/s"));
+    P.u_target = cfg.num("U_TARGET", 0.95);
+    P.mi_thresh = cfg.u32("MI_THRESH", 5);
+    P.fast_react = cfg.u32("FAST_REACT", 1);
     P.multi_rate = 0;
-    P.sample_feedback = u32("SAMPLE_FEEDBACK", 0);
-    P.int_multi = u32("INT_MULTI", 1);
-    P.buffer_size = u32("BUFFER_SIZE", 16) * 1024 * 1024;
+    P.sample_feedback = cfg.u32("SAMPLE_FEEDBACK", 0);
+    P.int_multi = cfg.u32("INT_MULTI", 1);
+    P.buffer_size = cfg.u32("BUFFER_SIZE", 16) * 1024 * 1024;
     P.pfc_shift = 3;
     {
         // KMAX_MAP n rate k ...: kmin and kmax in KB (ConfigEcn multiplies by 1000)
         auto lookup = [&](const char *key, double *out) {
-            if (!has(key))
+            if (!cfg.has(key))
                 return false;
-            vector<string> &v = cfg[key];
+            const vector<string> &v = config.at(key);
             int n = atoi(v[0].c_str());
             for (int i = 0; i < n; i++)
                 if (strtoull(v[1 + 2 * i].c_str(), 0, 10) == P.bps)
@@ -227,8 +212,8 @@ int main(int argc, char **argv)
         double kmin, kmax, pmax;
         if (!lookup("KMIN_MAP", &kmin) || !lookup("KMAX_MAP", &kmax) || !lookup("PMAX_MAP", &pmax))
         {
-            fprintf(stderr, "KMIN/KMAX/PMAX_MAP: no entry for %llu bps\n", (unsigned long long)P.bps);
-            return 1;
+            fprintf(stderr, "%s: KMIN/KMAX/PMAX_MAP: no entry for %llu bps\n", w.name.c_str(), (unsigned long long)P.bps);
+            return false;
         }
         P.kmin = (uint32_t)kmin * 1000;
         P.kmax = (uint32_t)kmax * 1000;
@@ -236,66 +221,77 @@ int main(int argc, char **argv)
     }
     if (P.cc == 1 && (P.alpha_int < delay || P.dec_int < delay || P.rp_int < delay))
     {
-        fprintf(stderr, "DCQCN timer intervals must be at least the link delay\n");
-        return 1;
+        fprintf(stderr, "%s: DCQCN timer intervals must be at least the link delay\n", w.name.c_str());
+        return false;
     }
+    if (cfg.u32("GLOBAL_T", 1) != 1)
+    {
+        fprintf(stderr, "%s: GLOBAL_T 0 is not modelled\n", w.name.c_str());
+        return false;
+    }
+    w.max_slots = (int64_t)(cfg.num("SIMULATOR_STOP_TIME", 10.0) * 1e9) / delay;
 
     // ---- topology
-    int H = 0, S = 0;
+    int &H = w.H, &S = w.S;
     vector<std::pair<int, int>> links;
     {
         std::ifstream f(topo_file);
         if (!f)
         {
             fprintf(stderr, "cannot open %s\n", topo_file.c_str());
-            return 1;
+            return false;
         }
-        string w, a, b;
-        while (f >> w)
+        string a, b, x;
+        while (f >> x)
         {
-            if (w == "hosts")
+            if (x == "hosts")
                 f >> H;
-            else if (w == "switches")
+            else if (x == "switches")
                 f >> S;
-            else if (w == "link")
+            else if (x == "link")
             {
                 f >> a >> b;
-                auto id = [&](const string &x) { return (x[0] == 'h' ? 0 : H) + atoi(x.c_str() + 1); };
+                auto id = [&](const string &y) { return (y[0] == 'h' ? 0 : H) + atoi(y.c_str() + 1); };
                 links.push_back({id(a), id(b)});
             }
         }
     }
-    int N = H + S, L = 2 * (int)links.size();
-    vector<int> deg(N, 0);
+    int N = w.N = H + S, L = w.L = 2 * (int)links.size();
+    vector<int> &deg = w.deg;
+    deg.assign(N, 0);
     for (auto &l : links)
         deg[l.first]++, deg[l.second]++;
     int K = 1;
     for (int n = 0; n < N; n++)
         K = std::max(K, deg[n]);
+    w.K = K;
     if (K > KMAX)
     {
-        fprintf(stderr, "a node has %d ports (at most %d)\n", K, KMAX);
-        return 1;
+        fprintf(stderr, "%s: a node has %d ports (at most %d)\n", w.name.c_str(), K, KMAX);
+        return false;
     }
     for (int h = 0; h < H; h++)
         if (deg[h] != 1)
         {
-            fprintf(stderr, "host %d has %d links (one expected)\n", h, deg[h]);
-            return 1;
+            fprintf(stderr, "%s: host %d has %d links (one expected)\n", w.name.c_str(), h, deg[h]);
+            return false;
         }
-    vector<int> out_link((size_t)N * K, -1), in_link((size_t)N * K, -1), link_dst(L), link_dport(L);
+    w.out_link.assign((size_t)N * K, -1);
+    w.in_link.assign((size_t)N * K, -1);
+    w.link_dst.assign(L, 0);
+    w.link_dport.assign(L, 0);
     vector<std::map<int, int>> nbr(N); // neighbour -> port (ns-3's nbr2if: by node id, the last link wins)
     {
         vector<int> d(N, 0);
         for (size_t i = 0; i < links.size(); i++)
         {
             int a = links[i].first, b = links[i].second, pa = d[a]++, pb = d[b]++;
-            out_link[(size_t)a * K + pa] = 2 * i;
-            in_link[(size_t)a * K + pa] = 2 * i + 1;
-            out_link[(size_t)b * K + pb] = 2 * i + 1;
-            in_link[(size_t)b * K + pb] = 2 * i;
-            link_dst[2 * i] = b, link_dport[2 * i] = pb;
-            link_dst[2 * i + 1] = a, link_dport[2 * i + 1] = pa;
+            w.out_link[(size_t)a * K + pa] = 2 * i;
+            w.in_link[(size_t)a * K + pa] = 2 * i + 1;
+            w.out_link[(size_t)b * K + pb] = 2 * i + 1;
+            w.in_link[(size_t)b * K + pb] = 2 * i;
+            w.link_dst[2 * i] = b, w.link_dport[2 * i] = pb;
+            w.link_dst[2 * i + 1] = a, w.link_dport[2 * i + 1] = pa;
             nbr[a][b] = pa;
             nbr[b][a] = pb;
         }
@@ -326,16 +322,16 @@ int main(int argc, char **argv)
         for (int n = 0; n < N; n++)
             hop_n[n][h] = dis[n];
     }
-    vector<Route> rt((size_t)S * H);
+    w.rt.assign((size_t)S * H, Route{});
     for (int x = 0; x < S; x++)
         for (int h = 0; h < H; h++)
         {
-            Route &r = rt[(size_t)x * H + h];
-            r = Route{};
+            Route &r = w.rt[(size_t)x * H + h];
             if (next_hop[x][h].size() > (size_t)RT_PORTS)
             {
-                fprintf(stderr, "switch %d has %zu equal-cost ports towards host %d (at most %d)\n", H + x, next_hop[x][h].size(), h, RT_PORTS);
-                return 1;
+                fprintf(stderr, "%s: switch %d has %zu equal-cost ports towards host %d (at most %d)\n", w.name.c_str(), H + x,
+                        next_hop[x][h].size(), h, RT_PORTS);
+                return false;
             }
             r.n = next_hop[x][h].size();
             for (int i = 0; i < r.n; i++)
@@ -351,30 +347,24 @@ int main(int argc, char **argv)
         if (P.cc == 3 && far - 1 > MAX_HOP)
         {
             // the reference's INT header has 5 hops; on longer paths it writes past hp.hop[]
-            fprintf(stderr, "HPCC: paths of %lld switches (INT records at most %d)\n", (long long)(far - 1), MAX_HOP);
-            return 1;
+            fprintf(stderr, "%s: HPCC: paths of %lld switches (INT records at most %d)\n", w.name.c_str(), (long long)(far - 1), MAX_HOP);
+            return false;
         }
         uint64_t per_hop_tx = (uint64_t)P.mtu * 1000000000ull * 8 / P.bps;
         max_rtt = (uint64_t)far * (uint64_t)delay * 2 + (uint64_t)far * per_hop_tx;
         max_bdp = max_rtt * P.bps / 1000000000ull / 8;
     }
     P.base_rtt = max_rtt;
-    P.win = u32("HAS_WIN", 1) ? (uint32_t)max_bdp : 0;
-    if (u32("GLOBAL_T", 1) != 1)
-    {
-        fprintf(stderr, "GLOBAL_T 0 is not modelled\n");
-        return 1;
-    }
-    printf("maxRtt=%llu maxBdp=%llu\n", (unsigned long long)max_rtt, (unsigned long long)max_bdp);
+    P.win = cfg.u32("HAS_WIN", 1) ? (uint32_t)max_bdp : 0;
 
     // ---- flows (rows in start order, stable; per host pair ports from 10000)
-    vector<FlowInfo> fi;
+    vector<FlowInfo> &fi = w.fi;
     {
         std::ifstream f(flow_file);
         if (!f)
         {
             fprintf(stderr, "cannot open %s\n", flow_file.c_str());
-            return 1;
+            return false;
         }
         string line;
         std::getline(f, line);
@@ -390,6 +380,12 @@ int main(int argc, char **argv)
         }
     }
     int F = fi.size();
+    for (auto &x : fi)
+        if (x.src >= H || x.dst >= H)
+        {
+            fprintf(stderr, "%s: a flow between %d and %d: not hosts\n", w.name.c_str(), x.src, x.dst);
+            return false;
+        }
     vector<int> order(F);
     for (int i = 0; i < F; i++)
         order[i] = i;
@@ -427,27 +423,239 @@ int main(int argc, char **argv)
             i = j;
         }
     }
-    for (auto &x : fi)
-        if (x.src >= H || x.dst >= H)
+    w.start_list.assign(F, 0);
+    w.start_off.assign(H + 1, 0);
+    for (int i = 0; i < F; i++)
+        w.start_off[fi[order[i]].src + 1]++;
+    for (int h = 0; h < H; h++)
+        w.start_off[h + 1] += w.start_off[h];
+    {
+        vector<int> pos(w.start_off.begin(), w.start_off.end() - 1);
+        for (int i = 0; i < F; i++)
+            w.start_list[pos[fi[order[i]].src]++] = order[i];
+    }
+    return true;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        fprintf(stderr, "usage: twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns] [KEY=VALUE ...]\n"
+                        "       twins-rdma CONFIG --batch=JOBFILE --outdir=DIR [KEY=VALUE ...]\n");
+        return 1;
+    }
+    Config base;
+    if (!read_config(argv[1], base))
+        return 1;
+    string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "";
+    int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
+    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0;
+    for (int i = 2; i < argc; i++)
+    {
+        string a = argv[i];
+        size_t eq = a.find('=');
+        string k = a.substr(0, eq), v = eq == string::npos ? "" : a.substr(eq + 1);
+        if (k == "--topo")
+            topo_file = v;
+        else if (k == "--flows")
+            flow_file = v;
+        else if (k == "--out")
+            out_file = v;
+        else if (k == "--batch")
+            batch_file = v;
+        else if (k == "--outdir")
+            out_dir = v;
+        else if (k == "--path")
+            data_dirs = v;
+        else if (k == "--txtrace")
+            tx_file = v;
+        else if (k == "--from")
+            tx_from = atoll(v.c_str());
+        else if (k == "--until")
+            tx_until = atoll(v.c_str());
+        else if (k == "--rate")
+            rate_s = v;
+        else if (k == "--delay")
+            delay = atoll(v.c_str());
+        else if (k == "--q3cap")
+            q3cap = atoi(v.c_str());
+        else if (k == "--tail")
+            tail_log2 = atoi(v.c_str());
+        else if (k == "--spread")
+            spread = atoi(v.c_str());
+        else if (k == "--serial")
+            serial = 1;
+        else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
+            set_override(base, k, v);
+        else
         {
-            fprintf(stderr, "a flow between %d and %d: not hosts\n", x.src, x.dst);
+            fprintf(stderr, "unknown argument %s\n", argv[i]);
             return 1;
         }
-    vector<int> start_list(F), start_off(H + 1, 0);
-    for (int i = 0; i < F; i++)
-        start_off[fi[order[i]].src + 1]++;
+    }
+    const uint64_t bps = parse_rate(rate_s);
+
+    // ---- the worlds: one, or a job file's lines "name topo flows [KEY=VALUE ...]" (the files
+    // looked up in the --path directories, colon separated, and as given)
+    vector<World> worlds;
+    auto find_file = [&](const string &f) {
+        size_t b = 0;
+        while (b <= data_dirs.size() && !data_dirs.empty())
+        {
+            size_t c = data_dirs.find(':', b);
+            string d = data_dirs.substr(b, c == string::npos ? string::npos : c - b);
+            string p = d + "/" + f;
+            if (std::ifstream(p))
+                return p;
+            if (c == string::npos)
+                break;
+            b = c + 1;
+        }
+        return f;
+    };
+    if (batch_file.empty())
+    {
+        worlds.emplace_back();
+        worlds[0].name = "run";
+        if (!build_world(worlds[0], base, topo_file, flow_file, bps, delay))
+            return 1;
+    }
+    else
+    {
+        if (!tx_file.empty())
+        {
+            fprintf(stderr, "--txtrace traces one world (no --batch)\n");
+            return 1;
+        }
+        std::ifstream f(batch_file);
+        if (!f)
+        {
+            fprintf(stderr, "cannot open %s\n", batch_file.c_str());
+            return 1;
+        }
+        string line;
+        while (std::getline(f, line))
+        {
+            std::istringstream is(line);
+            string name, topo, flows, kv;
+            if (!(is >> name) || name[0] == '#' || !(is >> topo >> flows))
+                continue;
+            Config cfg = base;
+            while (is >> kv)
+            {
+                size_t eq = kv.find('=');
+                if (eq == string::npos)
+                {
+                    fprintf(stderr, "%s: bad override %s\n", name.c_str(), kv.c_str());
+                    return 1;
+                }
+                set_override(cfg, kv.substr(0, eq), kv.substr(eq + 1));
+            }
+            worlds.emplace_back();
+            worlds.back().name = name;
+            if (!build_world(worlds.back(), cfg, find_file(topo), find_file(flows), bps, delay))
+                return 1;
+        }
+        if (worlds.empty())
+        {
+            fprintf(stderr, "%s: no jobs\n", batch_file.c_str());
+            return 1;
+        }
+    }
+    const int W = worlds.size();
+
+    // ---- the worlds side by side: hosts of all worlds, then switches; links and flows in turn
+    int H = 0, S = 0, L = 0, F = 0, K = 1;
+    vector<int> hbase(W), sbase(W), lbase(W), fbase(W);
+    for (int i = 0; i < W; i++)
+    {
+        World &w = worlds[i];
+        hbase[i] = H, sbase[i] = S, lbase[i] = L, fbase[i] = F;
+        H += w.H, S += w.S, L += w.L, F += w.fi.size();
+        K = std::max(K, w.K);
+    }
+    const int N = H + S;
+    auto gnode = [&](int wi, int n) { return n < worlds[wi].H ? hbase[wi] + n : H + sbase[wi] + (n - worlds[wi].H); };
+    vector<int> deg(N), out_link((size_t)N * K, -1), in_link((size_t)N * K, -1), link_dst(L), link_dport(L);
+    vector<Route> rt;
+    vector<SwInfo> si(S);
+    vector<FlowInfo> fi(F);
+    vector<int> start_list(F), start_off(H + 1, 0), h_world(H), s_world(S);
+    vector<Params> Pw(W);
+    int64_t max_slots = 0;
+    for (int wi = 0; wi < W; wi++)
+    {
+        World &w = worlds[wi];
+        Pw[wi] = w.P;
+        max_slots = std::max(max_slots, w.max_slots);
+        for (int n = 0; n < w.N; n++)
+        {
+            int g = gnode(wi, n);
+            deg[g] = w.deg[n];
+            for (int p = 0; p < w.K; p++)
+            {
+                int ol = w.out_link[(size_t)n * w.K + p], il = w.in_link[(size_t)n * w.K + p];
+                out_link[(size_t)g * K + p] = ol < 0 ? -1 : lbase[wi] + ol;
+                in_link[(size_t)g * K + p] = il < 0 ? -1 : lbase[wi] + il;
+            }
+        }
+        for (int l = 0; l < w.L; l++)
+        {
+            link_dst[lbase[wi] + l] = gnode(wi, w.link_dst[l]);
+            link_dport[lbase[wi] + l] = w.link_dport[l];
+        }
+        for (int x = 0; x < w.S; x++)
+        {
+            SwInfo &z = si[sbase[wi] + x];
+            z.seed = (uint32_t)(w.H + x);
+            z.hbase = hbase[wi];
+            z.rt_off = rt.size();
+            rt.insert(rt.end(), w.rt.begin() + (size_t)x * w.H, w.rt.begin() + (size_t)(x + 1) * w.H);
+            s_world[sbase[wi] + x] = wi;
+        }
+        for (size_t f = 0; f < w.fi.size(); f++)
+        {
+            FlowInfo x = w.fi[f];
+            x.src += hbase[wi];
+            x.dst += hbase[wi];
+            fi[fbase[wi] + f] = x;
+        }
+        for (int h = 0; h < w.H; h++)
+        {
+            h_world[hbase[wi] + h] = wi;
+            start_off[hbase[wi] + h + 1] = w.start_off[h + 1] - w.start_off[h];
+        }
+        for (size_t f = 0; f < w.start_list.size(); f++)
+            start_list[fbase[wi] + f] = fbase[wi] + w.start_list[f];
+    }
     for (int h = 0; h < H; h++)
         start_off[h + 1] += start_off[h];
+    if (H + S > 65535 * 2 || H > 65535)
     {
-        vector<int> pos(start_off.begin(), start_off.end() - 1);
-        for (int i = 0; i < F; i++)
-            start_list[pos[fi[order[i]].src]++] = order[i];
+        fprintf(stderr, "too many hosts (%d; frames carry 16-bit host ids)\n", H);
+        return 1;
     }
+    Params P = Pw[0];
+    if (W == 1)
+        printf("maxRtt=%llu maxBdp=%u\n", (unsigned long long)P.base_rtt, P.win);
+    else
+        printf("%d worlds: %d hosts, %d switches, %d flows\n", W, H, S, F);
 
     // ---- device state
     Sim s = {};
     s.H = H, s.S = S, s.N = N, s.L = L, s.K = K, s.F = F;
     s.P = P;
+    s.W = W;
+    s.Pw = dev_copy(Pw);
+    s.h_world = dev_copy(h_world);
+    s.s_world = dev_copy(s_world);
+    s.si = dev_copy(si);
+    vector<int> pbase(S + 1, 0);
+    for (int x = 0; x < S; x++)
+        pbase[x + 1] = pbase[x] + deg[H + x];
+    const size_t nports = pbase[S];
+    s.pbase = dev_copy(pbase);
     s.deg = dev_copy(deg);
     s.out_link = dev_copy(out_link);
     s.in_link = dev_copy(in_link);
@@ -484,32 +692,33 @@ int main(int argc, char **argv)
     s.qps = dev_alloc<int>((size_t)H * s.qps_cap);
     {
         vector<Switch> sw(S);
-        vector<Port> ps((size_t)S * K);
+        vector<Port> ps(nports);
         uint32_t headroom = (uint32_t)(P.bps * (uint64_t)delay / 8 / 1000000000ull * 3);
         for (int x = 0; x < S; x++)
         {
             int n = deg[H + x];
+            uint32_t node = si[x].seed; // the switch's node id in its world
             sw[x] = Switch{};
             sw[x].headroom = headroom;
             sw[x].total_hdrm = headroom * n;
             sw[x].total_rsrv = RESERVE * n;
-            for (int p = 0; p < K; p++)
+            for (int p = 0; p < n; p++)
             {
-                Port &pt = ps[(size_t)x * K + p];
+                Port &pt = ps[pbase[x] + p];
                 pt = Port{};
                 pt.tc_at = -1;
                 // ConfigEcnStream(port, node * SwitchMmu::pCnt + device)
-                pt.rng = nsm_rng::stream_state(1, (uint64_t)(H + x) * 257 + (p + 1), 1);
+                pt.rng = nsm_rng::stream_state(1, (uint64_t)node * 257 + (p + 1), 1);
             }
         }
         s.sw = dev_copy(sw);
         s.ps = dev_copy(ps);
     }
-    s.p_tc = dev_alloc<Chain>((size_t)S * K);
+    s.p_tc = dev_alloc<Chain>(nports);
     s.q0_cap = 64;
     s.q3_cap = q3cap;
-    s.q0 = dev_alloc<Pkt>((size_t)S * K * s.q0_cap);
-    s.q3 = dev_alloc<Pkt>((size_t)S * K * s.q3_cap);
+    s.q0 = dev_alloc<Pkt>((size_t)nports * s.q0_cap);
+    s.q3 = dev_alloc<Pkt>((size_t)nports * s.q3_cap);
     s.msg = dev_alloc<LFrame>((size_t)NB * L * MAXF);
     {
         vector<long long> mc((size_t)NB * L, -(1ll << 16));
@@ -524,7 +733,7 @@ int main(int argc, char **argv)
         s.next_wake = dev_copy(nw);
     }
     s.finished = dev_alloc<int>(1);
-    s.max_slots = (int64_t)(num("SIMULATOR_STOP_TIME", 10.0) * 1e9) / delay;
+    s.max_slots = max_slots;
     {
         vector<int64_t> fct(F, -1);
         s.fct = dev_copy(fct);
@@ -603,11 +812,23 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
     unsigned long long ev[32];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
-    FILE *fo = fopen(out_file.c_str(), "w");
-    for (int i = 0; i < F; i++)
-        if (fct[i] >= 0)
-            fprintf(fo, "%d %lld %lld\n", i, (long long)fi[i].start, (long long)fct[i]);
-    fclose(fo);
+    for (int wi = 0; wi < W; wi++)
+    {
+        string path = batch_file.empty() ? out_file : out_dir + "/" + worlds[wi].name + ".fct";
+        FILE *fo = fopen(path.c_str(), "w");
+        if (!fo)
+        {
+            fprintf(stderr, "cannot write %s\n", path.c_str());
+            return 1;
+        }
+        for (size_t i = 0; i < worlds[wi].fi.size(); i++)
+        {
+            int g = fbase[wi] + i;
+            if (fct[g] >= 0)
+                fprintf(fo, "%zu %lld %lld\n", i, (long long)fi[g].start, (long long)fct[g]);
+        }
+        fclose(fo);
+    }
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);
     printf("drops %llu marks %llu pauses %llu resumes %llu nacks %llu | undecided ties %llu, on lost tails %llu | overflows: tx %llu queue %llu ackq %llu qps %llu due %llu | acks for done QPs %llu\n",

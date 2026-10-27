@@ -414,6 +414,7 @@ __device__ __forceinline__ uint32_t arrival_code(const Sim &s, const LFrame &f) 
 struct HCtx
 {
     const Sim *s;
+    const Params *P; // its world's
     int h;
     bool pre_ok;     // the running ACK's HPCC U and dt were computed ahead
     double pre_U;
@@ -441,12 +442,12 @@ __device__ __forceinline__ int64_t qp_tx(SndQP &q, uint64_t rate, uint32_t bytes
     return q.tx_val;
 }
 
-__device__ __forceinline__ bool win_bound(const Sim &s, const SndQP &q)
+__device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
 {
     if (q.win == 0)
         return false;
     uint64_t w = q.win;
-    if (s.P.var_win)
+    if (P.var_win)
     {
         w = (uint64_t)q.win * q.rate / q.max_rate;
         if (w == 0)
@@ -486,7 +487,7 @@ __device__ __forceinline__ void h_schedule_ns(HCtx &c, int64_t at)
 __device__ __forceinline__ int next_qindex(HCtx &c)
 {
     const Sim &s = *c.s;
-    int ackq = s.P.ack_high_prio ? 0 : PG;
+    int ackq = c.P->ack_high_prio ? 0 : PG;
     if (!(c.st.paused >> ackq & 1) && c.st.ackq_n > 0)
         return -1;
     int *list = s.qps + (size_t)c.h * s.qps_cap;
@@ -495,7 +496,7 @@ __device__ __forceinline__ int next_qindex(HCtx &c)
     {
         int idx = (qi + c.st.rr) % fcount;
         const SndQP &q = s.qp[list[idx]];
-        if (!(c.st.paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(s, q))
+        if (!(c.st.paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
         {
             if (q.next_avail > c.now)
                 continue;
@@ -543,7 +544,7 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
         SndQP &q = s.qp[f];
         // RdmaHw::GetNxtPacket
         uint64_t left = bytes_left(q);
-        uint32_t payload = left < s.P.mtu ? (uint32_t)left : s.P.mtu;
+        uint32_t payload = left < c.P->mtu ? (uint32_t)left : c.P->mtu;
         Pkt p = {};
         p.kind = K_DATA;
         p.flow = f;
@@ -551,12 +552,12 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
         p.dst = (uint16_t)s.fi[f].dst;
         p.sport = (uint16_t)s.fi[f].sport;
         p.seq = (uint32_t)q.snd_nxt;
-        p.size = (uint16_t)data_size(s.P, payload);
+        p.size = (uint16_t)data_size(*c.P, payload);
         q.snd_nxt += payload;
         h_transmit(c, p);
         // RdmaHw::PktSent, UpdateNextAvail
         q.last_pkt = p.size;
-        q.next_avail = c.now + qp_tx(q, s.P.rate_bound ? q.rate : q.max_rate, p.size);
+        q.next_avail = c.now + qp_tx(q, c.P->rate_bound ? q.rate : q.max_rate, p.size);
         return;
     }
     int64_t t = INT64_MAX;
@@ -610,7 +611,7 @@ __device__ __forceinline__ void hpcc_hops(const Params &P, const uint64_t *ph, i
 // (hpcc_hops, in the host's prologue)
 __device__ __forceinline__ void hpcc_update(HCtx &c, SndQP &q, const Pkt &p, bool fast)
 {
-    const Params &P = c.s->P;
+    const Params &P = *c.P;
     uint32_t next_seq = (uint32_t)q.snd_nxt;
     if (q.last_update_seq == 0)
     {
@@ -696,11 +697,11 @@ __device__ __forceinline__ void dcqcn_cnp(HCtx &c, int f, SndQP &q)
     {
         q.alpha = 1;
         q.alpha_cnp = 0;
-        q.t_alpha = c.now + s.P.alpha_int;
-        cpush(&s.qc[f].alpha, ccode(s.P.alpha_int, c.ord++), c.cur);
-        q.t_dec = c.now + s.P.dec_int + 1;
-        cpush(&s.qc[f].dec, ccode(s.P.dec_int + 1, c.ord++), c.cur);
-        q.target = q.rate = rate_of((double)q.rate * s.P.rate_first_cnp);
+        q.t_alpha = c.now + c.P->alpha_int;
+        cpush(&s.qc[f].alpha, ccode(c.P->alpha_int, c.ord++), c.cur);
+        q.t_dec = c.now + c.P->dec_int + 1;
+        cpush(&s.qc[f].dec, ccode(c.P->dec_int + 1, c.ord++), c.cur);
+        q.target = q.rate = rate_of((double)q.rate * c.P->rate_first_cnp);
         q.first_cnp = 0;
     }
 }
@@ -709,7 +710,7 @@ __device__ __forceinline__ void dcqcn_cnp(HCtx &c, int f, SndQP &q)
 __device__ __forceinline__ void dcqcn_timer(HCtx &c, int f, int kind)
 {
     const Sim &s = *c.s;
-    const Params &P = s.P;
+    const Params &P = *c.P;
     SndQP &q = s.qp[f];
     if (kind == 0)
     {
@@ -775,13 +776,13 @@ __device__ __forceinline__ void h_ack(HCtx &c, const Pkt &p)
     }
     if (p.kind == K_NACK)
         q.snd_nxt = q.snd_una;
-    if (p.cnp && s.P.cc == 1 && !q.done) // (after QpComplete its timers would touch nothing else)
+    if (p.cnp && c.P->cc == 1 && !q.done) // (after QpComplete its timers would touch nothing else)
         dcqcn_cnp(c, f, q);
-    if (s.P.cc == 3)
+    if (c.P->cc == 3)
     {
         if (p.seq > q.last_update_seq)
             hpcc_update(c, q, p, false);
-        else if (s.P.fast_react)
+        else if (c.P->fast_react)
             hpcc_update(c, q, p, true);
     }
     h_dequeue(c);
@@ -792,7 +793,7 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
 {
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
-    uint32_t payload = p.size - 48 - s.P.int_size;
+    uint32_t payload = p.size - 48 - c.P->int_size;
     // data for a flow received whole: if the sender has completed by now, ns-3 has deleted the
     // receiving queue pair, and a new one would answer with a NACK (not modelled; needs a drop)
     if (r.expected >= s.fi[p.flow].size)
@@ -803,9 +804,9 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
     if (p.seq == expected)
     {
         r.expected = expected + payload;
-        if (r.expected >= s.P.ack_interval)
+        if (r.expected >= c.P->ack_interval)
             x = 1;
-        else if (s.P.chunk && r.expected % s.P.chunk == 0)
+        else if (c.P->chunk && r.expected % c.P->chunk == 0)
             x = 1;
         else
             x = 5;
@@ -814,7 +815,7 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
     {
         if (c.now >= r.nack_timer || r.last_nack != expected)
         {
-            r.nack_timer = c.now + s.P.nack_interval;
+            r.nack_timer = c.now + c.P->nack_interval;
             r.last_nack = expected;
             x = 2;
         }
@@ -832,7 +833,7 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
     a.seq = r.expected;
     a.cnp = p.ecn ? 1 : 0;
     a.ecn = 0;
-    a.size = (uint16_t)ack_size(s.P);
+    a.size = (uint16_t)ack_size(*c.P);
     if (c.st.ackq_n >= s.ackq_cap)
     {
         atomicAdd(&s.ev[6], 1ull);
@@ -852,8 +853,8 @@ __device__ __forceinline__ void h_start(HCtx &c, int f)
     q = SndQP{};
     q.size = fi.size;
     q.rate = q.max_rate = s.P.bps;
-    q.win = s.P.win;
-    q.base_rtt = s.P.base_rtt;
+    q.win = c.P->win;
+    q.base_rtt = c.P->base_rtt;
     q.alpha = 1;
     q.first_cnp = 1;
     q.target = s.P.bps;
@@ -909,6 +910,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
 {
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const int link_in = s.in_link[(size_t)h * s.K];
+    const Params &WP = s.Pw[s.h_world[h]];
     if (lane == 0)
     {
         // the arrivals: at most the last frame of slot s - 2, the frames of slot s - 1 but perhaps the last
@@ -942,7 +944,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     __syncthreads();
     // (with FAST_REACT every ACK of a QP calls UpdateRateHp, which stores its hops; without it,
     // only those that end an RTT do)
-    if (pooled && s.P.cc == 3 && s.P.fast_react && !s.P.sample_feedback)
+    if (pooled && WP.cc == 3 && WP.fast_react && !WP.sample_feedback)
         for (int j = lane; j < total; j += lanes)
         {
             HArr &a = pool[j];
@@ -953,7 +955,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             while (k >= 0 && !(pool[k].p.flow == a.p.flow && (pool[k].p.kind == K_ACK || pool[k].p.kind == K_NACK)))
                 k--;
             const SndQP &q = s.qp[a.p.flow];
-            hpcc_hops(s.P, a.p.hop, a.p.nhop, k >= 0 ? pool[k].p.hop : q.hop, q.max_rate, q.win, &a.U, &a.dt);
+            hpcc_hops(WP, a.p.hop, a.p.nhop, k >= 0 ? pool[k].p.hop : q.hop, q.max_rate, q.win, &a.U, &a.dt);
             a.pre = 1;
         }
     __syncthreads();
@@ -961,6 +963,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         return false;
     HCtx c;
     c.s = &s;
+    c.P = &WP;
     c.h = h;
     c.st = s.hs[h];
     c.slot = slot;
@@ -975,7 +978,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     Due due[MAX_DUE];
     int nd = 0;
     const int *list = s.qps + (size_t)h * s.qps_cap;
-    if (s.P.cc == 1)
+    if (WP.cc == 1)
         for (int i = 0; i < c.st.qp_n; i++)
         {
             const SndQP &q = s.qp[list[i]];
@@ -1083,7 +1086,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                 h_ack(c, p);
                 c.pre_ok = false;
             }
-            else if (s.P.qbb)
+            else if (WP.qbb)
             {
                 if (p.kind == K_PAUSE)
                     c.st.paused |= 1u << p.q;
@@ -1127,7 +1130,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         int64_t t = s.fi[s.start_list[c.st.next_start]].start;
         w = t < w ? t : w;
     }
-    if (s.P.cc == 1)
+    if (WP.cc == 1)
         for (int i = 0; i < c.st.qp_n; i++)
         {
             const SndQP &q = s.qp[list[i]];
@@ -1175,6 +1178,7 @@ constexpr int POOL = 1024; // arrivals per switch and slot in the pool (global m
 struct SCtx
 {
     const Sim *s;
+    const Params *P; // its world's
     int x, node;
     SwPortLds *w; // [deg]
     Chain *tc;    // [deg] the pending TransmitCompletes' chains (s.p_tc)
@@ -1208,7 +1212,7 @@ __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
 // SwitchMmu, priority PG
 __device__ __forceinline__ uint32_t pfc_thresh(const SCtx &c)
 {
-    const Params &P = c.s->P;
+    const Params &P = *c.P;
     return (P.buffer_size - c.sw.total_hdrm - c.sw.total_rsrv - c.sw.shared_used) >> P.pfc_shift;
 }
 __device__ __forceinline__ uint32_t shared_used(const Port &p) { return p.ing > RESERVE ? p.ing - RESERVE : 0; }
@@ -1242,7 +1246,7 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
 {
     const Sim &s = *c.s;
     Port &pt = c.w[port].pt;
-    size_t pi = (size_t)c.x * s.K + port;
+    size_t pi = (size_t)s.pbase[c.x] + port;
     if (q == 0)
     {
         if (pt.q0_n >= s.q0_cap)
@@ -1274,7 +1278,7 @@ __device__ __forceinline__ void s_start_q0(SCtx &c, int port)
     Port &pt = c.w[port].pt;
     if (pt.tc_at >= 0)
         return;
-    size_t pi = (size_t)c.x * s.K + port;
+    size_t pi = (size_t)s.pbase[c.x] + port;
     Pkt p = s.q0[pi * s.q0_cap + pt.q0_head];
     pt.q0_head = (pt.q0_head + 1) % s.q0_cap;
     pt.q0_n--;
@@ -1302,7 +1306,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p);
 __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
 {
     const Sim &s = *c.s;
-    const Params &P = s.P;
+    const Params &P = *c.P;
     Port &pt = c.w[port].pt;
     if (pt.tc_at >= 0)
         return;
@@ -1313,7 +1317,7 @@ __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
     }
     if ((pt.paused >> PG & 1) || pt.q3_n == 0)
         return;
-    Pkt p = s.q3[((size_t)c.x * s.K + port) * s.q3_cap + pt.q3_head];
+    Pkt p = s.q3[((size_t)s.pbase[c.x] + port) * s.q3_cap + pt.q3_head];
     pt.q3_head = (pt.q3_head + 1) % s.q3_cap;
     pt.q3_n--;
     pt.bytes_total -= p.size;
@@ -1325,7 +1329,7 @@ __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
 __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
 {
     const Sim &s = *c.s;
-    const Params &P = s.P;
+    const Params &P = *c.P;
     Port &pt = c.w[port].pt;
     Port &in = c.w[p.inport].pt;
     if (c.safe)
@@ -1388,16 +1392,19 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
 
 // SwitchNode::SendToDev
 // the egress port of a data frame or ACK (-1: no route) and its queue
-__device__ __forceinline__ int s_route(const Sim &s, int x, const Pkt &p, int *q)
+// (hosts are numbered within their world for the hash and the table, as in the reference: host
+// h of the world is node h, and its switch x node hn + x)
+__device__ __forceinline__ int s_route(const Sim &s, const Params &P, int x, const Pkt &p, int *q)
 {
+    const SwInfo &si = s.si[x];
     bool data = p.kind == K_DATA;
-    int dst = data ? p.dst : p.src;
-    const Route &rt = s.rt[(size_t)x * s.H + dst];
-    *q = (s.P.ack_high_prio && !data) ? 0 : PG;
+    int src = (data ? p.src : p.dst) - si.hbase, dst = (data ? p.dst : p.src) - si.hbase;
+    const Route &rt = s.rt[si.rt_off + dst];
+    *q = (P.ack_high_prio && !data) ? 0 : PG;
     if (rt.n == 0)
         return -1;
     uint32_t w2 = data ? (p.sport | 100u << 16) : (100u | (uint32_t)p.sport << 16);
-    uint32_t hsh = ecmp_hash(node_ip(data ? p.src : p.dst), node_ip(dst), w2, (uint32_t)(s.H + x));
+    uint32_t hsh = ecmp_hash(node_ip(src), node_ip(dst), w2, si.seed);
     return rt.port[hsh % rt.n];
 }
 
@@ -1517,10 +1524,11 @@ __host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_
 __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
                                             int *shared_int)
 {
-    Chain *tcs = s.p_tc + (size_t)x * s.K;
+    Chain *tcs = s.p_tc + s.pbase[x];
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const int node = s.H + x, deg = s.deg[node];
-    Port *gp = s.ps + (size_t)x * s.K;
+    const Params &WP = s.Pw[s.s_world[x]];
+    Port *gp = s.ps + s.pbase[x];
     // ports, and the bounds of their arrivals: at most the last frame of slot s - 2 (a frame
     // arrives within one transmission of the link's delay), and the frames of slot s - 1 but
     // perhaps the last
@@ -1581,7 +1589,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             cprefix(a.ap, a.acode, f.c);
             a.frame = fi;
             int q = 0;
-            a.out = (int16_t)(f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? -1 : s_route(s, x, f.p, &q));
+            a.out = (int16_t)(f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? -1 : s_route(s, WP, x, f.p, &q));
             a.q = (uint8_t)q;
             a.in = (uint8_t)p;
             if (a.out >= 0 && q != 0)
@@ -1610,8 +1618,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             if (w[p].pt.hdrm || w[p].pt.mmu_paused)
                 safe = false;
         }
-        int64_t room = (int64_t)s.P.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
-        int64_t th_min = room > 0 ? room >> s.P.pfc_shift : -1;
+        int64_t room = (int64_t)WP.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
+        int64_t th_min = room > 0 ? room >> WP.pfc_shift : -1;
         for (int p = 0; p < deg && safe; p++)
         {
             int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
@@ -1698,6 +1706,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             c.tc = tcs;
             c.pool = pool;
             c.safe = true;
+            c.P = &WP;
             int oi = obase[o], oe = obase[o] + ocnt[o];
             SwPortLds &me = w[o];
             for (;;)
@@ -1737,7 +1746,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 Pkt pk = a.p;
                 if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
                 {
-                    if (s.P.qbb)
+                    if (WP.qbb)
                     {
                         if (pk.kind == K_PAUSE)
                             me.pt.paused |= 1u << pk.q;
@@ -1780,6 +1789,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.tc = tcs;
         c.pool = pooled ? pool : nullptr;
         c.safe = false;
+        c.P = &WP;
         int base = 0;
         for (int p = 0; p < deg; p++)
         {
@@ -1877,7 +1887,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 const LFrame &f = sw_frame(s, w[p], slot);
                 c.cur_src = &f.c;
                 pk = f.p;
-                out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, x, pk, &q);
+                out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, WP, x, pk, &q);
             }
 #ifdef RDMA_PROF
             q1 = clock64();
@@ -1889,7 +1899,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             sw_peek(c, w[p], t1);
             if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
             {
-                if (s.P.qbb)
+                if (WP.qbb)
                 {
                     if (pk.kind == K_PAUSE)
                         w[p].pt.paused |= 1u << pk.q;

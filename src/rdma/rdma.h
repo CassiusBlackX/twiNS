@@ -24,11 +24,11 @@ namespace rdma
 {
 
 #ifndef TWINS_RDMA_RUNS
-#define TWINS_RDMA_RUNS 12
+#define TWINS_RDMA_RUNS 6
 #endif
 constexpr int RUNS = TWINS_RDMA_RUNS; // chain runs kept
 constexpr int MAXF = 256;    // frames a link can start in one slot
-constexpr int NB = 4;        // message ring: receivers read slots s - 1 and s - 2
+constexpr int NB = 3;        // message ring: slot s is written, slots s - 1 and s - 2 read
 constexpr int MAX_HOP = 5;   // IntHeader::maxHop
 constexpr int PG = 3;        // the data priority (flows' pg), RdmaEgressQueue::ack_q_idx
 constexpr uint32_t RESERVE = 4 * 1024, RESUME_OFFSET = 3 * 1024; // SwitchMmu
@@ -225,15 +225,31 @@ struct Params
     double pmax;
 };
 
+// a switch's place in its world: the hash seed (its node id in the world), its world's first
+// host, its routes (rt_off: towards its world's host 0)
+struct SwInfo
+{
+    uint32_t seed;
+    int hbase;
+    uint32_t rt_off;
+};
+
+// Worlds are independent networks run side by side (a batch): their hosts come first, then their
+// switches, links and flows, in world order. They share the link rate and delay (P.bps, P.delay:
+// the slot); everything else is per world (Pw).
 struct Sim
 {
     int H, S, N, L, K; // hosts, switches, nodes (hosts first), directed links, max ports per node
     int F;             // flows
-    Params P;
+    Params P;          // world 0's (its rate and delay are every world's)
+    int W;             // worlds
+    const Params *Pw;  // [W]
+    const int *h_world, *s_world; // [H], [S]
+    const SwInfo *si;  // [S]
     // topology: node n's port p (device p + 1) sends on link out_link[n K + p], receives on
     // in_link[n K + p]; a link's receiving node and port
     int *deg, *out_link, *in_link, *link_dst, *link_dport;
-    // routes: switch x towards host h, rt[x H + h]
+    // routes: switch x towards host h of its world, rt[si[x].rt_off + h]
     struct Route *rt;
     FlowInfo *fi;
     SndQP *qp;
@@ -249,9 +265,11 @@ struct Sim
     int qps_cap;
     // switches
     Switch *sw;
-    Port *ps;           // [S K]
-    Chain *p_tc;        // [S K]
-    Pkt *q0, *q3;       // [S K][q0_cap], [S K][q3_cap]
+    // switch x's ports are pbase[x] .. pbase[x] + deg - 1 of the per-port arrays
+    const int *pbase;
+    Port *ps;           // [ports]
+    Chain *p_tc;        // [ports]
+    Pkt *q0, *q3;       // [ports][q0_cap], [ports][q3_cap]
     struct ArrLds *apool; // [S][POOL] a switch's arrivals of the slot
     int *aidx;          // [S][2 POOL] their order per egress port (safe slots)
     int q0_cap, q3_cap;
@@ -293,7 +311,7 @@ struct TxRec
     uint8_t kind, ecn;
 };
 
-__host__ __device__ inline int64_t mi(const Sim &s, int64_t slot, int link) { return (slot & (NB - 1)) * s.L + link; }
+__host__ __device__ inline int64_t mi(const Sim &s, int64_t slot, int link) { return ((slot % NB + NB) % NB) * s.L + link; }
 
 __host__ __device__ inline int msg_count(const Sim &s, int64_t slot, int link)
 {
