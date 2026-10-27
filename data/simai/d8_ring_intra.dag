@@ -1,0 +1,328 @@
+flow 0 0 1 1048576
+flow 1 1 2 1048576
+flow 2 2 3 1048576
+flow 3 3 4 1048576
+flow 4 4 5 1048576
+flow 5 5 6 1048576
+flow 6 6 7 1048576
+flow 7 7 0 1048576
+flow 8 0 1 1048576
+flow 9 1 2 1048576
+flow 10 2 3 1048576
+flow 11 3 4 1048576
+flow 12 4 5 1048576
+flow 13 5 6 1048576
+flow 14 6 7 1048576
+flow 15 7 0 1048576
+flow 16 0 1 1048576
+flow 17 1 2 1048576
+flow 18 2 3 1048576
+flow 19 3 4 1048576
+flow 20 4 5 1048576
+flow 21 5 6 1048576
+flow 22 6 7 1048576
+flow 23 7 0 1048576
+flow 24 0 1 1048576
+flow 25 1 2 1048576
+flow 26 2 3 1048576
+flow 27 3 4 1048576
+flow 28 4 5 1048576
+flow 29 5 6 1048576
+flow 30 6 7 1048576
+flow 31 7 0 1048576
+flow 32 0 1 1048576
+flow 33 1 2 1048576
+flow 34 2 3 1048576
+flow 35 3 4 1048576
+flow 36 4 5 1048576
+flow 37 5 6 1048576
+flow 38 6 7 1048576
+flow 39 7 0 1048576
+flow 40 0 1 1048576
+flow 41 1 2 1048576
+flow 42 2 3 1048576
+flow 43 3 4 1048576
+flow 44 4 5 1048576
+flow 45 5 6 1048576
+flow 46 6 7 1048576
+flow 47 7 0 1048576
+flow 48 0 1 1048576
+flow 49 1 2 1048576
+flow 50 2 3 1048576
+flow 51 3 4 1048576
+flow 52 4 5 1048576
+flow 53 5 6 1048576
+flow 54 6 7 1048576
+flow 55 7 0 1048576
+flow 56 0 1 1048576
+flow 57 1 2 1048576
+flow 58 2 3 1048576
+flow 59 3 4 1048576
+flow 60 4 5 1048576
+flow 61 5 6 1048576
+flow 62 6 7 1048576
+flow 63 7 0 1048576
+flow 64 0 1 1048576
+flow 65 1 2 1048576
+flow 66 2 3 1048576
+flow 67 3 4 1048576
+flow 68 4 5 1048576
+flow 69 5 6 1048576
+flow 70 6 7 1048576
+flow 71 7 0 1048576
+flow 72 0 1 1048576
+flow 73 1 2 1048576
+flow 74 2 3 1048576
+flow 75 3 4 1048576
+flow 76 4 5 1048576
+flow 77 5 6 1048576
+flow 78 6 7 1048576
+flow 79 7 0 1048576
+flow 80 0 1 1048576
+flow 81 1 2 1048576
+flow 82 2 3 1048576
+flow 83 3 4 1048576
+flow 84 4 5 1048576
+flow 85 5 6 1048576
+flow 86 6 7 1048576
+flow 87 7 0 1048576
+flow 88 0 1 1048576
+flow 89 1 2 1048576
+flow 90 2 3 1048576
+flow 91 3 4 1048576
+flow 92 4 5 1048576
+flow 93 5 6 1048576
+flow 94 6 7 1048576
+flow 95 7 0 1048576
+flow 96 0 1 1048576
+flow 97 1 2 1048576
+flow 98 2 3 1048576
+flow 99 3 4 1048576
+flow 100 4 5 1048576
+flow 101 5 6 1048576
+flow 102 6 7 1048576
+flow 103 7 0 1048576
+flow 104 0 1 1048576
+flow 105 1 2 1048576
+flow 106 2 3 1048576
+flow 107 3 4 1048576
+flow 108 4 5 1048576
+flow 109 5 6 1048576
+flow 110 6 7 1048576
+flow 111 7 0 1048576
+root 0 1000
+root 1 1000
+root 2 1000
+root 3 1000
+root 4 1000
+root 5 1000
+root 6 1000
+root 7 1000
+dep 8 r 7
+dep 8 s 0
+dep 9 r 0
+dep 9 s 1
+dep 10 r 1
+dep 10 s 2
+dep 11 r 2
+dep 11 s 3
+dep 12 r 3
+dep 12 s 4
+dep 13 r 4
+dep 13 s 5
+dep 14 r 5
+dep 14 s 6
+dep 15 r 6
+dep 15 s 7
+dep 16 r 15
+dep 16 s 8
+dep 17 r 8
+dep 17 s 9
+dep 18 r 9
+dep 18 s 10
+dep 19 r 10
+dep 19 s 11
+dep 20 r 11
+dep 20 s 12
+dep 21 r 12
+dep 21 s 13
+dep 22 r 13
+dep 22 s 14
+dep 23 r 14
+dep 23 s 15
+dep 24 r 23
+dep 24 s 16
+dep 25 r 16
+dep 25 s 17
+dep 26 r 17
+dep 26 s 18
+dep 27 r 18
+dep 27 s 19
+dep 28 r 19
+dep 28 s 20
+dep 29 r 20
+dep 29 s 21
+dep 30 r 21
+dep 30 s 22
+dep 31 r 22
+dep 31 s 23
+dep 32 r 31
+dep 32 s 24
+dep 33 r 24
+dep 33 s 25
+dep 34 r 25
+dep 34 s 26
+dep 35 r 26
+dep 35 s 27
+dep 36 r 27
+dep 36 s 28
+dep 37 r 28
+dep 37 s 29
+dep 38 r 29
+dep 38 s 30
+dep 39 r 30
+dep 39 s 31
+dep 40 r 39
+dep 40 s 32
+dep 41 r 32
+dep 41 s 33
+dep 42 r 33
+dep 42 s 34
+dep 43 r 34
+dep 43 s 35
+dep 44 r 35
+dep 44 s 36
+dep 45 r 36
+dep 45 s 37
+dep 46 r 37
+dep 46 s 38
+dep 47 r 38
+dep 47 s 39
+dep 48 r 47
+dep 48 s 40
+dep 49 r 40
+dep 49 s 41
+dep 50 r 41
+dep 50 s 42
+dep 51 r 42
+dep 51 s 43
+dep 52 r 43
+dep 52 s 44
+dep 53 r 44
+dep 53 s 45
+dep 54 r 45
+dep 54 s 46
+dep 55 r 46
+dep 55 s 47
+dep 56 r 55
+dep 56 s 48
+dep 57 r 48
+dep 57 s 49
+dep 58 r 49
+dep 58 s 50
+dep 59 r 50
+dep 59 s 51
+dep 60 r 51
+dep 60 s 52
+dep 61 r 52
+dep 61 s 53
+dep 62 r 53
+dep 62 s 54
+dep 63 r 54
+dep 63 s 55
+dep 64 r 63
+dep 64 s 56
+dep 65 r 56
+dep 65 s 57
+dep 66 r 57
+dep 66 s 58
+dep 67 r 58
+dep 67 s 59
+dep 68 r 59
+dep 68 s 60
+dep 69 r 60
+dep 69 s 61
+dep 70 r 61
+dep 70 s 62
+dep 71 r 62
+dep 71 s 63
+dep 72 r 71
+dep 72 s 64
+dep 73 r 64
+dep 73 s 65
+dep 74 r 65
+dep 74 s 66
+dep 75 r 66
+dep 75 s 67
+dep 76 r 67
+dep 76 s 68
+dep 77 r 68
+dep 77 s 69
+dep 78 r 69
+dep 78 s 70
+dep 79 r 70
+dep 79 s 71
+dep 80 r 79
+dep 80 s 72
+dep 81 r 72
+dep 81 s 73
+dep 82 r 73
+dep 82 s 74
+dep 83 r 74
+dep 83 s 75
+dep 84 r 75
+dep 84 s 76
+dep 85 r 76
+dep 85 s 77
+dep 86 r 77
+dep 86 s 78
+dep 87 r 78
+dep 87 s 79
+dep 88 r 87
+dep 88 s 80
+dep 89 r 80
+dep 89 s 81
+dep 90 r 81
+dep 90 s 82
+dep 91 r 82
+dep 91 s 83
+dep 92 r 83
+dep 92 s 84
+dep 93 r 84
+dep 93 s 85
+dep 94 r 85
+dep 94 s 86
+dep 95 r 86
+dep 95 s 87
+dep 96 r 95
+dep 96 s 88
+dep 97 r 88
+dep 97 s 89
+dep 98 r 89
+dep 98 s 90
+dep 99 r 90
+dep 99 s 91
+dep 100 r 91
+dep 100 s 92
+dep 101 r 92
+dep 101 s 93
+dep 102 r 93
+dep 102 s 94
+dep 103 r 94
+dep 103 s 95
+dep 104 r 103
+dep 104 s 96
+dep 105 r 96
+dep 105 s 97
+dep 106 r 97
+dep 106 s 98
+dep 107 r 98
+dep 107 s 99
+dep 108 r 99
+dep 108 s 100
+dep 109 r 100
+dep 109 s 101
+dep 110 r 101
+dep 110 s 102
+dep 111 r 102
+dep 111 s 103

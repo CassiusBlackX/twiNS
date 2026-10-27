@@ -165,6 +165,7 @@ struct FlowInfo
     uint32_t win;       // its window and base RTT (maxBdp and maxRtt, or the pair's with GLOBAL_T 0)
     uint64_t base_rtt;
     uint8_t snic, rnic; // its sender's device (GetNicIdxOfQp), its receiver's for ACKs (GetNicIdxOfRxQp)
+    uint8_t dyn;        // DAG: it starts when its dependencies have fired (start, sport, devices then)
     Chain start_chain;  // the chain of its StartApplication
 };
 
@@ -344,6 +345,26 @@ struct Sim
     int serial;              // switches run every slot's events on one lane (no safe slots)
     int64_t *fct;       // [F] completion time - start (ns), -1: not yet
     int64_t *sent;      // [F] simai: its first SendComplete (ns), -1: none yet
+    // DAG: children of flow g at ch_list[ch_off[g] ..] (child << 1 | kind: 0 received, 1 sent);
+    // per flow its dependencies left and the latest StartApplication they gave; messages filed by
+    // arrival slot (dmsg[b][..], dmsg_n[b]); a host's ready flows (dyn[h][..]); a world's host
+    // pairs' devices and port counters (at wp_off[w] + src * H_w + dst, numbered in the world)
+    int dag;
+    int64_t send_lat;
+    const int *ch_off;
+    const uint32_t *ch_list;
+    int *dep_left;
+    int64_t *dep_t;
+    Chain *dep_c;
+    struct DMsg *dmsg;
+    unsigned int *dmsg_n;
+    int nbi, dcap;
+    int *dyn, *dyn_n;
+    int dyn_cap;
+    const struct PairNic *pnic;
+    uint16_t *pcnt;
+    const int *wh_base, *wh_n;
+    const int64_t *wp_off;
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;
     unsigned long long *tx_cnt, tx_cap;
@@ -356,6 +377,21 @@ struct TailPool
     TailNode *n;
     unsigned long long *cnt;
     uint64_t mask; // capacity - 1 (a power of two)
+};
+
+// DAG (docs/ai/dag.md): a fired dependency of a flow, for its source host: the StartApplication it
+// would give (time, chain)
+struct DMsg
+{
+    int64_t ts;
+    Chain c;
+    uint32_t flow;
+};
+// a host pair's devices: towards b, those a queue pair of a picks from (GetNicIdxOfQp), and those
+// a's receiving queue pair from b picks from (GetNicIdxOfRxQp)
+struct PairNic
+{
+    uint8_t sn, s[3], rn, r[3];
 };
 
 // one transmission start (rdma-ref --txtrace)

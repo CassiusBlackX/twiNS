@@ -1,0 +1,13 @@
+# DAG-driven traffic (docs/ai/dag.md) on SimAI's topologies: rings, all-to-all phases, a pipeline
+d_sx16_ring sx16.topo d16_ring.dag
+d_sx16_ring4ch sx16.topo d16_ring4ch.dag
+d_sx16_intra_ring sx16.topo d8_ring_intra.dag
+d_sx16_a2a sx16.topo d16_a2a.dag
+d_sx16_pipe sx16.topo d16_pipe.dag
+d_hpn16_ring hpn16.topo d16_ring.dag
+d_hpn16_ring4ch hpn16.topo d16_ring4ch.dag
+d_hpn16_a2a hpn16.topo d16_a2a.dag
+d_dcn16_ring dcn16.topo d16_ring.dag
+d_dcn16_a2a dcn16.topo d16_a2a.dag
+d_sx128_ring sx128.topo d128_ring.dag
+d_sx128_xring sx128.topo d128_xring.dag

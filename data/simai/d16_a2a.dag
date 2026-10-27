@@ -1,0 +1,272 @@
+flow 0 0 1 1048576
+flow 1 1 2 1048576
+flow 2 2 3 1048576
+flow 3 3 4 1048576
+flow 4 4 5 1048576
+flow 5 5 6 1048576
+flow 6 6 7 1048576
+flow 7 7 8 1048576
+flow 8 8 9 1048576
+flow 9 9 10 1048576
+flow 10 10 11 1048576
+flow 11 11 12 1048576
+flow 12 12 13 1048576
+flow 13 13 14 1048576
+flow 14 14 15 1048576
+flow 15 15 0 1048576
+flow 16 0 2 1048576
+flow 17 1 3 1048576
+flow 18 2 4 1048576
+flow 19 3 5 1048576
+flow 20 4 6 1048576
+flow 21 5 7 1048576
+flow 22 6 8 1048576
+flow 23 7 9 1048576
+flow 24 8 10 1048576
+flow 25 9 11 1048576
+flow 26 10 12 1048576
+flow 27 11 13 1048576
+flow 28 12 14 1048576
+flow 29 13 15 1048576
+flow 30 14 0 1048576
+flow 31 15 1 1048576
+flow 32 0 3 1048576
+flow 33 1 4 1048576
+flow 34 2 5 1048576
+flow 35 3 6 1048576
+flow 36 4 7 1048576
+flow 37 5 8 1048576
+flow 38 6 9 1048576
+flow 39 7 10 1048576
+flow 40 8 11 1048576
+flow 41 9 12 1048576
+flow 42 10 13 1048576
+flow 43 11 14 1048576
+flow 44 12 15 1048576
+flow 45 13 0 1048576
+flow 46 14 1 1048576
+flow 47 15 2 1048576
+flow 48 0 4 1048576
+flow 49 1 5 1048576
+flow 50 2 6 1048576
+flow 51 3 7 1048576
+flow 52 4 8 1048576
+flow 53 5 9 1048576
+flow 54 6 10 1048576
+flow 55 7 11 1048576
+flow 56 8 12 1048576
+flow 57 9 13 1048576
+flow 58 10 14 1048576
+flow 59 11 15 1048576
+flow 60 12 0 1048576
+flow 61 13 1 1048576
+flow 62 14 2 1048576
+flow 63 15 3 1048576
+flow 64 0 5 1048576
+flow 65 1 6 1048576
+flow 66 2 7 1048576
+flow 67 3 8 1048576
+flow 68 4 9 1048576
+flow 69 5 10 1048576
+flow 70 6 11 1048576
+flow 71 7 12 1048576
+flow 72 8 13 1048576
+flow 73 9 14 1048576
+flow 74 10 15 1048576
+flow 75 11 0 1048576
+flow 76 12 1 1048576
+flow 77 13 2 1048576
+flow 78 14 3 1048576
+flow 79 15 4 1048576
+flow 80 0 6 1048576
+flow 81 1 7 1048576
+flow 82 2 8 1048576
+flow 83 3 9 1048576
+flow 84 4 10 1048576
+flow 85 5 11 1048576
+flow 86 6 12 1048576
+flow 87 7 13 1048576
+flow 88 8 14 1048576
+flow 89 9 15 1048576
+flow 90 10 0 1048576
+flow 91 11 1 1048576
+flow 92 12 2 1048576
+flow 93 13 3 1048576
+flow 94 14 4 1048576
+flow 95 15 5 1048576
+root 0 1000
+root 1 1000
+root 2 1000
+root 3 1000
+root 4 1000
+root 5 1000
+root 6 1000
+root 7 1000
+root 8 1000
+root 9 1000
+root 10 1000
+root 11 1000
+root 12 1000
+root 13 1000
+root 14 1000
+root 15 1000
+dep 16 r 0
+dep 16 r 15
+dep 17 r 1
+dep 17 r 0
+dep 18 r 2
+dep 18 r 1
+dep 19 r 3
+dep 19 r 2
+dep 20 r 4
+dep 20 r 3
+dep 21 r 5
+dep 21 r 4
+dep 22 r 6
+dep 22 r 5
+dep 23 r 7
+dep 23 r 6
+dep 24 r 8
+dep 24 r 7
+dep 25 r 9
+dep 25 r 8
+dep 26 r 10
+dep 26 r 9
+dep 27 r 11
+dep 27 r 10
+dep 28 r 12
+dep 28 r 11
+dep 29 r 13
+dep 29 r 12
+dep 30 r 14
+dep 30 r 13
+dep 31 r 15
+dep 31 r 14
+dep 32 r 16
+dep 32 r 30
+dep 33 r 17
+dep 33 r 31
+dep 34 r 18
+dep 34 r 16
+dep 35 r 19
+dep 35 r 17
+dep 36 r 20
+dep 36 r 18
+dep 37 r 21
+dep 37 r 19
+dep 38 r 22
+dep 38 r 20
+dep 39 r 23
+dep 39 r 21
+dep 40 r 24
+dep 40 r 22
+dep 41 r 25
+dep 41 r 23
+dep 42 r 26
+dep 42 r 24
+dep 43 r 27
+dep 43 r 25
+dep 44 r 28
+dep 44 r 26
+dep 45 r 29
+dep 45 r 27
+dep 46 r 30
+dep 46 r 28
+dep 47 r 31
+dep 47 r 29
+dep 48 r 32
+dep 48 r 45
+dep 49 r 33
+dep 49 r 46
+dep 50 r 34
+dep 50 r 47
+dep 51 r 35
+dep 51 r 32
+dep 52 r 36
+dep 52 r 33
+dep 53 r 37
+dep 53 r 34
+dep 54 r 38
+dep 54 r 35
+dep 55 r 39
+dep 55 r 36
+dep 56 r 40
+dep 56 r 37
+dep 57 r 41
+dep 57 r 38
+dep 58 r 42
+dep 58 r 39
+dep 59 r 43
+dep 59 r 40
+dep 60 r 44
+dep 60 r 41
+dep 61 r 45
+dep 61 r 42
+dep 62 r 46
+dep 62 r 43
+dep 63 r 47
+dep 63 r 44
+dep 64 r 48
+dep 64 r 60
+dep 65 r 49
+dep 65 r 61
+dep 66 r 50
+dep 66 r 62
+dep 67 r 51
+dep 67 r 63
+dep 68 r 52
+dep 68 r 48
+dep 69 r 53
+dep 69 r 49
+dep 70 r 54
+dep 70 r 50
+dep 71 r 55
+dep 71 r 51
+dep 72 r 56
+dep 72 r 52
+dep 73 r 57
+dep 73 r 53
+dep 74 r 58
+dep 74 r 54
+dep 75 r 59
+dep 75 r 55
+dep 76 r 60
+dep 76 r 56
+dep 77 r 61
+dep 77 r 57
+dep 78 r 62
+dep 78 r 58
+dep 79 r 63
+dep 79 r 59
+dep 80 r 64
+dep 80 r 75
+dep 81 r 65
+dep 81 r 76
+dep 82 r 66
+dep 82 r 77
+dep 83 r 67
+dep 83 r 78
+dep 84 r 68
+dep 84 r 79
+dep 85 r 69
+dep 85 r 64
+dep 86 r 70
+dep 86 r 65
+dep 87 r 71
+dep 87 r 66
+dep 88 r 72
+dep 88 r 67
+dep 89 r 73
+dep 89 r 68
+dep 90 r 74
+dep 90 r 69
+dep 91 r 75
+dep 91 r 70
+dep 92 r 76
+dep 92 r 71
+dep 93 r 77
+dep 93 r 72
+dep 94 r 78
+dep 94 r 73
+dep 95 r 79
+dep 95 r 74

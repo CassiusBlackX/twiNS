@@ -1,0 +1,108 @@
+flow 0 0 8 2097152
+flow 1 8 1 2097152
+flow 2 1 9 2097152
+flow 3 9 2 2097152
+flow 4 2 10 2097152
+flow 5 0 8 2097152
+flow 6 8 1 2097152
+flow 7 1 9 2097152
+flow 8 9 2 2097152
+flow 9 2 10 2097152
+flow 10 0 8 2097152
+flow 11 8 1 2097152
+flow 12 1 9 2097152
+flow 13 9 2 2097152
+flow 14 2 10 2097152
+flow 15 0 8 2097152
+flow 16 8 1 2097152
+flow 17 1 9 2097152
+flow 18 9 2 2097152
+flow 19 2 10 2097152
+flow 20 0 8 2097152
+flow 21 8 1 2097152
+flow 22 1 9 2097152
+flow 23 9 2 2097152
+flow 24 2 10 2097152
+flow 25 0 8 2097152
+flow 26 8 1 2097152
+flow 27 1 9 2097152
+flow 28 9 2 2097152
+flow 29 2 10 2097152
+flow 30 0 8 2097152
+flow 31 8 1 2097152
+flow 32 1 9 2097152
+flow 33 9 2 2097152
+flow 34 2 10 2097152
+flow 35 0 8 2097152
+flow 36 8 1 2097152
+flow 37 1 9 2097152
+flow 38 9 2 2097152
+flow 39 2 10 2097152
+root 0 1000
+dep 1 r 0
+dep 2 r 1
+dep 3 r 2
+dep 4 r 3
+dep 5 r 0
+dep 6 r 5
+dep 6 r 1
+dep 7 r 6
+dep 7 r 2
+dep 8 r 7
+dep 8 r 3
+dep 9 r 8
+dep 9 r 4
+dep 10 r 5
+dep 11 r 10
+dep 11 r 6
+dep 12 r 11
+dep 12 r 7
+dep 13 r 12
+dep 13 r 8
+dep 14 r 13
+dep 14 r 9
+dep 15 r 10
+dep 16 r 15
+dep 16 r 11
+dep 17 r 16
+dep 17 r 12
+dep 18 r 17
+dep 18 r 13
+dep 19 r 18
+dep 19 r 14
+dep 20 r 15
+dep 21 r 20
+dep 21 r 16
+dep 22 r 21
+dep 22 r 17
+dep 23 r 22
+dep 23 r 18
+dep 24 r 23
+dep 24 r 19
+dep 25 r 20
+dep 26 r 25
+dep 26 r 21
+dep 27 r 26
+dep 27 r 22
+dep 28 r 27
+dep 28 r 23
+dep 29 r 28
+dep 29 r 24
+dep 30 r 25
+dep 31 r 30
+dep 31 r 26
+dep 32 r 31
+dep 32 r 27
+dep 33 r 32
+dep 33 r 28
+dep 34 r 33
+dep 34 r 29
+dep 35 r 30
+dep 36 r 35
+dep 36 r 31
+dep 37 r 36
+dep 37 r 32
+dep 38 r 37
+dep 38 r 33
+dep 39 r 38
+dep 39 r 34

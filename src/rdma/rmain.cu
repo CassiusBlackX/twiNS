@@ -163,50 +163,6 @@ static bool simai_link0(const string &path, uint64_t *bps, int64_t *delay)
     return true;
 }
 
-// ns-3's Hash32: MurmurHash3_x86_32 with seed 0x8BADF00D (hash-murmur3.cc)
-static uint32_t ns3_hash32(const uint8_t *key, int len)
-{
-    auto rotl = [](uint32_t x, int r) { return (x << r) | (x >> (32 - r)); };
-    const uint32_t c1 = 0xcc9e2d51, c2 = 0x1b873593;
-    uint32_t h = 0x8BADF00D;
-    int nblocks = len / 4;
-    for (int i = 0; i < nblocks; i++)
-    {
-        uint32_t k;
-        memcpy(&k, key + 4 * i, 4);
-        k *= c1;
-        k = rotl(k, 15);
-        k *= c2;
-        h ^= k;
-        h = rotl(h, 13);
-        h = h * 5 + 0xe6546b64;
-    }
-    const uint8_t *tail = key + 4 * nblocks;
-    uint32_t k = 0;
-    switch (len & 3)
-    {
-    case 3:
-        k ^= tail[2] << 16;
-        [[fallthrough]];
-    case 2:
-        k ^= tail[1] << 8;
-        [[fallthrough]];
-    case 1:
-        k ^= tail[0];
-        k *= c1;
-        k = rotl(k, 15);
-        k *= c2;
-        h ^= k;
-    }
-    h ^= (uint32_t)len;
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-    return h;
-}
-
 static void host_push(Chain *c, int64_t lead, int ord) { cpush(c, ccode(lead, ord), Chain(*c)); }
 
 // One network: its parameters, topology, routes and flows, numbered within it.
@@ -224,6 +180,13 @@ struct World
     vector<int64_t> ldelay; // [L]
     vector<PortCfg> pcfg;   // its switches' ports in turn
     vector<uint8_t> nvs;    // [S] an NVSwitch
+    // DAG worlds: children (child << 1 | kind) per flow, dependencies per flow, host pairs' devices
+    // and port counters ([src H + dst])
+    bool dag = false;
+    vector<int> ch_off, ndeps;
+    vector<uint32_t> ch_list;
+    vector<PairNic> pnic;
+    vector<uint16_t> pcnt;
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
 
@@ -551,8 +514,98 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             }
     }
 
-    // ---- flows (rows in start order, stable; per host pair ports from 10000)
+    // ---- flows (rows in start order, stable; per host pair ports from 10000), or a DAG
     vector<FlowInfo> &fi = w.fi;
+    w.dag = flow_file.size() > 4 && flow_file.compare(flow_file.size() - 4, 4, ".dag") == 0;
+    if (w.dag)
+    {
+        std::ifstream f(flow_file);
+        if (!f)
+        {
+            fprintf(stderr, "cannot open %s\n", flow_file.c_str());
+            return false;
+        }
+        string x;
+        vector<std::pair<int, int>> deps; // (child, parent << 1 | kind)
+        while (f >> x)
+        {
+            if (x == "flow")
+            {
+                unsigned id, a, b;
+                unsigned long long sz;
+                f >> id >> a >> b >> sz;
+                if (id != fi.size())
+                {
+                    fprintf(stderr, "%s: DAG flow ids must be 0, 1, ... in order (flow %u)\n", w.name.c_str(), id);
+                    return false;
+                }
+                FlowInfo y = {};
+                y.src = a, y.dst = b, y.size = sz, y.start = -1, y.dyn = 1;
+                fi.push_back(y);
+            }
+            else if (x == "root")
+            {
+                unsigned id;
+                unsigned long long st;
+                f >> id >> st;
+                if (id >= fi.size())
+                {
+                    fprintf(stderr, "%s: root %u before its flow\n", w.name.c_str(), id);
+                    return false;
+                }
+                fi[id].start = (int64_t)st;
+                fi[id].dyn = 0;
+            }
+            else if (x == "dep")
+            {
+                unsigned id, par;
+                string k;
+                f >> id >> k >> par;
+                if (id >= fi.size() || par >= fi.size() || (k != "r" && k != "s"))
+                {
+                    fprintf(stderr, "%s: bad dependency %u %s %u\n", w.name.c_str(), id, k.c_str(), par);
+                    return false;
+                }
+                deps.push_back({(int)id, (int)(par << 1 | (k == "s"))});
+            }
+            else
+                std::getline(f, x);
+        }
+        w.ndeps.assign(fi.size(), 0);
+        vector<vector<uint32_t>> ch(fi.size());
+        for (auto &d : deps)
+        {
+            ch[d.second >> 1].push_back((uint32_t)d.first << 1 | (d.second & 1));
+            w.ndeps[d.first]++;
+        }
+        w.ch_off.assign(fi.size() + 1, 0);
+        for (size_t g = 0; g < fi.size(); g++)
+        {
+            std::stable_sort(ch[g].begin(), ch[g].end(), [](uint32_t a, uint32_t b) { return a >> 1 < b >> 1; });
+            w.ch_off[g + 1] = w.ch_off[g] + ch[g].size();
+            w.ch_list.insert(w.ch_list.end(), ch[g].begin(), ch[g].end());
+        }
+        int64_t t0 = -1;
+        for (size_t i = 0; i < fi.size(); i++)
+        {
+            if (fi[i].dyn && w.ndeps[i] == 0)
+            {
+                fprintf(stderr, "%s: DAG flow %zu is neither a root nor has dependencies\n", w.name.c_str(), i);
+                return false;
+            }
+            if (!fi[i].dyn)
+            {
+                // roots get their ports before any message is installed: one start time for all
+                if (t0 >= 0 && fi[i].start != t0)
+                {
+                    fprintf(stderr, "%s: DAG roots must all start at the same time\n", w.name.c_str());
+                    return false;
+                }
+                t0 = fi[i].start;
+            }
+        }
+    }
+    else
     {
         std::ifstream f(flow_file);
         if (!f)
@@ -589,20 +642,23 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             x.base_rtt = pair_rtt(x.src, x.dst);
         }
     }
-    vector<int> order(F);
+    // the flows started at given times (in a DAG, the roots), in start order
+    vector<int> order;
     for (int i = 0; i < F; i++)
-        order[i] = i;
+        if (!fi[i].dyn)
+            order.push_back(i);
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return fi[a].start < fi[b].start; });
+    const int FR = order.size();
     {
         std::map<std::pair<int, int>, uint32_t> port;
         // ScheduleFlowInputs runs once per start time and starts that time's flows; each
         // StartApplication descends from it through Node::AddApplication's Application::Start
         int64_t prev_t = 0;
         int prev_n = 0, k = 0;
-        for (int i = 0; i < F;)
+        for (int i = 0; i < FR;)
         {
             int j = i;
-            while (j < F && fi[order[j]].start == fi[order[i]].start)
+            while (j < FR && fi[order[j]].start == fi[order[i]].start)
                 j++;
             int64_t t = fi[order[i]].start;
             for (int m = i; m < j; m++)
@@ -628,6 +684,13 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             k++;
             i = j;
         }
+        if (w.dag)
+        {
+            // the port counters after the roots
+            w.pcnt.assign((size_t)H * H, 10000);
+            for (auto &e : port)
+                w.pcnt[(size_t)e.first.first * H + e.first.second] = (uint16_t)e.second;
+        }
     }
     // the devices of a flow's queue pairs: RdmaHw's tables of a host towards a host are its next
     // hops, through NVSwitches (m_rtTable_nxthop_nvswitch) or not (m_rtTable); among several, a
@@ -639,17 +702,43 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 (is_nvs(y) ? nv : rt_).push_back(nbr[a][y]);
         };
         auto pick = [&](const vector<int> &v, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
-            uint8_t buf[12];
-            memcpy(buf, &sip, 4);
-            memcpy(buf + 4, &dip, 4);
-            memcpy(buf + 8, &sport, 2);
-            memcpy(buf + 10, &dport, 2);
-            return v[ns3_hash32(buf, 12) % v.size()];
+            return v[qp_pick(sip, dip, sport, dport, v.size())];
         };
         vector<int> nv, rt_;
+        if (w.dag)
+        {
+            // every host pair's candidates, for the flows that pick at their start
+            w.pnic.assign((size_t)H * H, PairNic{});
+            for (int a = 0; a < H; a++)
+                for (int b = 0; b < H; b++)
+                {
+                    if (a == b)
+                        continue;
+                    PairNic &pn = w.pnic[(size_t)a * H + b];
+                    if (deg[a] == 1)
+                    {
+                        pn.sn = pn.rn = 1;
+                        continue;
+                    }
+                    tables(a, b, nv, rt_);
+                    const vector<int> sv = (a / gps == b / gps || !nv.empty()) ? nv : rt_, rv = !rt_.empty() ? rt_ : nv;
+                    if (sv.size() > 3 || rv.size() > 3)
+                    {
+                        fprintf(stderr, "%s: GPU %d has more than 3 devices towards %d\n", w.name.c_str(), a, b);
+                        return false;
+                    }
+                    pn.sn = sv.size(), pn.rn = rv.size();
+                    for (size_t i = 0; i < sv.size(); i++)
+                        pn.s[i] = sv[i];
+                    for (size_t i = 0; i < rv.size(); i++)
+                        pn.r[i] = rv[i];
+                }
+        }
         for (size_t i = 0; i < fi.size(); i++)
         {
             FlowInfo &x = fi[i];
+            if (x.dyn)
+                continue; // (picked at its start)
             if (deg[x.src] == 1 && deg[x.dst] == 1)
             {
                 x.snic = x.rnic = 0;
@@ -676,15 +765,15 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             x.rnic = (uint8_t)pick(rv, node_ip(x.dst), node_ip(x.src), 100, (uint16_t)x.sport);
         }
     }
-    w.start_list.assign(F, 0);
+    w.start_list.assign(FR, 0);
     w.start_off.assign(H + 1, 0);
-    for (int i = 0; i < F; i++)
+    for (int i = 0; i < FR; i++)
         w.start_off[fi[order[i]].src + 1]++;
     for (int h = 0; h < H; h++)
         w.start_off[h + 1] += w.start_off[h];
     {
         vector<int> pos(w.start_off.begin(), w.start_off.end() - 1);
-        for (int i = 0; i < F; i++)
+        for (int i = 0; i < FR; i++)
             w.start_list[pos[fi[order[i]].src]++] = order[i];
     }
     return true;
@@ -863,6 +952,7 @@ int main(int argc, char **argv)
     vector<FlowInfo> fi(F);
     vector<Chain> root_chain(F);
     vector<int> start_list(F), start_off(H + 1, 0), h_world(H), s_world(S);
+    size_t sl_base = 0; // the next world's first entry in start_list
     vector<Params> Pw(W);
     int64_t max_slots = 0;
     for (int wi = 0; wi < W; wi++)
@@ -906,8 +996,11 @@ int main(int argc, char **argv)
         for (size_t f = 0; f < w.fi.size(); f++)
         {
             FlowInfo x = w.fi[f];
-            x.start_chain.root += fbase[wi]; // roots over all worlds (the order within one is kept)
-            root_chain[x.start_chain.root - 1] = x.start_chain;
+            if (!x.dyn)
+            {
+                x.start_chain.root += fbase[wi]; // roots over all worlds (the order within one is kept)
+                root_chain[x.start_chain.root - 1] = x.start_chain;
+            }
             x.src += hbase[wi];
             x.dst += hbase[wi];
             fi[fbase[wi] + f] = x;
@@ -918,7 +1011,8 @@ int main(int argc, char **argv)
             start_off[hbase[wi] + h + 1] = w.start_off[h + 1] - w.start_off[h];
         }
         for (size_t f = 0; f < w.start_list.size(); f++)
-            start_list[fbase[wi] + f] = fbase[wi] + w.start_list[f];
+            start_list[sl_base + f] = fbase[wi] + w.start_list[f];
+        sl_base += w.start_list.size();
     }
     for (int h = 0; h < H; h++)
         start_off[h + 1] += start_off[h];
@@ -956,6 +1050,63 @@ int main(int argc, char **argv)
     s.rtp = dev_copy(rtp);
     s.fi = dev_copy(fi);
     s.root_chain = dev_copy(root_chain);
+    // DAG worlds: children, dependencies, host pairs; messages wait send_lat (SEND_LAT_NS, as
+    // AS_SEND_LAT), at least a slot
+    int nbi = 1;
+    for (auto &w : worlds)
+        s.dag |= w.dag;
+    if (s.dag)
+    {
+        s.send_lat = (int64_t)Cfg{base}.num("SEND_LAT_NS", 3000);
+        if (s.send_lat < D)
+        {
+            fprintf(stderr, "SEND_LAT_NS (%lld) must be at least the slot (%lld ns)\n", (long long)s.send_lat, (long long)D);
+            return 1;
+        }
+        vector<int> ch_off(F + 1, 0), dep_left(F, 0), wh_base(W), wh_n(W);
+        vector<uint32_t> ch_list;
+        vector<int64_t> wp_off(W, 0), dep_t(F, -1);
+        vector<PairNic> pnic;
+        vector<uint16_t> pcnt;
+        for (int wi = 0; wi < W; wi++)
+        {
+            World &w = worlds[wi];
+            wh_base[wi] = hbase[wi];
+            wh_n[wi] = w.H;
+            wp_off[wi] = pnic.size();
+            for (size_t f = 0; f < w.fi.size(); f++)
+            {
+                int g = fbase[wi] + f;
+                if (w.dag)
+                {
+                    for (int j = w.ch_off[f]; j < w.ch_off[f + 1]; j++)
+                        ch_list.push_back((uint32_t)(((w.ch_list[j] >> 1) + fbase[wi]) << 1 | (w.ch_list[j] & 1)));
+                    dep_left[g] = w.ndeps[f];
+                }
+                ch_off[g + 1] = ch_list.size();
+            }
+            pnic.insert(pnic.end(), w.pnic.begin(), w.pnic.end());
+            pcnt.insert(pcnt.end(), w.pcnt.begin(), w.pcnt.end());
+        }
+        s.ch_off = dev_copy(ch_off);
+        s.ch_list = dev_copy(ch_list);
+        s.dep_left = dev_copy(dep_left);
+        s.dep_t = dev_copy(dep_t);
+        s.dep_c = dev_alloc<Chain>(F);
+        s.pnic = dev_copy(pnic);
+        s.pcnt = dev_copy(pcnt);
+        s.wh_base = dev_copy(wh_base);
+        s.wh_n = dev_copy(wh_n);
+        s.wp_off = dev_copy(wp_off);
+        nbi = (int)(s.send_lat / D) + 3;
+        s.nbi = nbi;
+        s.dcap = 4096;
+        s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
+        s.dmsg_n = dev_alloc<unsigned int>(nbi);
+        s.dyn_cap = 256;
+        s.dyn = dev_alloc<int>((size_t)H * s.dyn_cap);
+        s.dyn_n = dev_alloc<int>(H);
+    }
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
     s.rx = dev_alloc<RcvQP>(F);
@@ -1092,6 +1243,7 @@ int main(int argc, char **argv)
         s.msg_cnt = dev_copy(mc);
     }
     s.pend_n = pend_n;
+    pend_n = std::max(pend_n, nbi); // (a DAG message arrives send_lat after its event)
     s.pend = dev_alloc<unsigned int>(pend_n);
     if (W == 1 && rates.size() > 1)
         printf("slot %lld ns, %zu link rates, %.1f MB of link buffers\n", (long long)D, rates.size(), nframes * sizeof(LFrame) / 1e6);
@@ -1221,6 +1373,8 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(&done, s.flows_done, sizeof(unsigned), cudaMemcpyDeviceToHost));
     vector<int64_t> fct(F);
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    if (s.dag) // the DAG flows' start times
+        CK(cudaMemcpy(fi.data(), s.fi, F * sizeof(FlowInfo), cudaMemcpyDeviceToHost));
     unsigned long long ev[32];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
     for (int wi = 0; wi < W; wi++)

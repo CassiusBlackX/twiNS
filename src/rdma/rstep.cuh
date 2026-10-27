@@ -483,6 +483,91 @@ __device__ __forceinline__ void trace_event(int node, int64_t now, const char *w
 __device__ __forceinline__ void trace_event(int, int64_t, const char *, int, const Chain &) {}
 #endif
 
+// ns-3's Hash32: MurmurHash3_x86_32 with seed 0x8BADF00D (hash-murmur3.cc)
+__host__ __device__ __forceinline__ uint32_t ns3_hash32(const uint8_t *key, int len)
+{
+    const uint32_t c1 = 0xcc9e2d51, c2 = 0x1b873593;
+    uint32_t h = 0x8BADF00D;
+    int nblocks = len / 4;
+    for (int i = 0; i < nblocks; i++)
+    {
+        uint32_t k = (uint32_t)key[4 * i] | (uint32_t)key[4 * i + 1] << 8 | (uint32_t)key[4 * i + 2] << 16 | (uint32_t)key[4 * i + 3] << 24;
+        k *= c1;
+        k = (k << 15) | (k >> 17);
+        k *= c2;
+        h ^= k;
+        h = (h << 13) | (h >> 19);
+        h = h * 5 + 0xe6546b64;
+    }
+    const uint8_t *tail = key + 4 * nblocks;
+    uint32_t k = 0;
+    switch (len & 3)
+    {
+    case 3:
+        k ^= tail[2] << 16;
+        [[fallthrough]];
+    case 2:
+        k ^= tail[1] << 8;
+        [[fallthrough]];
+    case 1:
+        k ^= tail[0];
+        k *= c1;
+        k = (k << 15) | (k >> 17);
+        k *= c2;
+        h ^= k;
+    }
+    h ^= (uint32_t)len;
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+}
+// a queue pair's pick among n devices: Hash32 of its (sip, dip, sport, dport)
+__host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint32_t n)
+{
+    uint8_t b[12] = {(uint8_t)sip, (uint8_t)(sip >> 8), (uint8_t)(sip >> 16), (uint8_t)(sip >> 24),
+                     (uint8_t)dip, (uint8_t)(dip >> 8), (uint8_t)(dip >> 16), (uint8_t)(dip >> 24),
+                     (uint8_t)sport, (uint8_t)(sport >> 8), (uint8_t)dport, (uint8_t)(dport >> 8)};
+    return ns3_hash32(b, 12) % n;
+}
+
+// ------------------------------------------------------------------ DAG
+// Flow g's dependency of kind k (0 received: its QpComplete; 1 sent: its first SendComplete) fired
+// in an event at tE with chain E: each child of that kind is installed in it (SendFlow), the i-th
+// with ordinal base + i (its index among the event's children of that kind, in id order), and its
+// StartApplication would be at tE + send_lat with chain E (0, base + i) (send_lat, 0). The child's
+// source host learns this send_lat later, in the slot it would start.
+__device__ __forceinline__ void dag_fire(const Sim &s, int g, int k, int64_t tE, const Chain &E, int base)
+{
+    int i = 0;
+    for (int j = s.ch_off[g]; j < s.ch_off[g + 1]; j++)
+    {
+        uint32_t v = s.ch_list[j];
+        if ((int)(v & 1) != k)
+            continue;
+        int64_t ts = tE + s.send_lat;
+        int64_t a = ts / s.P.delay;
+        int b = (int)(a % s.nbi);
+        unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
+        if (n >= (unsigned)s.dcap)
+        {
+            atomicAdd(&s.ev[14], 1ull);
+            i++;
+            continue;
+        }
+        DMsg &m = s.dmsg[(size_t)b * s.dcap + n];
+        Chain x;
+        cpush(&x, ccode(0, base + i), E);
+        cpush(&m.c, ccode(s.send_lat, 0), x);
+        m.ts = ts;
+        m.flow = v >> 1;
+        s.pend[a % s.pend_n] = 1;
+        i++;
+    }
+}
+
 // ------------------------------------------------------------------ frames
 __host__ __device__ __forceinline__ uint32_t node_ip(int id) { return 0x0b000001u + (id / 256) * 0x00010000u + (id % 256) * 0x00000100u; }
 
@@ -677,9 +762,17 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
     {
         // ns-3-alibabacloud's TransmitStart first schedules SendCallback (RdmaHw::SendPacketComplete,
         // which fires SendComplete if the frame's (dip, sport, pg) finds a queue pair: a data frame)
-        c.ord++;
+        int k = c.ord++;
         if (p.kind == K_DATA && s.sent[p.flow] < 0)
+        {
             s.sent[p.flow] = c.now + tx;
+            if (s.dag)
+            {
+                Chain e;
+                cpush(&e, ccode(tx, k), c.cur);
+                dag_fire(s, p.flow, 1, c.now + tx, e, 0);
+            }
+        }
     }
     cpush(&s.h_tc[c.nic()], ccode(tx, c.ord++), c.cur);
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
@@ -1000,6 +1093,8 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         q.done = 1;
         s.fct[f] = c.now - s.fi[f].start;
         atomicAdd(s.flows_done, 1u);
+        if (s.dag)
+            dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event has scheduled nothing yet)
     }
     if (p.kind == K_NACK)
         q.snd_nxt = q.snd_una;
@@ -1135,6 +1230,25 @@ struct HArr
 };
 constexpr int HPOOL = 64;
 
+// a DAG flow's StartApplication: its source port (portNumber[src][dst]++, in the order of the
+// installing events, which is the order of these starts) and devices, then AddQueuePair
+template <int ND>
+__device__ __forceinline__ void h_start_dyn(HCtx<ND> &c, int f)
+{
+    const Sim &s = *c.s;
+    FlowInfo &x = s.fi[f];
+    int w = s.h_world[c.h], hb = s.wh_base[w], hn = s.wh_n[w];
+    int a = x.src - hb, b = x.dst - hb;
+    int64_t pi = s.wp_off[w] + (int64_t)a * hn + b, pr = s.wp_off[w] + (int64_t)b * hn + a;
+    uint16_t port = s.pcnt[pi]++;
+    x.sport = port;
+    x.start = c.now;
+    const PairNic &sn = s.pnic[pi], &rn = s.pnic[pr];
+    x.snic = sn.sn > 1 ? sn.s[qp_pick(node_ip(a), node_ip(b), port, 100, sn.sn)] : sn.s[0];
+    x.rnic = rn.rn > 1 ? rn.r[qp_pick(node_ip(b), node_ip(a), 100, port, rn.rn)] : rn.r[0];
+    h_start(c, f);
+}
+
 // A host's slot, run by the lanes of one wave: they load the slot's arrivals (of all its devices)
 // into LDS and compute HPCC's per-hop utilizations of its ACKs (with FAST_REACT and without
 // SAMPLE_FEEDBACK an ACK's depend only on it and on the hops of the QP's previous ACK, so they need
@@ -1269,6 +1383,36 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         af[d] = nullptr;
     int sf = -1, sf_at = -1;
     Host &h0 = c.stv[0]; // the host's flow starts
+    // DAG: the dependencies fired for this host's flows that arrive in this slot; a flow whose last
+    // one this is becomes ready, to start at the latest of them (in ns-3's order)
+    int *dyn = s.dag ? s.dyn + (size_t)h * s.dyn_cap : nullptr;
+    int ndyn = s.dag ? s.dyn_n[h] : 0;
+    if (s.dag)
+    {
+        int b = (int)(slot % s.nbi);
+        unsigned int n = s.dmsg_n[b];
+        if (n > (unsigned)s.dcap)
+            n = s.dcap;
+        for (unsigned int i = 0; i < n; i++)
+        {
+            const DMsg &m = s.dmsg[(size_t)b * s.dcap + i];
+            int f = m.flow;
+            if (s.fi[f].src != h)
+                continue;
+            if (s.dep_t[f] < 0 || before(s, s.dep_t[f], 0, s.dep_c[f], m.ts, 0, m.c))
+            {
+                s.dep_t[f] = m.ts;
+                s.dep_c[f] = m.c;
+            }
+            if (--s.dep_left[f] == 0)
+            {
+                if (ndyn >= s.dyn_cap)
+                    atomicAdd(&s.ev[15], 1ull);
+                else
+                    dyn[ndyn++] = f;
+            }
+        }
+    }
     for (;;)
     {
         // candidates: 0 an arrival, 1 a TransmitComplete, 2 an m_nextSend (each per device), 3 a
@@ -1307,13 +1451,19 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         // a candidate's chain is cpush(code(k, d), chain(k, d)). The selection keeps only indices: a
         // version that carried a pointer to the best candidate's chain along gave wrong results at
         // -O2 and above (the pointer was stale at a flow start), and right ones at -O1
+        // the earliest ready DAG flow
+        int di_dyn = -1;
+        for (int i = 0; i < ndyn; i++)
+            if (di_dyn < 0 || before(s, s.dep_t[dyn[i]], 0, s.dep_c[dyn[i]], s.dep_t[dyn[di_dyn]], 0, s.dep_c[dyn[di_dyn]]))
+                di_dyn = i;
         auto code = [&](int k, int d) -> uint32_t { return k == 0 ? acode[d] : 0; };
         auto chain = [&](int k, int d) -> const Chain & {
             return k == 0   ? af[d]->c
                    : k == 1 ? s.h_tc[c.nic0 + d]
                    : k == 2 ? s.h_ns[c.nic0 + d]
                    : k == 3 ? due_chain(s, due[di])
-                            : s.fi[sf].start_chain;
+                   : k == 4 ? s.fi[sf].start_chain
+                            : s.dep_c[dyn[di_dyn]];
         };
         auto ctime = [&](int k, int d) -> int64_t {
             if (k == 0)
@@ -1324,11 +1474,13 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                 return c.stv[d].ns_at >= 0 && c.stv[d].ns_at < t1 ? c.stv[d].ns_at : INT64_MAX;
             if (k == 3)
                 return di < ndue ? due[di].at : INT64_MAX;
-            return sf_t < t1 ? sf_t : INT64_MAX;
+            if (k == 4)
+                return sf_t < t1 ? sf_t : INT64_MAX;
+            return di_dyn >= 0 && s.dep_t[dyn[di_dyn]] < t1 ? s.dep_t[dyn[di_dyn]] : INT64_MAX;
         };
         int bk = -1, bd = 0;
         int64_t bt = INT64_MAX;
-        for (int k = 0; k < 5; k++)
+        for (int k = 0; k < 6; k++)
             for (int d = 0; d < (k < 3 ? nd : 1); d++)
             {
                 int64_t t = ctime(k, d);
@@ -1348,6 +1500,13 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             c.cur = chain(bk, bd);
         c.ord = 0;
         trace_event(h, c.now, bk == 0 ? "arrival" : bk == 1 ? "tc" : bk == 2 ? "nextsend" : bk == 3 ? "timer" : "start", bd, c.cur);
+        if (bk == 5)
+        {
+            int f = dyn[di_dyn];
+            dyn[di_dyn] = dyn[--ndyn];
+            h_start_dyn(c, f);
+            continue;
+        }
         if (bk < 3)
             hsel(c, bd);
         if (bk == 0)
@@ -1407,6 +1566,12 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     int64_t w = INT64_MAX;
     if (h0.next_start < h0.start_end)
         w = s.fi[s.start_list[h0.next_start]].start;
+    if (s.dag)
+    {
+        s.dyn_n[h] = ndyn;
+        for (int i = 0; i < ndyn; i++)
+            w = s.dep_t[dyn[i]] < w ? s.dep_t[dyn[i]] : w;
+    }
     for (int d = 0; d < nd; d++)
     {
         link_flush(s, c.obv[d]);
@@ -2253,6 +2418,8 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     unsigned int cur = atomicAdd(&s.activity[0], 0u);
     unsigned long long nw = atomicAdd(s.next_wake, 0ull);
     s.pend[slot % s.pend_n] = 0;
+    if (s.dag)
+        s.dmsg_n[slot % s.nbi] = 0; // this slot's dependency messages are read
     int64_t next = slot + 1;
     if (cur == 0)
     {
