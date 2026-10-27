@@ -25,7 +25,7 @@ __host__ __device__ __forceinline__ int64_t ns_seconds(double x)
 __host__ __device__ __forceinline__ int64_t tx_ns(uint64_t bps, uint32_t bytes) { return ns_seconds((double)bytes * 8 / (double)bps); }
 
 // tx_ns(link rate, bytes) for frames below TXT_N bytes (main fills it)
-constexpr int TXT_N = 4096;
+constexpr int TXT_N = 8192;
 __constant__ int32_t c_txt[TXT_N];
 __device__ __forceinline__ int64_t link_tx(const Sim &s, uint32_t bytes) { return bytes < TXT_N ? c_txt[bytes] : tx_ns(s.P.bps, bytes); }
 
