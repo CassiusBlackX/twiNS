@@ -1050,6 +1050,38 @@ int main(int argc, char **argv)
     s.rtp = dev_copy(rtp);
     s.fi = dev_copy(fi);
     s.root_chain = dev_copy(root_chain);
+    {
+        // the roots in ccmp_walk's order of their start chains (short, without tails): the first
+        // differing lead (the larger first), a chain that ends first, then the root
+        auto leads = [](const Chain &c) {
+            vector<uint32_t> v;
+            for (int i = 0; i < RUNS && c.r[i].code; i++)
+                for (uint32_t k = 0; k < c.r[i].cnt; k++)
+                    v.push_back(c.r[i].code >> 3);
+            return v;
+        };
+        vector<vector<uint32_t>> L(F);
+        vector<int> idx;
+        for (int i = 0; i < F; i++)
+            if (root_chain[i].root)
+            {
+                L[i] = leads(root_chain[i]);
+                idx.push_back(i);
+            }
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+            const vector<uint32_t> &x = L[a], &y = L[b];
+            for (size_t i = 0; i < x.size() && i < y.size(); i++)
+                if (x[i] != y[i])
+                    return x[i] > y[i];
+            if (x.size() != y.size())
+                return x.size() < y.size();
+            return root_chain[a].root < root_chain[b].root;
+        });
+        vector<uint32_t> rank(F, 0);
+        for (size_t i = 0; i < idx.size(); i++)
+            rank[idx[i]] = i;
+        s.root_rank = dev_copy(rank);
+    }
     // DAG worlds: children, dependencies, host pairs; messages wait send_lat (SEND_LAT_NS, as
     // AS_SEND_LAT), at least a slot
     int nbi = 1;
@@ -1243,6 +1275,7 @@ int main(int argc, char **argv)
             }
     }
     s.li = dev_copy(li);
+
     s.msg = dev_alloc<LFrame>(nframes);
     {
         vector<long long> mc(ncnt, -(1ll << 16));
@@ -1448,7 +1481,7 @@ int main(int argc, char **argv)
     {
         unsigned long long gp[8];
         CK(hipMemcpyFromSymbol(gp, HIP_SYMBOL(g_prof), sizeof(gp)));
-        printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu)\n", gp[0], gp[3], gp[1], gp[4]);
+        printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu), walk steps %llu (in tails %llu)\n", gp[0], gp[3], gp[1], gp[4], gp[2], gp[5]);
     }
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",

@@ -5,6 +5,8 @@
 usage: gen_dag.py ring GPUS BYTES [CHANNELS] > F     ring all-reduce over GPUS (a list a-b or a,b,..)
        gen_dag.py a2a GPUS BYTES PHASES > F          all-to-all in phases
        gen_dag.py pipe GPUS BYTES MICROBATCHES > F   pipeline stages GPUS[0] -> GPUS[1] -> ...
+       gen_dag.py rails NGPUS GPS BYTES > F          a ring all-reduce per rail (GPU index within its
+                                                     server) over all servers, side by side
 The ring sends BYTES / len(GPUS) per step and channel, 2 (n - 1) steps: step k of rank i waits for
 step k - 1 of rank i - 1 (received) and its own step k - 1 (sent). An all-to-all phase p sends
 from i to i + p + 1; phase p + 1 of rank i waits for its phase-p message received and the phase-p
@@ -94,8 +96,22 @@ def pipe(g, size, mb, t0=1000):
     return dag
 
 
+def rails(n, gps, size, t0=1000):
+    dag = Dag()
+    for r in range(gps):
+        d = ring(list(range(r, n, gps)), size, 1, t0)
+        base = len(dag.flows)
+        dag.flows += d.flows
+        dag.roots += [(i + base, t) for i, t in d.roots]
+        dag.deps += [(i + base, k, p + base) for i, k, p in d.deps]
+    return dag
+
+
 def main():
     kind = sys.argv[1]
+    if kind == "rails":
+        rails(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])).write()
+        return
     g = gpus(sys.argv[2])
     size = int(sys.argv[3])
     if kind == "ring":

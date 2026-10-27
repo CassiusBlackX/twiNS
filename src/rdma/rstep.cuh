@@ -244,7 +244,9 @@ struct RunCursor
 // the deepest level at which the ordinals differ, and there the smaller ordinal (the sibling
 // scheduled first) decides; distinct roots (flows' StartApplications) decide in start order.
 // (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
-__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr)
+// (inline_only: give up, returning 2, where either chain goes on into its tail)
+__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr,
+                                         bool inline_only = false)
 {
     *inexact = false;
     if (by_lead)
@@ -255,6 +257,8 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
     B.init(b, pb);
     for (;;)
     {
+        if (inline_only && (A.i > RUNS || B.i > RUNS))
+            return 2;
         uint32_t ca = A.code, cb = B.code;
         if (ca == 0 || cb == 0)
         {
@@ -354,7 +358,10 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
         hb[i] = pb ? (i == 1 ? b.hash : b.anc[i - 2]) : b.anc[i - 1];
     }
     if (a.root && b.root && a.root != b.root && ha[0] == hb[0])
-        return ccmp_walk(0, s.root_chain[a.root - 1], 0, s.root_chain[b.root - 1], inexact);
+    {
+        *inexact = false;
+        return s.root_rank[a.root - 1] < s.root_rank[b.root - 1] ? -1 : 1;
+    }
     // the top elements' leads, one at a time: depth j is usable when the top j leads are equal
     RunCursor A, B;
     A.init(a, pa);
@@ -443,6 +450,15 @@ __device__ __forceinline__ int pcmp(const Run *a, const Run *b)
             rb = b[ib].cnt;
     }
     return 0;
+}
+
+// a tie by what a switch keeps in LDS: chains of distinct roots with equal lead hashes compare as
+// their roots (see ccmp), else the prefixes; 0: undecided
+__device__ __forceinline__ int qcmp(const Sim &s, const Run *pa, uint64_t ha, uint32_t ra, const Run *pb, uint64_t hb, uint32_t rb)
+{
+    if (ra && rb && ra != rb && ha == hb)
+        return s.root_rank[ra - 1] < s.root_rank[rb - 1] ? -1 : 1;
+    return pcmp(pa, pb);
 }
 
 // a candidate event: does (ta, a) run before (tb, b)? A chain is given as cpush(p, chain) (p 0:
@@ -1624,6 +1640,8 @@ struct SwPortLds
     OutBucket ob;          // its out link's
     uint32_t acode;    // the next arrival's code
     Run ap[PRE], tp[PRE]; // the prefixes of the next arrival's chain and of tc's
+    uint64_t ah, th;   // their lead hashes and roots (qcmp)
+    uint32_t ar, tr;
 };
 
 // an arrival of the slot in the pool: its frame's contents, the code and prefix of its arrival's
@@ -1633,6 +1651,8 @@ struct ArrLds
     int64_t ts;
     Pkt p;
     Run ap[PRE];
+    uint64_t ah;    // its chain's lead hash and root (qcmp)
+    uint32_t ar;
     uint32_t acode;
     uint32_t frame; // index in s.msg
     int16_t out;    // the egress port (-1: a PFC frame, or no route)
@@ -1695,6 +1715,8 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     cpush(&tcc, ccode(tx, c.ord++), cur);
     c.tc[port] = tcc;
     cprefix(c.w[port].tp, 0, tcc);
+    c.w[port].th = tcc.hash;
+    c.w[port].tr = tcc.root;
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
     c.ord++;
     c.w[port].nout++;
@@ -1949,6 +1971,8 @@ __device__ __forceinline__ void sw_peek(const SCtx &c, SwPortLds &w, int64_t t1)
             w.acode = a.acode;
             for (int i = 0; i < PRE; i++)
                 w.ap[i] = a.ap[i];
+            w.ah = a.ah;
+            w.ar = a.ar;
         }
         return;
     }
@@ -1959,6 +1983,8 @@ __device__ __forceinline__ void sw_peek(const SCtx &c, SwPortLds &w, int64_t t1)
         w.ats = f.ts;
         w.acode = arrival_code(s, w.link_in, w.in_delay, f);
         cprefix(w.ap, w.acode, f.c);
+        w.ah = chash(f.c.hash, w.acode);
+        w.ar = f.c.root;
     }
 }
 
@@ -2026,7 +2052,11 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         first[p] = 0;
         cnt[p] = q.an;
         if (q.pt.tc_at >= 0)
+        {
             cprefix(q.tp, 0, tcs[p]);
+            q.th = tcs[p].hash;
+            q.tr = tcs[p].root;
+        }
     }
     __syncthreads();
     // the pool: ports' arrivals in order, if they fit
@@ -2048,6 +2078,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             a.p = f.p;
             a.acode = arrival_code(s, w[p].link_in, w[p].in_delay, f);
             cprefix(a.ap, a.acode, f.c);
+            a.ah = chash(f.c.hash, a.acode);
+            a.ar = f.c.root;
             a.frame = fi;
             int q = 0;
             a.out = (int16_t)(f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? -1 : s_route(s, WP, x, f.p, &q));
@@ -2137,7 +2169,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                     int kb = cur[bp];
                     if (kts[k] != kts[kb] ? kts[k] < kts[kb] : ({
                             const ArrLds &A = pool[k], &B = pool[kb];
-                            int r = pcmp(A.ap, B.ap);
+                            int r = qcmp(s, A.ap, A.ah, A.ar, B.ap, B.ah, B.ar);
                             r ? r < 0 : before(s, A.ts, A.acode, s.msg[A.frame].c, B.ts, B.acode, s.msg[B.frame].c);
                         }))
                         bp = p;
@@ -2185,7 +2217,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 else
                 {
                     const ArrLds &a = pool[olist[oi]];
-                    int r = pcmp(a.ap, me.tp);
+                    int r = qcmp(s, a.ap, a.ah, a.ar, me.tp, me.th, me.tr);
                     arr = r ? r < 0 : before(s, ta, a.acode, s.msg[a.frame].c, tc, 0, tcs[o]);
                 }
                 c.ord = 0;
@@ -2239,8 +2271,167 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
 #endif
         }
     }
-    else if (lane == 0)
+    else if (deg <= SAFE_LANES)
     {
+        // all events in order, by lane 0 (a few ports: a scan is cheaper than the lanes' barriers)
+        if (lane == 0)
+        {
+            SCtx c;
+            c.s = &s;
+            c.x = x;
+            c.node = node;
+            c.sw = s.sw[x];
+            c.slot = slot;
+            c.w = w;
+            c.tc = tcs;
+            c.pool = pooled ? pool : nullptr;
+            c.safe = false;
+            c.nvs = s.si[x].nvs;
+            c.P = &WP;
+            int base = 0;
+            for (int p = 0; p < deg; p++)
+            {
+                if (pooled)
+                {
+                    w[p].ai = base;
+                    w[p].aend = base + cnt[p];
+                    base += cnt[p];
+                }
+                else
+                    w[p].ai = 0;
+                sw_peek(c, w[p], t1);
+            }
+    #ifdef RDMA_PROF
+            unsigned long long nev = 0;
+            unsigned long long ph[4] = {0, 0, 0, 0};
+            long long q0 = clock64();
+    #endif
+            for (;;)
+            {
+                // the earliest event: a port's next arrival or its TransmitComplete
+                int best = -1, bk = 0;
+                int64_t bt = INT64_MAX;
+                for (int p = 0; p < deg; p++)
+                {
+                    int64_t ta = w[p].ats, tc = w[p].pt.tc_at;
+                    for (int k = 0; k < 2; k++)
+                    {
+                        int64_t t = k ? tc : ta;
+                        if (k ? (tc < 0 || tc >= t1 || tc > bt) : (ta == INT64_MAX || ta > bt))
+                            continue;
+                        if (t < bt || best < 0)
+                        {
+                            best = p, bk = k, bt = t;
+                            continue;
+                        }
+                        // a tie: the prefixes, else the whole chains
+                        const Run *pa = k ? w[p].tp : w[p].ap, *pb = bk ? w[best].tp : w[best].ap;
+                        int r = qcmp(s, pa, k ? w[p].th : w[p].ah, k ? w[p].tr : w[p].ar, pb, bk ? w[best].th : w[best].ah,
+                                     bk ? w[best].tr : w[best].ar);
+    #ifdef RDMA_PROF
+                        atomicAdd(&s.ev[28], 1ull);
+                        if (r == 0)
+                            atomicAdd(&s.ev[29], 1ull);
+    #endif
+                        if (r == 0)
+                        {
+                            uint32_t ca = k ? 0 : w[p].acode, cb = bk ? 0 : w[best].acode;
+                            const Chain &xa = k ? tcs[p] : sw_arr_chain(c, w[p]);
+                            const Chain &xb = bk ? tcs[best] : sw_arr_chain(c, w[best]);
+                            r = before(s, t, ca, xa, bt, cb, xb) ? -1 : 1;
+                        }
+                        if (r < 0)
+                            best = p, bk = k;
+                    }
+                }
+                if (best < 0)
+                    break;
+                int p = best;
+                c.now = bt;
+                c.ord = 0;
+                c.cur_ok = false;
+    #ifdef RDMA_PROF
+                nev++;
+                long long q1 = clock64();
+                ph[0] += q1 - q0;
+                q0 = q1;
+    #endif
+                if (bk == 1)
+                {
+                    c.cur_src = &tcs[p];
+                    c.cur_code = 0;
+                    trace_event(c.node, c.now, "tc", p, sc_cur(c));
+                    w[p].pt.tc_at = -1;
+                    s_dequeue(c, p);
+    #ifdef RDMA_PROF
+                    q1 = clock64();
+                    ph[2] += q1 - q0;
+                    q0 = q1;
+    #endif
+                    continue;
+                }
+                Pkt pk;
+                int out, q = PG;
+                c.cur_code = w[p].acode;
+                if (c.pool)
+                {
+                    const ArrLds &a = c.pool[w[p].ai];
+                    c.cur_src = &s.msg[a.frame].c;
+                    pk = a.p;
+                    out = a.out;
+                    q = a.q;
+                }
+                else
+                {
+                    const LFrame &f = sw_frame(s, w[p]);
+                    c.cur_src = &f.c;
+                    pk = f.p;
+                    out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, WP, x, pk, &q);
+                }
+    #ifdef RDMA_PROF
+                q1 = clock64();
+                ph[1] += q1 - q0;
+                q0 = q1;
+    #endif
+                trace_event(c.node, c.now, "arrival", p, sc_cur(c));
+                w[p].ai++;
+                sw_peek(c, w[p], t1);
+                if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
+                {
+                    if (WP.qbb)
+                    {
+                        if (pk.kind == K_PAUSE)
+                            w[p].pt.paused |= 1u << pk.q;
+                        else
+                        {
+                            w[p].pt.paused &= ~(1u << pk.q);
+                            s_dequeue(c, p);
+                        }
+                    }
+                }
+                else
+                    s_forward(c, p, pk, out, q);
+    #ifdef RDMA_PROF
+                q1 = clock64();
+                ph[3] += q1 - q0;
+                q0 = q1;
+    #endif
+            }
+            s.sw[x] = c.sw;
+    #ifdef RDMA_PROF
+            for (int i = 0; i < 4; i++)
+                atomicAdd(&s.ev[24 + i], ph[i]);
+            atomicAdd(&s.ev[20], nev);
+            atomicMax(&s.ev[22], nev);
+            if (!pooled)
+                atomicAdd(&s.ev[30], 1ull);
+    #endif
+        }
+    }
+    else
+    {
+        // all events in order, many ports: the lanes choose the next one together (each the best of
+        // its ports, then a reduction); lane 0 runs it
         SCtx c;
         c.s = &s;
         c.x = x;
@@ -2253,143 +2444,158 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.safe = false;
         c.nvs = s.si[x].nvs;
         c.P = &WP;
-        int base = 0;
-        for (int p = 0; p < deg; p++)
+        for (int p = lane; p < deg; p += lanes)
         {
             if (pooled)
             {
+                int base = 0;
+                for (int q = 0; q < p; q++)
+                    base += cnt[q];
                 w[p].ai = base;
                 w[p].aend = base + cnt[p];
-                base += cnt[p];
             }
             else
                 w[p].ai = 0;
             sw_peek(c, w[p], t1);
         }
+        __syncthreads();
+        // a candidate: index 2 port + kind (0 arrival, 1 TransmitComplete), -1 none; time
+        auto ctime = [&](int i) -> int64_t {
+            const SwPortLds &q = w[i >> 1];
+            if (i & 1)
+                return q.pt.tc_at >= 0 && q.pt.tc_at < t1 ? q.pt.tc_at : INT64_MAX;
+            return q.ats;
+        };
+        // does candidate i run before j (both at time t)? Undecided ties keep the smaller index, as
+        // a scan in port order would
+        auto first = [&](int i, int j, int64_t t) -> bool {
+            const SwPortLds &a = w[i >> 1], &b = w[j >> 1];
+            int ki = i & 1, kj = j & 1;
+            int r = qcmp(s, ki ? a.tp : a.ap, ki ? a.th : a.ah, ki ? a.tr : a.ar, kj ? b.tp : b.ap, kj ? b.th : b.ah, kj ? b.tr : b.ar);
+#ifdef RDMA_PROF
+            atomicAdd(&s.ev[28], 1ull);
+            if (r == 0)
+                atomicAdd(&s.ev[29], 1ull);
+#endif
+            if (r == 0)
+            {
+                const Chain &xa = ki ? tcs[i >> 1] : sw_arr_chain(c, a);
+                const Chain &xb = kj ? tcs[j >> 1] : sw_arr_chain(c, b);
+                bool inexact;
+                r = ccmp(s, ki ? 0 : a.acode, xa, kj ? 0 : b.acode, xb, &inexact);
+                if (inexact)
+                    atomicAdd(&s.ev[9], 1ull);
+                if (r == 0)
+                {
+                    atomicAdd(&s.ev[8], 1ull);
+                    return i < j;
+                }
+            }
+            return r < 0;
+        };
+        __shared__ int sel_best;
 #ifdef RDMA_PROF
         unsigned long long nev = 0;
-        unsigned long long ph[4] = {0, 0, 0, 0};
-        long long q0 = clock64();
 #endif
         for (;;)
         {
-            // the earliest event: a port's next arrival or its TransmitComplete
-            int best = -1, bk = 0;
+            int best = -1;
             int64_t bt = INT64_MAX;
-            for (int p = 0; p < deg; p++)
-            {
-                int64_t ta = w[p].ats, tc = w[p].pt.tc_at;
+            for (int p = lane; p < deg; p += lanes)
                 for (int k = 0; k < 2; k++)
                 {
-                    int64_t t = k ? tc : ta;
-                    if (k ? (tc < 0 || tc >= t1 || tc > bt) : (ta == INT64_MAX || ta > bt))
+                    int i = 2 * p + k;
+                    int64_t t = ctime(i);
+                    if (t == INT64_MAX || t > bt)
                         continue;
-                    if (t < bt || best < 0)
-                    {
-                        best = p, bk = k, bt = t;
-                        continue;
-                    }
-                    // a tie: the prefixes, else the whole chains
-                    const Run *pa = k ? w[p].tp : w[p].ap, *pb = bk ? w[best].tp : w[best].ap;
-                    int r = pcmp(pa, pb);
-#ifdef RDMA_PROF
-                    atomicAdd(&s.ev[28], 1ull);
-                    if (r == 0)
-                        atomicAdd(&s.ev[29], 1ull);
-#endif
-                    if (r == 0)
-                    {
-                        uint32_t ca = k ? 0 : w[p].acode, cb = bk ? 0 : w[best].acode;
-                        const Chain &xa = k ? tcs[p] : sw_arr_chain(c, w[p]);
-                        const Chain &xb = bk ? tcs[best] : sw_arr_chain(c, w[best]);
-                        r = before(s, t, ca, xa, bt, cb, xb) ? -1 : 1;
-                    }
-                    if (r < 0)
-                        best = p, bk = k;
+                    if (t < bt || best < 0 || first(i, best, t))
+                        best = i, bt = t;
                 }
+            for (int off = 1; off < lanes; off <<= 1)
+            {
+                int ob = __shfl_xor(best, off);
+                int lo = __shfl_xor((int)(uint32_t)bt, off), hi = __shfl_xor((int)(bt >> 32), off);
+                int64_t ot = (int64_t)(((uint64_t)(uint32_t)hi << 32) | (uint32_t)lo);
+                if (ob < 0)
+                    continue;
+                if (best < 0 || ot < bt || (ot == bt && ob != best && first(ob, best, ot)))
+                    best = ob, bt = ot;
             }
+            if (lane == 0)
+                sel_best = best;
+            __syncthreads();
+            best = sel_best;
             if (best < 0)
                 break;
-            int p = best;
-            c.now = bt;
-            c.ord = 0;
-            c.cur_ok = false;
+            if (lane == 0)
+            {
+                int p = best >> 1;
+                c.now = bt;
+                c.ord = 0;
+                c.cur_ok = false;
 #ifdef RDMA_PROF
-            nev++;
-            long long q1 = clock64();
-            ph[0] += q1 - q0;
-            q0 = q1;
+                nev++;
 #endif
-            if (bk == 1)
-            {
-                c.cur_src = &tcs[p];
-                c.cur_code = 0;
-                trace_event(c.node, c.now, "tc", p, sc_cur(c));
-                w[p].pt.tc_at = -1;
-                s_dequeue(c, p);
-#ifdef RDMA_PROF
-                q1 = clock64();
-                ph[2] += q1 - q0;
-                q0 = q1;
-#endif
-                continue;
-            }
-            Pkt pk;
-            int out, q = PG;
-            c.cur_code = w[p].acode;
-            if (c.pool)
-            {
-                const ArrLds &a = c.pool[w[p].ai];
-                c.cur_src = &s.msg[a.frame].c;
-                pk = a.p;
-                out = a.out;
-                q = a.q;
-            }
-            else
-            {
-                const LFrame &f = sw_frame(s, w[p]);
-                c.cur_src = &f.c;
-                pk = f.p;
-                out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, WP, x, pk, &q);
-            }
-#ifdef RDMA_PROF
-            q1 = clock64();
-            ph[1] += q1 - q0;
-            q0 = q1;
-#endif
-            trace_event(c.node, c.now, "arrival", p, sc_cur(c));
-            w[p].ai++;
-            sw_peek(c, w[p], t1);
-            if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
-            {
-                if (WP.qbb)
+                if (best & 1)
                 {
-                    if (pk.kind == K_PAUSE)
-                        w[p].pt.paused |= 1u << pk.q;
+                    c.cur_src = &tcs[p];
+                    c.cur_code = 0;
+                    trace_event(c.node, c.now, "tc", p, sc_cur(c));
+                    w[p].pt.tc_at = -1;
+                    s_dequeue(c, p);
+                }
+                else
+                {
+                    Pkt pk;
+                    int out, q = PG;
+                    c.cur_code = w[p].acode;
+                    if (c.pool)
+                    {
+                        const ArrLds &a = c.pool[w[p].ai];
+                        c.cur_src = &s.msg[a.frame].c;
+                        pk = a.p;
+                        out = a.out;
+                        q = a.q;
+                    }
                     else
                     {
-                        w[p].pt.paused &= ~(1u << pk.q);
-                        s_dequeue(c, p);
+                        const LFrame &f = sw_frame(s, w[p]);
+                        c.cur_src = &f.c;
+                        pk = f.p;
+                        out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, WP, x, pk, &q);
                     }
+                    trace_event(c.node, c.now, "arrival", p, sc_cur(c));
+                    w[p].ai++;
+                    sw_peek(c, w[p], t1);
+                    if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
+                    {
+                        if (WP.qbb)
+                        {
+                            if (pk.kind == K_PAUSE)
+                                w[p].pt.paused |= 1u << pk.q;
+                            else
+                            {
+                                w[p].pt.paused &= ~(1u << pk.q);
+                                s_dequeue(c, p);
+                            }
+                        }
+                    }
+                    else
+                        s_forward(c, p, pk, out, q);
                 }
             }
-            else
-                s_forward(c, p, pk, out, q);
+            __syncthreads();
+        }
+        if (lane == 0)
+        {
+            s.sw[x] = c.sw;
 #ifdef RDMA_PROF
-            q1 = clock64();
-            ph[3] += q1 - q0;
-            q0 = q1;
+            atomicAdd(&s.ev[20], nev);
+            atomicMax(&s.ev[22], nev);
+            if (!pooled)
+                atomicAdd(&s.ev[30], 1ull);
 #endif
         }
-        s.sw[x] = c.sw;
-#ifdef RDMA_PROF
-        for (int i = 0; i < 4; i++)
-            atomicAdd(&s.ev[24 + i], ph[i]);
-        atomicAdd(&s.ev[20], nev);
-        atomicMax(&s.ev[22], nev);
-        if (!pooled)
-            atomicAdd(&s.ev[30], 1ull);
-#endif
     }
     __syncthreads();
     for (int p = lane; p < deg; p += lanes)

@@ -294,6 +294,7 @@ struct Sim
     const uint8_t *rtp;
     FlowInfo *fi;
     const Chain *root_chain; // [F] the start chain of root r at r - 1
+    const uint32_t *root_rank; // [F] root r's place in the order of the start chains (ccmp_walk's)
     SndQP *qp;
     QPChains *qc;
     RcvQP *rx;
