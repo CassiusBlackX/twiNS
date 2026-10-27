@@ -242,6 +242,16 @@ build/twins-rdma validation/hpcc/hpcc.cfg --topo=data/topo/fattree8.txt --flows=
   as twins.
 - **Output.** One line per flow: `id start_ns fct_ns`.
 
+**Batches.** `--batch=JOBFILE --outdir=DIR` runs every line of a job file
+(`name topo flows [KEY=VALUE ...]`) as a world of its own, side by side in one GPU run, and
+writes `DIR/name.fct`. The worlds may differ in topology, flows and every config key except the
+link rate and delay. A single run fills only a few hundred waves, so batches multiply throughput.
+
+The k=8 sweep in `validation/hpcc/sweep_k8.txt` has 32 configurations: 2 workloads, DCQCN and
+HPCC, 2 buffer sizes, 4 ECN thresholds. As one batch it takes 3.2 s, and every world matches
+its reference. The same 32 runs take 19.0 s one after another. The reference takes 1,783 s on one
+core and 63.1 s on 32 cores of the Xeon (32 processes at once): 554× and 20×.
+
 The reference is the HPCC fork's own scenario on these files. Two changes make it reproducible:
 - routes are ordered by node id instead of by heap address;
 - each switch port draws its ECN marks from its own random stream.

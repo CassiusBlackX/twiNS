@@ -66,9 +66,13 @@ difference between the two transmission traces (`txdiff.py`).
 | `jobs1.txt` | 10 | FatTree k=4 and k=8: incasts, all-to-all (up to 12519 flows); PFC with 1–2 MB buffers | all |
 | `jobs2.txt` | 29 | FatTree k=16 (1024 hosts), leaf-spine 16×8, Jellyfish, torus, Dragonfly; incast of 64 with 1 MB buffers (4315 pauses); low ECN thresholds (28k marks); every switch of the config (ACK priority, windows, fast react, MI threshold, target clamping, rate bound, MTU 1500, ACK interval, DCQCN gains and timers) | all |
 | `jobs3.txt` | 8 | Safe and serial switch slots alternating within a run: all-to-all and permutation traffic with 1–2 MB buffers (up to 26848 pauses), FatTree k=8 and k=16, leaf-spine; HPCC with `SAMPLE_FEEDBACK` (its serial paths), with and without fast react | all |
+| `sweep_k8.txt` | 32 | A parameter sweep on FatTree k=8 (a2a30, a2a50s): DCQCN and HPCC, 2 and 32 MB buffers, 4 ECN thresholds; checked as one batch (`check_batch.sh`) | all |
 
 Both congestion controls run in each set. HPCC runs only where paths have at most 5 switches.
 Beyond that its INT header overflows and the fork writes past the end of `hp.hop[]`.
+
+`check_batch.sh JOBFILE` runs a whole job file as one batch of worlds (`twins-rdma --batch`) and
+compares every world with its reference. All three job files give identical results this way too.
 
 Ties the chains do not decide, and ties decided on an overwritten tail node, are counted and
 reported. A larger `--tail` makes the ring longer. twins-rdma also warns about late data:
