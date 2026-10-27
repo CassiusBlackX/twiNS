@@ -1,0 +1,61 @@
+diff --git a/simulation/src/point-to-point/model/switch-mmu.cc b/simulation/src/point-to-point/model/switch-mmu.cc
+index 4baa387..bb4e3da 100644
+--- a/simulation/src/point-to-point/model/switch-mmu.cc
++++ b/simulation/src/point-to-point/model/switch-mmu.cc
+@@ -11,6 +11,8 @@
+ #include "ns3/simulator.h"
+ #include "ns3/random-variable.h"
+ #include "switch-mmu.h"
++#include "ns3/rng-stream.h"
++#include "ns3/rng-seed-manager.h"
+ 
+ NS_LOG_COMPONENT_DEFINE("SwitchMmu");
+ namespace ns3 {
+@@ -32,6 +34,7 @@ namespace ns3 {
+ 		memset(ingress_bytes, 0, sizeof(ingress_bytes));
+ 		memset(paused, 0, sizeof(paused));
+ 		memset(egress_bytes, 0, sizeof(egress_bytes));
++		memset(ecn_rng, 0, sizeof(ecn_rng));
+ 	}
+ 	bool SwitchMmu::CheckIngressAdmission(uint32_t port, uint32_t qIndex, uint32_t psize){
+ 		if (psize + hdrm_bytes[port][qIndex] > headroom[port] && psize + GetSharedUsed(port, qIndex) > GetPfcThreshold(port)){
+@@ -103,11 +106,14 @@ namespace ns3 {
+ 			return true;
+ 		if (egress_bytes[ifindex][qIndex] > kmin[ifindex]){
+ 			double p = pmax[ifindex] * double(egress_bytes[ifindex][qIndex] - kmin[ifindex]) / (kmax[ifindex] - kmin[ifindex]);
+-			if (UniformVariable(0, 1).GetValue() < p)
++			if ((ecn_rng[ifindex] ? ecn_rng[ifindex]->RandU01() : UniformVariable(0, 1).GetValue()) < p)
+ 				return true;
+ 		}
+ 		return false;
+ 	}
++	void SwitchMmu::ConfigEcnStream(uint32_t port, uint64_t stream){
++		ecn_rng[port] = new RngStream(RngSeedManager::GetSeed(), (1ull << 63) + stream, RngSeedManager::GetRun());
++	}
+ 	void SwitchMmu::ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax){
+ 		kmin[port] = _kmin * 1000;
+ 		kmax[port] = _kmax * 1000;
+diff --git a/simulation/src/point-to-point/model/switch-mmu.h b/simulation/src/point-to-point/model/switch-mmu.h
+index 76d4ca3..8366eff 100644
+--- a/simulation/src/point-to-point/model/switch-mmu.h
++++ b/simulation/src/point-to-point/model/switch-mmu.h
+@@ -7,6 +7,7 @@
+ namespace ns3 {
+ 
+ class Packet;
++class RngStream;
+ 
+ class SwitchMmu: public Object{
+ public:
+@@ -37,6 +38,11 @@ public:
+ 	bool ShouldSendCN(uint32_t ifindex, uint32_t qIndex);
+ 
+ 	void ConfigEcn(uint32_t port, uint32_t _kmin, uint32_t _kmax, double _pmax);
++	// TwiNS patch: the ECN marking draws of each egress port come from its own stream
++	// (RngStream(seed, 2^63 + stream, run), as SetStream(stream) gives) instead of a new
++	// UniformVariable per draw, whose stream depends on how many were created before it
++	void ConfigEcnStream(uint32_t port, uint64_t stream);
++	RngStream *ecn_rng[pCnt];
+ 	void ConfigHdrm(uint32_t port, uint32_t size);
+ 	void ConfigNPort(uint32_t n_port);
+ 	void ConfigBufferSize(uint32_t size);

@@ -1,0 +1,26 @@
+diff --git a/astra-sim-alibabacloud/astra-sim/system/Sys.cc b/astra-sim-alibabacloud/astra-sim/system/Sys.cc
+index fc94627..4ad5051 100644
+--- a/astra-sim-alibabacloud/astra-sim/system/Sys.cc
++++ b/astra-sim-alibabacloud/astra-sim/system/Sys.cc
+@@ -296,7 +296,7 @@ Sys::Sys(
+         "Unable to initialize the workload layer because it can not open the workload file");
+     return;
+   }
+-  #if defined(NS3_MTP) || defined(NS3_MPI) || defined(PHY_MTP)
++  #if 1 // TwiNS patch: the sequential ns-3 build needs the NCCL mock too (was: NS3_MTP || NS3_MPI || PHY_MTP)
+   result = mock_nccl_grobal_group_init();
+   if(result == false) {
+     sys_panic(
+diff --git a/astra-sim-alibabacloud/astra-sim/workload/Workload.cc b/astra-sim-alibabacloud/astra-sim/workload/Workload.cc
+index 3de336b..901a333 100755
+--- a/astra-sim-alibabacloud/astra-sim/workload/Workload.cc
++++ b/astra-sim-alibabacloud/astra-sim/workload/Workload.cc
+@@ -81,7 +81,7 @@ void Workload::initialize_stat_files() {
+   #ifdef NS3_MPI
+   detailed->initialize_csv(SIZE * total_rows + 20, 50);
+   #endif
+-  #ifdef NS3_MTP 
++  #ifndef NS3_MPI // TwiNS patch: the sequential ns-3 build writes these too (was: NS3_MTP)
+   detailed->initialize_csv(SIZE * total_rows + 20, 50);
+   #endif
+   end_to_end->initialize_csv(SIZE * total_rows + 20, 50);
