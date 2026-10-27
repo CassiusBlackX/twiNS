@@ -415,6 +415,9 @@ struct HCtx
 {
     const Sim *s;
     int h;
+    bool pre_ok;     // the running ACK's HPCC U and dt were computed ahead
+    double pre_U;
+    uint64_t pre_dt;
     Host st;
     int64_t now, slot;
     Chain cur; // the running event's chain
@@ -565,7 +568,33 @@ __device__ __forceinline__ void change_rate(HCtx &c, SndQP &q, uint64_t new_rate
     q.rate = new_rate;
 }
 
-// RdmaHw::UpdateRateHp, one rate for the path (MULTI_RATE 0)
+// UpdateRateHp's loop over the hops without SAMPLE_FEEDBACK: the largest utilization U (the first
+// of equal ones) and its tau, from an ACK's INT hops ph and those the QP last stored, qh
+__device__ __forceinline__ void hpcc_hops(const Params &P, const uint64_t *ph, int nhop, const uint64_t *qh, uint64_t max_rate, uint32_t win,
+                                          double *Uo, uint64_t *dto)
+{
+    double U = 0;
+    uint64_t dt = 0;
+    for (int i = 0; i < nhop; i++)
+    {
+        uint64_t tau = hop_time_delta(ph[i], qh[i]);
+        double duration = (double)tau * 1e-9;
+        double tx_rate = (double)(hop_bytes_delta(ph[i], qh[i], P.int_multi) * 8) / duration;
+        uint32_t qa = hop_qlen(ph[i]) * 80 * P.int_multi, qb = hop_qlen(qh[i]) * 80 * P.int_multi;
+        double lr = (double)hop_rate(ph[i]);
+        double u = tx_rate / lr + (double)(qa < qb ? qa : qb) * (double)max_rate / lr / (double)win;
+        if (u > U)
+        {
+            U = u;
+            dt = tau;
+        }
+    }
+    *Uo = U;
+    *dto = dt;
+}
+
+// RdmaHw::UpdateRateHp, one rate for the path (MULTI_RATE 0). pre: U and dt computed ahead
+// (hpcc_hops, in the host's prologue)
 __device__ __forceinline__ void hpcc_update(HCtx &c, SndQP &q, const Pkt &p, bool fast)
 {
     const Params &P = c.s->P;
@@ -582,7 +611,16 @@ __device__ __forceinline__ void hpcc_update(HCtx &c, SndQP &q, const Pkt &p, boo
         double U = 0;
         uint64_t dt = 0;
         bool any = false;
-        for (int i = 0; i < p.nhop; i++)
+        if (c.pre_ok)
+        {
+            U = c.pre_U;
+            dt = c.pre_dt;
+            any = p.nhop > 0;
+            for (int i = 0; i < p.nhop; i++)
+                q.hop[i] = p.hop[i];
+        }
+        else
+            for (int i = 0; i < p.nhop; i++)
         {
             if (P.sample_feedback && hop_qlen(p.hop[i]) == 0 && fast)
                 continue;
@@ -837,9 +875,77 @@ __device__ __forceinline__ int64_t due_now(const Sim &s, const Due &d)
     return d.kind == 0 ? q.t_alpha : d.kind == 1 ? q.t_dec : q.t_rp;
 }
 
-__device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake)
+// a host's arrival of the slot in LDS: its frame (the index in s.msg for its chain), its arrival's
+// code, and for an HPCC ACK the U and dt of UpdateRateHp computed ahead
+struct HArr
+{
+    int64_t ts;
+    Pkt p;
+    uint32_t acode, frame;
+    double U;
+    uint64_t dt;
+    int pre;
+};
+constexpr int HPOOL = 64;
+
+// A host's slot, run by the lanes of one wave: they load the slot's arrivals into LDS and compute
+// HPCC's per-hop utilizations of its ACKs (with FAST_REACT and without SAMPLE_FEEDBACK an ACK's
+// depend only on it and on the hops of the QP's previous ACK, so they need not wait for the
+// events); lane 0 then runs the events.
+__device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints)
 {
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
+    const int link_in = s.in_link[(size_t)h * s.K];
+    if (lane == 0)
+    {
+        // the arrivals: at most the last frame of slot s - 2, the frames of slot s - 1 but perhaps the last
+        int an2 = slot >= 2 ? msg_count(s, slot - 2, link_in) : 0, an1 = slot >= 1 ? msg_count(s, slot - 1, link_in) : 0;
+        const LFrame *a2 = s.msg + mi(s, slot - 2, link_in) * MAXF, *a1 = s.msg + mi(s, slot - 1, link_in) * MAXF;
+        int f2 = an2, n1 = an1;
+        while (f2 > 0 && a2[f2 - 1].ts >= t0)
+            f2--;
+        while (n1 > 0 && a1[n1 - 1].ts >= t1)
+            n1--;
+        hints[0] = an2 - f2 + n1;
+        hints[1] = f2;
+        hints[2] = an2;
+    }
+    __syncthreads();
+    const int total = hints[0], f2 = hints[1], an2 = hints[2];
+    const bool pooled = total <= HPOOL;
+    if (pooled)
+        for (int j = lane; j < total; j += lanes)
+        {
+            int n2 = an2 - f2;
+            uint32_t fi = j < n2 ? (uint32_t)(mi(s, slot - 2, link_in) * MAXF + f2 + j) : (uint32_t)(mi(s, slot - 1, link_in) * MAXF + (j - n2));
+            const LFrame &f = s.msg[fi];
+            HArr &a = pool[j];
+            a.ts = f.ts;
+            a.p = f.p;
+            a.acode = arrival_code(s, f);
+            a.frame = fi;
+            a.pre = 0;
+        }
+    __syncthreads();
+    // (with FAST_REACT every ACK of a QP calls UpdateRateHp, which stores its hops; without it,
+    // only those that end an RTT do)
+    if (pooled && s.P.cc == 3 && s.P.fast_react && !s.P.sample_feedback)
+        for (int j = lane; j < total; j += lanes)
+        {
+            HArr &a = pool[j];
+            if ((a.p.kind != K_ACK && a.p.kind != K_NACK) || a.p.nhop > MAX_HOP)
+                continue;
+            // the hops the QP will hold: the previous ACK's of this slot, or the stored ones
+            int k = j - 1;
+            while (k >= 0 && !(pool[k].p.flow == a.p.flow && (pool[k].p.kind == K_ACK || pool[k].p.kind == K_NACK)))
+                k--;
+            const SndQP &q = s.qp[a.p.flow];
+            hpcc_hops(s.P, a.p.hop, a.p.nhop, k >= 0 ? pool[k].p.hop : q.hop, q.max_rate, q.win, &a.U, &a.dt);
+            a.pre = 1;
+        }
+    __syncthreads();
+    if (lane != 0)
+        return false;
     HCtx c;
     c.s = &s;
     c.h = h;
@@ -848,8 +954,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     c.link = s.out_link[(size_t)h * s.K];
     c.out = s.msg + mi(s, slot, c.link) * MAXF;
     c.nout = 0;
+    c.pre_ok = false;
     Arrivals in;
-    in.init(s, s.in_link[(size_t)h * s.K], slot, t0);
+    in.init(s, link_in, slot, t0);
+    int ai = 0; // the next pooled arrival
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
     Due due[MAX_DUE];
     int nd = 0;
@@ -886,9 +994,20 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         // candidates: 0 arrival, 1 TransmitComplete, 2 m_nextSend, 3 a DCQCN timer, 4 a flow start
         if (!af)
         {
-            af = in.peek(t1);
-            if (af)
-                acode = arrival_code(s, *af);
+            if (pooled)
+            {
+                if (ai < total)
+                {
+                    af = &s.msg[pool[ai].frame];
+                    acode = pool[ai].acode;
+                }
+            }
+            else
+            {
+                af = in.peek(t1);
+                if (af)
+                    acode = arrival_code(s, *af);
+            }
         }
         while (di < nd && due_now(s, due[di]) != due[di].at)
             di++; // cancelled or moved
@@ -922,12 +1041,23 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         if (best == 0)
         {
             Pkt p = af->p;
-            in.pop();
+            if (pooled)
+            {
+                c.pre_ok = pool[ai].pre;
+                c.pre_U = pool[ai].U;
+                c.pre_dt = pool[ai].dt;
+                ai++;
+            }
+            else
+                in.pop();
             af = nullptr;
             if (p.kind == K_DATA)
                 h_data(c, p);
             else if (p.kind == K_ACK || p.kind == K_NACK)
+            {
                 h_ack(c, p);
+                c.pre_ok = false;
+            }
             else if (s.P.qbb)
             {
                 if (p.kind == K_PAUSE)
@@ -1015,10 +1145,10 @@ struct ArrLds
     Run ap[PRE];
     uint32_t acode;
     uint32_t frame; // index in s.msg
-    int16_t out;    // the egress port (-1: a PFC frame)
-    uint8_t q, pad;
+    int16_t out;    // the egress port (-1: a PFC frame, or no route)
+    uint8_t q, in;  // its queue; the ingress port
 };
-constexpr int POOL = 96; // arrivals per switch and slot in the pool
+constexpr int POOL = 256; // arrivals per switch and slot in the pool
 
 struct SCtx
 {
@@ -1034,6 +1164,9 @@ struct SCtx
     uint32_t cur_code;
     bool cur_ok;
     int ord;
+    // a safe slot (see switch_step): each lane runs one egress port's events; the MMU's ingress
+    // counters are summed with LDS atomics, and shared_used is recomputed at the end
+    bool safe;
 };
 
 __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
@@ -1184,8 +1317,15 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     const Sim &s = *c.s;
     const Params &P = s.P;
     Port &pt = c.w[port].pt;
+    Port &in = c.w[p.inport].pt;
+    if (c.safe)
     {
-        Port &in = c.w[p.inport].pt;
+        // no headroom anywhere, no port paused: RemoveFromIngressAdmission takes it from ing
+        atomicSub(&in.ing, (uint32_t)p.size);
+        pt.egr -= p.size;
+    }
+    else
+    {
         // RemoveFromIngressAdmission, RemoveFromEgressAdmission
         uint32_t from_hdrm = in.hdrm < p.size ? in.hdrm : p.size;
         uint32_t sh = in.ing > RESERVE ? in.ing - RESERVE : 0;
@@ -1199,32 +1339,32 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
             printf("mmu %lld node %d in %d out %d deq %u ing %u hdrm %u shared %u thresh %u pkt %d>%d %u q3n %d\n", (long long)c.now, c.node, p.inport + 1,
                    port + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c), p.src, p.dst, p.seq, pt.q3_n);
 #endif
-        if (P.ecn)
+    }
+    if (P.ecn)
+    {
+        // SwitchMmu::ShouldSendCN
+        bool mark = false;
+        if (pt.egr > P.kmax)
+            mark = true;
+        else if (pt.egr > P.kmin)
         {
-            // SwitchMmu::ShouldSendCN
-            bool mark = false;
-            if (pt.egr > P.kmax)
-                mark = true;
-            else if (pt.egr > P.kmin)
-            {
-                double pr = P.pmax * (double)(pt.egr - P.kmin) / (double)(P.kmax - P.kmin);
-                mark = nsm_rng::rand_u01(pt.rng) < pr;
-            }
-            if (mark)
-            {
-                p.ecn = 3;
-                atomicAdd(&s.ev[1], 1ull);
-            }
+            double pr = P.pmax * (double)(pt.egr - P.kmin) / (double)(P.kmax - P.kmin);
+            mark = nsm_rng::rand_u01(pt.rng) < pr;
         }
-        // CheckAndSendResume
-        if (in.mmu_paused)
+        if (mark)
         {
-            uint32_t su = shared_used(in);
-            if (in.hdrm == 0 && (su == 0 || su + RESUME_OFFSET <= pfc_thresh(c)))
-            {
-                s_send_pfc(c, p.inport, 1);
-                in.mmu_paused = 0;
-            }
+            p.ecn = 3;
+            atomicAdd(&s.ev[1], 1ull);
+        }
+    }
+    // CheckAndSendResume (never in a safe slot: no port is paused)
+    if (!c.safe && in.mmu_paused)
+    {
+        uint32_t su = shared_used(in);
+        if (in.hdrm == 0 && (su == 0 || su + RESUME_OFFSET <= pfc_thresh(c)))
+        {
+            s_send_pfc(c, p.inport, 1);
+            in.mmu_paused = 0;
         }
     }
     if (p.kind == K_DATA && P.cc == 3 && p.nhop < 0xFFFF)
@@ -1256,7 +1396,14 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     const Sim &s = *c.s;
     if (out < 0)
         return;
-    if (q != 0)
+    if (q != 0 && c.safe)
+    {
+        // below every threshold for the whole slot: no drop, no headroom, no PAUSE; only ing
+        // changes (shared_used follows from it at the end of the slot)
+        atomicAdd(&c.w[inport].pt.ing, (uint32_t)p.size);
+        c.w[out].pt.egr += p.size;
+    }
+    else if (q != 0)
     {
         Port &in = c.w[inport].pt;
         uint32_t th = pfc_thresh(c);
@@ -1342,9 +1489,18 @@ __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPort
     return c.pool ? c.s->msg[c.pool[w.ai].frame].c : sw_frame(*c.s, w, c.slot).c;
 }
 
-// A switch's slot, run by the lanes of one wave: they load its ports, this slot's arrivals (into
-// the pool, with their routes) and the heads of its queues into LDS together; lane 0 then runs
-// the events; they store the ports back together.
+// A switch's slot, run by the lanes of one wave. They load its ports, this slot's arrivals (into
+// the pool, with their routes) and the heads of its queues into LDS together. Then:
+//  - in a safe slot, each lane runs one egress port's events: the arrivals routed to it (or PFC
+//    frames arriving at it) and its TransmitCompletes, in their order. A slot is safe when no port
+//    is paused by the MMU, none has headroom bytes, and every port stays below the lowest PFC
+//    threshold the slot can reach even if all of its arrivals stay: then no MMU decision
+//    (drop, headroom, PAUSE, RESUME) can occur, ports interact only through the sums in their
+//    ingress counters, and shared_used = sum max(0, ing - reserve) follows at the end;
+//  - otherwise lane 0 runs all events in order.
+// Last, the lanes store the ports back together.
+constexpr int SAFE_LANES = 32; // safe slots need a lane per port
+constexpr int SW_INTS = 6 * KMAX + 2 * POOL + SAFE_LANES * SAFE_LANES; // the int workspace of a switch
 __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int lane, int lanes,
                                             int *shared_int)
 {
@@ -1355,10 +1511,19 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     // arrives within one transmission of the link's delay), and the frames of slot s - 1 but
     // perhaps the last
     int *cnt = shared_int, *first = shared_int + KMAX; // per port: arrivals, the first in slot s - 2's list
+    uint32_t *abytes = (uint32_t *)(shared_int + 2 * KMAX); // bytes arriving for queue PG
+    uint32_t *ing0 = (uint32_t *)(shared_int + 3 * KMAX);   // ing at the slot's start
+    int *ocnt = shared_int + 4 * KMAX, *obase = shared_int + 5 * KMAX; // safe: arrivals per egress port
+    int *olist = shared_int + 6 * KMAX;                     // safe: pool indices by egress port, in order
+    int *mcur = olist + POOL;                                // safe: merge cursors [egress][ingress]
+    int *onext = mcur + SAFE_LANES * SAFE_LANES;             // safe: the next arrival of its ingress with the same egress
     for (int p = lane; p < deg; p += lanes)
     {
         SwPortLds &q = w[p];
         q.pt = gp[p];
+        abytes[p] = 0;
+        ocnt[p] = 0;
+        ing0[p] = q.pt.ing;
         q.link_in = s.in_link[(size_t)node * s.K + p];
         q.an2 = slot >= 2 ? msg_count(s, slot - 2, q.link_in) : 0;
         q.an1 = slot >= 1 ? msg_count(s, slot - 1, q.link_in) : 0;
@@ -1411,10 +1576,174 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             int q = 0;
             a.out = (int16_t)(f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? -1 : s_route(s, x, f.p, &q));
             a.q = (uint8_t)q;
+            a.in = (uint8_t)p;
+            if (a.out >= 0 && q != 0)
+                atomicAdd(&abytes[p], (uint32_t)f.p.size);
+            // its egress port in a safe slot: the route's, or its own port for a PFC frame (a
+            // frame without a route belongs to none)
+            int own = a.out >= 0 ? a.out : (f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? p : -1);
+            if (own >= 0)
+                atomicAdd(&ocnt[own], 1);
         }
     __syncthreads();
+    // is the slot safe? (every lane decides alike)
+    bool safe = pooled && deg <= lanes && deg <= SAFE_LANES && !s.serial;
+    if (safe)
+    {
+        const Switch &sw = s.sw[x];
+        int64_t amax = sw.shared_used;
+        for (int p = 0; p < deg; p++)
+        {
+            amax += abytes[p];
+            if (w[p].pt.hdrm || w[p].pt.mmu_paused)
+                safe = false;
+        }
+        int64_t room = (int64_t)s.P.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
+        int64_t th_min = room > 0 ? room >> s.P.pfc_shift : -1;
+        for (int p = 0; p < deg && safe; p++)
+        {
+            int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
+            if ((su > 0 ? su : 0) >= th_min)
+                safe = false;
+        }
+    }
     bool act = false;
-    if (lane == 0)
+    if (safe)
+    {
+        // each egress port's arrivals (counted above), merged from the ingress ports in order: lane
+        // p links its port's arrivals to the next one with the same egress, then lane o merges
+        auto owner = [&](const ArrLds &a) { return a.out >= 0 ? (int)a.out : (a.p.kind == K_PAUSE || a.p.kind == K_RESUME ? (int)a.in : -1); };
+        if (lane < deg)
+        {
+            int p = lane, b = 0;
+            for (int q = 0; q < p; q++)
+                b += cnt[q];
+            for (int o = 0; o < deg; o++)
+                mcur[o * SAFE_LANES + p] = -1;
+            for (int k = b + cnt[p] - 1; k >= b; k--)
+            {
+                int o = owner(pool[k]);
+                if (o < 0)
+                    continue;
+                onext[k] = mcur[o * SAFE_LANES + p];
+                mcur[o * SAFE_LANES + p] = k;
+            }
+        }
+        __syncthreads();
+        if (lane < deg)
+        {
+            int o = lane, base = 0;
+            for (int p = 0; p < o; p++)
+                base += ocnt[p];
+            obase[o] = base;
+            int *cur = mcur + o * SAFE_LANES;
+            for (int n = 0; n < ocnt[o]; n++)
+            {
+                int bp = -1;
+                for (int p = 0; p < deg; p++)
+                {
+                    int k = cur[p];
+                    if (k < 0)
+                        continue;
+                    if (bp < 0)
+                    {
+                        bp = p;
+                        continue;
+                    }
+                    const ArrLds &A = pool[k], &B = pool[cur[bp]];
+                    if (A.ts != B.ts ? A.ts < B.ts : ({
+                            int r = pcmp(A.ap, B.ap);
+                            r ? r < 0 : before(s, A.ts, A.acode, s.msg[A.frame].c, B.ts, B.acode, s.msg[B.frame].c);
+                        }))
+                        bp = p;
+                }
+                olist[base + n] = cur[bp];
+                cur[bp] = onext[cur[bp]];
+            }
+        }
+        if (lane < deg)
+        {
+            const int o = lane;
+            SCtx c;
+            c.s = &s;
+            c.x = x;
+            c.node = node;
+            c.sw = s.sw[x];
+            c.slot = slot;
+            c.w = w;
+            c.pool = pool;
+            c.safe = true;
+            int oi = obase[o], oe = obase[o] + ocnt[o];
+            SwPortLds &me = w[o];
+            for (;;)
+            {
+                int64_t ta = oi < oe ? pool[olist[oi]].ts : INT64_MAX, tc = me.pt.tc_at;
+                bool htc = tc >= 0 && tc < t1;
+                if (ta == INT64_MAX && !htc)
+                    break;
+                bool arr;
+                if (!htc || ta == INT64_MAX)
+                    arr = !htc;
+                else if (ta != tc)
+                    arr = ta < tc;
+                else
+                {
+                    const ArrLds &a = pool[olist[oi]];
+                    int r = pcmp(a.ap, me.tp);
+                    arr = r ? r < 0 : before(s, ta, a.acode, s.msg[a.frame].c, tc, 0, me.tc);
+                }
+                c.ord = 0;
+                c.cur_ok = false;
+                if (!arr)
+                {
+                    c.now = tc;
+                    c.cur_src = &me.tc;
+                    c.cur_code = 0;
+                    trace_event(c.node, c.now, "tc", o, sc_cur(c));
+                    me.pt.tc_at = -1;
+                    s_dequeue(c, o);
+                    continue;
+                }
+                const ArrLds &a = pool[olist[oi++]];
+                c.now = ta;
+                c.cur_src = &s.msg[a.frame].c;
+                c.cur_code = a.acode;
+                trace_event(c.node, c.now, "arrival", a.in, sc_cur(c));
+                Pkt pk = a.p;
+                if (pk.kind == K_PAUSE || pk.kind == K_RESUME)
+                {
+                    if (s.P.qbb)
+                    {
+                        if (pk.kind == K_PAUSE)
+                            me.pt.paused |= 1u << pk.q;
+                        else
+                        {
+                            me.pt.paused &= ~(1u << pk.q);
+                            s_dequeue(c, o);
+                        }
+                    }
+                }
+                else
+                    s_forward(c, a.in, pk, a.out, a.q);
+            }
+        }
+        __syncthreads();
+        if (lane == 0)
+        {
+            // shared_used = sum over ports of max(0, ing - reserve), which changed with ing only
+            Switch sw = s.sw[x];
+            for (int p = 0; p < deg; p++)
+            {
+                uint32_t a = ing0[p] > RESERVE ? ing0[p] - RESERVE : 0, b = w[p].pt.ing > RESERVE ? w[p].pt.ing - RESERVE : 0;
+                sw.shared_used += b - a;
+            }
+            s.sw[x] = sw;
+#ifdef RDMA_PROF
+            atomicAdd(&s.ev[31], 1ull);
+#endif
+        }
+    }
+    else if (lane == 0)
     {
         SCtx c;
         c.s = &s;
@@ -1424,6 +1753,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.slot = slot;
         c.w = w;
         c.pool = pooled ? pool : nullptr;
+        c.safe = false;
         int base = 0;
         for (int p = 0; p < deg; p++)
         {
@@ -1590,43 +1920,38 @@ __global__ void rdma_slot(Sim s)
         blk_wake = ~0ull;
     }
     __syncthreads();
-    // one entity per `spread` lanes, on the first of them: entities that share a wave diverge, and
-    // the wave would run their events one after another
-    int local = threadIdx.x / s.spread, per_block = blockDim.x / s.spread;
-    bool lead = threadIdx.x % s.spread == 0;
-    int id = blockIdx.x * per_block + local;
+    // one host or switch per block (one wave): its lanes load its slot's inputs together, then
+    // the first lane runs its events (entities sharing a wave would diverge and run in turn)
+    extern __shared__ __align__(16) char smem[];
+    int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
 #endif
-    if (blockIdx.x < s.host_blocks)
+    if (blockIdx.x < s.H)
     {
-        if (lead && id < s.H)
-        {
-            int64_t w = INT64_MAX;
-            if (host_step(s, id, slot, &w))
-                blk_act = 1;
-            if (w != INT64_MAX)
-                atomicMin(&blk_wake, (unsigned long long)w);
-        }
+        int h = blockIdx.x;
+        int64_t w = INT64_MAX;
+        HArr *pool = reinterpret_cast<HArr *>(smem);
+        int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
+        if (host_step(s, h, slot, &w, lane, lanes, pool, hints))
+            blk_act = 1;
+        if (lane == 0 && w != INT64_MAX)
+            atomicMin(&blk_wake, (unsigned long long)w);
     }
     else
     {
-        // a switch's workspace: its ports, its arrival pool, two arrays of KMAX ints
-        extern __shared__ __align__(16) char smem[];
-        int x = id - s.host_blocks * per_block;
-        size_t per = (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds) + 2 * KMAX * sizeof(int);
-        char *mine = smem + (size_t)local * per;
-        SwPortLds *w = reinterpret_cast<SwPortLds *>(mine);
-        ArrLds *pool = reinterpret_cast<ArrLds *>(mine + (size_t)s.K * sizeof(SwPortLds));
-        int *ints = reinterpret_cast<int *>(mine + (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds));
-        // every lane of the block reaches the barriers in switch_step (a block holds switches only)
-        if (switch_step(s, x < s.S ? x : s.S - 1, slot, w, pool, threadIdx.x % s.spread, s.spread, ints) && x < s.S)
+        // a switch's workspace: its ports, its arrival pool, its ints
+        int x = blockIdx.x - s.H;
+        SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
+        ArrLds *pool = reinterpret_cast<ArrLds *>(smem + (size_t)s.K * sizeof(SwPortLds));
+        int *ints = reinterpret_cast<int *>(smem + (size_t)s.K * sizeof(SwPortLds) + POOL * sizeof(ArrLds));
+        if (switch_step(s, x, slot, w, pool, lane, lanes, ints))
             blk_act = 1;
     }
 #ifdef RDMA_PROF
     // per slot: the slowest host and switch thread (cycles, ev[16], ev[17]), summed over slots in
     // ev[18], ev[19]
-    atomicMax(&s.ev[blockIdx.x < s.host_blocks ? 16 : 17], (unsigned long long)(clock64() - p0));
+    atomicMax(&s.ev[blockIdx.x < s.H ? 16 : 17], (unsigned long long)(clock64() - p0));
 #endif
     __syncthreads();
     if (threadIdx.x == 0)

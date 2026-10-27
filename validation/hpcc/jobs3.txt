@@ -1,0 +1,10 @@
+# slots switching between safe (ports in parallel) and serial (PFC near) within a run
+k8_a2a50s_b1_cc1 fattree8.txt k8_a2a50s.csv CC_MODE=1 BUFFER_SIZE=1
+k8_a2a50s_b1_cc3 fattree8.txt k8_a2a50s.csv CC_MODE=3 BUFFER_SIZE=1
+k8_perm_b1_cc1 fattree8.txt k8_perm.csv CC_MODE=1 BUFFER_SIZE=1
+k8_perm_b1_cc3 fattree8.txt k8_perm.csv CC_MODE=3 BUFFER_SIZE=1
+ls_a2a50s_b2_cc3 ls16x8.topo ls_a2a50s.csv CC_MODE=3 BUFFER_SIZE=2
+k16_a2a50s_b2_cc1 ft16.topo k16_a2a50s.csv CC_MODE=1 BUFFER_SIZE=2
+# HPCC's serial paths
+k8_perm_sfb_cc3 fattree8.txt k8_perm.csv CC_MODE=3 SAMPLE_FEEDBACK=1
+k8_perm_sfb_nofast_cc3 fattree8.txt k8_perm.csv CC_MODE=3 SAMPLE_FEEDBACK=1 FAST_REACT=0

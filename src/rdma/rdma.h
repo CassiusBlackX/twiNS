@@ -261,6 +261,7 @@ struct Sim
     int *finished;
     int64_t max_slots;
     int host_blocks, spread; // spread: lanes per entity (see rdma_slot)
+    int serial;              // switches run every slot's events on one lane (no safe slots)
     int64_t *fct;       // [F] completion time - start (ns), -1: not yet
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;

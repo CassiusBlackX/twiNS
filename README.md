@@ -254,16 +254,23 @@ variable created before it. `validation/hpcc/README.md` covers:
   link rates.
 
 **How it differs from the TCP model.**
-- **Switches.** A switch's MMU couples its ports: each PFC threshold depends on the
-  switch-wide shared buffer. So one wave runs a whole switch.
-  - Its lanes first load the slot's arriving frames (with their routes) and the heads of its
-    queues into LDS together.
-  - Lane 0 then runs the events in order.
+- **Switches.** A switch's MMU couples its ports, since every PFC threshold depends on the
+  switch-wide shared buffer. Each switch therefore runs in a wave of its own. Its lanes first load
+  the slot's arriving frames (with their routes) and the heads of its queues into LDS together.
+  - **Safe slots** are the common case: no port is MMU-paused, none has headroom bytes, and every
+    port stays below the lowest threshold the slot can reach even if all its arrivals stay. Then
+    no MMU decision can occur. Each lane runs one egress port's events: the arrivals routed to it
+    and its TransmitCompletes, in their order. Ingress counters are summed with LDS atomics, and
+    shared_used follows at the end from `Σ max(0, ing − reserve)`.
+  - **Otherwise** (PFC near) one lane runs all the switch's events in order.
+- **Hosts.** A host's lanes load the slot's arrivals and compute HPCC's per-hop utilizations of
+  its ACKs ahead. With fast react on, an ACK's utilizations depend only on that ACK and on the
+  QP's previous ACK, which leaves one lane five divisions per ACK instead of about 25.
 - **Chains.**
-  - Chains compare leads before ordinals. Ordinals order only the events one parent
-    schedules, and comparing them across parents was wrong.
-  - Chains are not truncated. Past 12 runs, the older runs spill into a shared ring of
-    immutable nodes, which a comparison follows when the recent runs tie. The 39 runs have no
+  - Chains compare leads before ordinals. Ordinals order only the events one parent schedules,
+    and comparing them across parents was wrong.
+  - Chains are not truncated. Past 12 runs, the older runs spill into a shared ring of immutable
+    nodes, which a comparison follows when the recent runs tie. The validation runs have no
     undecided ties.
 
 | run | flows | reference | twins-rdma | speedup |

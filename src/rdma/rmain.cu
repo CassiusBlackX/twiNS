@@ -2,7 +2,7 @@
 // parameters of an HPCC config file, like validation/hpcc/rdma-ref.cc:
 //
 //   twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns]
-//              [--rate=100Gbps --delay=1000] [--q3cap=N] [--tail=log2] [KEY=VALUE ...]
+//              [--rate=100Gbps --delay=1000] [--q3cap=N] [--tail=log2] [--serial] [KEY=VALUE ...]
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
 // overwritten tail are reported as "on lost tails"
@@ -109,7 +109,7 @@ int main(int argc, char **argv)
     }
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps";
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 8192, tail_log2 = 24, spread = 32;
+    int q3cap = 8192, tail_log2 = 24, spread = 32, serial = 0;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -137,6 +137,8 @@ int main(int argc, char **argv)
             tail_log2 = atoi(v.c_str());
         else if (k == "--spread")
             spread = atoi(v.c_str());
+        else if (k == "--serial")
+            serial = 1;
         else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
         {
             // KEY=VALUE, or KEY=V1,V2,... for a key with several values (KMAX_MAP=1,100000000000,800)
@@ -550,21 +552,20 @@ int main(int argc, char **argv)
             txt[b] = (int32_t)tx_ns(P.bps, b);
         CK(hipMemcpyToSymbol(HIP_SYMBOL(c_txt), txt.data(), sizeof(int32_t) * TXT_N));
     }
-    // one thread per host or switch, each in a wave of its own; a switch thread keeps its ports in LDS
+    // a block (one wave) per host and per switch; a switch keeps its ports in LDS
     s.spread = spread;
-    size_t per_sw = (size_t)K * sizeof(SwPortLds) + POOL * sizeof(ArrLds) + 2 * KMAX * sizeof(int);
-    int EPB = 4; // entities per block
-    while (EPB > 1 && (size_t)EPB * per_sw > 60 * 1024)
-        EPB /= 2;
+    s.serial = serial || spread < SAFE_LANES;
+    size_t per_sw = (size_t)K * sizeof(SwPortLds) + POOL * sizeof(ArrLds) + SW_INTS * sizeof(int);
+    size_t per_h = HPOOL * sizeof(HArr) + 4 * sizeof(int);
     if (per_sw > 64 * 1024)
     {
         fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw, K);
         return 1;
     }
-    int BS = EPB * spread;
-    s.host_blocks = (H + EPB - 1) / EPB;
-    int blocks = s.host_blocks + (S + EPB - 1) / EPB;
-    size_t lds = (size_t)EPB * per_sw;
+    int BS = spread;
+    s.host_blocks = H;
+    int blocks = H + S;
+    size_t lds = std::max(per_sw, per_h);
     if (lds > 48 * 1024)
         CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
 
@@ -626,7 +627,7 @@ int main(int argc, char **argv)
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);
     printf("prof: switch cycles per event: select %.0f, arrival chain %.0f, tc events %.0f, arrival handling %.0f\n", (double)ev[24] / ev[20],
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
-    printf("prof: switch ties %llu, undecided by the prefixes %llu\n", ev[28], ev[29]);
+    printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
 #endif
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12];
     if (bad)
