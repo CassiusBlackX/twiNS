@@ -1,0 +1,245 @@
+diff --git a/src/internet/model/ipv4-global-routing.cc b/src/internet/model/ipv4-global-routing.cc
+index 9964024..961e699 100644
+--- a/src/internet/model/ipv4-global-routing.cc
++++ b/src/internet/model/ipv4-global-routing.cc
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ //
+ // Copyright (c) 2008 University of Washington
+ //
+@@ -78,7 +79,8 @@ Ipv4GlobalRouting::AddHostRouteTo(Ipv4Address dest, Ipv4Address nextHop, uint32_
+     NS_LOG_FUNCTION(this << dest << nextHop << interface);
+     auto route = new Ipv4RoutingTableEntry();
+     *route = Ipv4RoutingTableEntry::CreateHostRouteTo(dest, nextHop, interface);
+-    for (auto routePointer : m_hostRoutes)
++    auto& bucket = m_hostIndex[dest.Get()];
++    for (auto routePointer : bucket)
+     {
+         if (*routePointer == *route)
+         {
+@@ -88,6 +90,7 @@ Ipv4GlobalRouting::AddHostRouteTo(Ipv4Address dest, Ipv4Address nextHop, uint32_
+         }
+     }
+     m_hostRoutes.push_back(route);
++    bucket.push_back(route);
+ }
+ 
+ void
+@@ -96,7 +99,8 @@ Ipv4GlobalRouting::AddHostRouteTo(Ipv4Address dest, uint32_t interface)
+     NS_LOG_FUNCTION(this << dest << interface);
+     auto route = new Ipv4RoutingTableEntry();
+     *route = Ipv4RoutingTableEntry::CreateHostRouteTo(dest, interface);
+-    for (auto routePointer : m_hostRoutes)
++    auto& bucket = m_hostIndex[dest.Get()];
++    for (auto routePointer : bucket)
+     {
+         if (*routePointer == *route)
+         {
+@@ -106,6 +110,7 @@ Ipv4GlobalRouting::AddHostRouteTo(Ipv4Address dest, uint32_t interface)
+         }
+     }
+     m_hostRoutes.push_back(route);
++    bucket.push_back(route);
+ }
+ 
+ void
+@@ -117,7 +122,8 @@ Ipv4GlobalRouting::AddNetworkRouteTo(Ipv4Address network,
+     NS_LOG_FUNCTION(this << network << networkMask << nextHop << interface);
+     auto route = new Ipv4RoutingTableEntry();
+     *route = Ipv4RoutingTableEntry::CreateNetworkRouteTo(network, networkMask, nextHop, interface);
+-    for (auto routePointer : m_networkRoutes)
++    auto& bucket = m_netIndex[networkMask.GetPrefixLength()][route->GetDestNetwork().CombineMask(networkMask).Get()];
++    for (auto routePointer : bucket)
+     {
+         if (*routePointer == *route)
+         {
+@@ -127,6 +133,7 @@ Ipv4GlobalRouting::AddNetworkRouteTo(Ipv4Address network,
+         }
+     }
+     m_networkRoutes.push_back(route);
++    bucket.push_back(route);
+ }
+ 
+ void
+@@ -135,7 +142,8 @@ Ipv4GlobalRouting::AddNetworkRouteTo(Ipv4Address network, Ipv4Mask networkMask,
+     NS_LOG_FUNCTION(this << network << networkMask << interface);
+     auto route = new Ipv4RoutingTableEntry();
+     *route = Ipv4RoutingTableEntry::CreateNetworkRouteTo(network, networkMask, interface);
+-    for (auto routePointer : m_networkRoutes)
++    auto& bucket = m_netIndex[networkMask.GetPrefixLength()][route->GetDestNetwork().CombineMask(networkMask).Get()];
++    for (auto routePointer : bucket)
+     {
+         if (*routePointer == *route)
+         {
+@@ -145,6 +153,7 @@ Ipv4GlobalRouting::AddNetworkRouteTo(Ipv4Address network, Ipv4Mask networkMask,
+         }
+     }
+     m_networkRoutes.push_back(route);
++    bucket.push_back(route);
+ }
+ 
+ void
+@@ -179,61 +188,40 @@ Ipv4GlobalRouting::LookupGlobal(Ipv4Address dest, uint32_t flowHash, Ptr<NetDevi
+     RouteVec_t allRoutes;
+ 
+     NS_LOG_LOGIC("Number of m_hostRoutes = " << m_hostRoutes.size());
+-    for (auto i = m_hostRoutes.begin(); i != m_hostRoutes.end(); i++)
++    if (auto hi = m_hostIndex.find(dest.Get()); hi != m_hostIndex.end())
+     {
+-        NS_ASSERT((*i)->IsHost());
+-        if ((*i)->GetDest() == dest)
++        for (auto route : hi->second)
+         {
+-            if (oif)
++            NS_ASSERT(route->IsHost());
++            if (oif && oif != m_ipv4->GetNetDevice(route->GetInterface()))
+             {
+-                if (oif != m_ipv4->GetNetDevice((*i)->GetInterface()))
+-                {
+-                    NS_LOG_LOGIC("Not on requested interface, skipping");
+-                    continue;
+-                }
++                continue;
+             }
+-            allRoutes.push_back(*i);
+-            NS_LOG_LOGIC(allRoutes.size() << "Found global host route" << *i);
++            allRoutes.push_back(route);
+         }
+     }
+     if (allRoutes.empty()) // if no host route is found
+     {
+-        NS_LOG_LOGIC("Number of m_networkRoutes" << m_networkRoutes.size());
+-        // store the length of the longest mask.
+-        uint16_t longest_mask = 0;
+-        for (auto j = m_networkRoutes.begin(); j != m_networkRoutes.end(); j++)
++        // the longest prefix with a usable route (the index is ordered by prefix length)
++        for (auto& [len, byNet] : m_netIndex)
+         {
+-            Ipv4Mask mask = (*j)->GetDestNetworkMask();
+-            uint16_t masklen = mask.GetPrefixLength();
+-
+-            Ipv4Address entry = (*j)->GetDestNetwork();
+-            if (mask.IsMatch(dest, entry))
++            Ipv4Mask mask(len == 0 ? 0u : (0xffffffffu << (32 - len)));
++            auto ni = byNet.find(dest.CombineMask(mask).Get());
++            if (ni == byNet.end())
+             {
+-                if (oif)
+-                {
+-                    if (oif != m_ipv4->GetNetDevice((*j)->GetInterface()))
+-                    {
+-                        NS_LOG_LOGIC("Not on requested interface, skipping");
+-                        continue;
+-                    }
+-                }
+-                NS_LOG_LOGIC(allRoutes.size() << "Found global network route" << *j);
+-                if (masklen < longest_mask) // Not interested if got shorter mask
++                continue;
++            }
++            for (auto route : ni->second)
++            {
++                if (oif && oif != m_ipv4->GetNetDevice(route->GetInterface()))
+                 {
+-                    NS_LOG_LOGIC("Previous match longer, skipping");
+                     continue;
+                 }
+-                else if (masklen == longest_mask)
+-                {
+-                    NS_LOG_LOGIC("Equal mask length, adding this to the list");
+-                    allRoutes.push_back(*j);
+-                }
+-                else
+-                {
+-                    NS_LOG_LOGIC("Longer mask length found, clearing the list and adding");
+-                    allRoutes.clear();
+-                    allRoutes.push_back(*j);
+-                }
++                allRoutes.push_back(route);
++            }
++            if (!allRoutes.empty())
++            {
++                break;
+             }
+         }
+     }
+@@ -261,6 +249,11 @@ Ipv4GlobalRouting::LookupGlobal(Ipv4Address dest, uint32_t flowHash, Ptr<NetDevi
+     }
+     if (!allRoutes.empty()) // if route(s) is found
+     {
++        // TwiNS reference patch: order equal-cost routes by output interface so that
++        // flowHash % n maps to a reproducible port
++        std::stable_sort(allRoutes.begin(), allRoutes.end(), [](Ipv4RoutingTableEntry* a, Ipv4RoutingTableEntry* b) {
++            return a->GetInterface() < b->GetInterface();
++        });
+         // pick up one of the routes uniformly at random if random
+         // ECMP routing is enabled, or always select the first route
+         // consistently if random ECMP routing is disabled
+@@ -349,8 +342,30 @@ Ipv4GlobalRouting::GetRoute(uint32_t index) const
+     return nullptr;
+ }
+ 
++void
++Ipv4GlobalRouting::RebuildIndex()
++{
++    m_hostIndex.clear();
++    m_netIndex.clear();
++    for (auto r : m_hostRoutes)
++    {
++        m_hostIndex[r->GetDest().Get()].push_back(r);
++    }
++    for (auto r : m_networkRoutes)
++    {
++        m_netIndex[r->GetDestNetworkMask().GetPrefixLength()][r->GetDestNetwork().CombineMask(r->GetDestNetworkMask()).Get()].push_back(r);
++    }
++}
++
+ void
+ Ipv4GlobalRouting::RemoveRoute(uint32_t index)
++{
++    RemoveRouteUnindexed(index);
++    RebuildIndex();
++}
++
++void
++Ipv4GlobalRouting::RemoveRouteUnindexed(uint32_t index)
+ {
+     NS_LOG_FUNCTION(this << index);
+     if (index < m_hostRoutes.size())
+@@ -415,6 +430,8 @@ void
+ Ipv4GlobalRouting::DoDispose()
+ {
+     NS_LOG_FUNCTION(this);
++    m_hostIndex.clear();
++    m_netIndex.clear();
+     for (auto i = m_hostRoutes.begin(); i != m_hostRoutes.end(); i = m_hostRoutes.erase(i))
+     {
+         delete (*i);
+diff --git a/src/internet/model/ipv4-global-routing.h b/src/internet/model/ipv4-global-routing.h
+index b195b46..70f1fe2 100644
+--- a/src/internet/model/ipv4-global-routing.h
++++ b/src/internet/model/ipv4-global-routing.h
+@@ -16,6 +16,9 @@
+ #include "ns3/random-variable-stream.h"
+ 
+ #include <list>
++#include <map>
++#include <unordered_map>
++#include <vector>
+ #include <stdint.h>
+ 
+ namespace ns3
+@@ -272,6 +275,14 @@ class Ipv4GlobalRouting : public Ipv4RoutingProtocol
+     NetworkRoutes m_networkRoutes;       //!< Routes to networks
+     ASExternalRoutes m_ASexternalRoutes; //!< External routes imported
+ 
++    // TwiNS reference patch: indexes of the two tables (same entries, same order) so that
++    // duplicate checks and lookups do not scan every route (quadratic set-up at k >= 16)
++    std::unordered_map<uint32_t, std::vector<Ipv4RoutingTableEntry*>> m_hostIndex; //!< by destination
++    std::map<uint32_t, std::unordered_map<uint32_t, std::vector<Ipv4RoutingTableEntry*>>, std::greater<uint32_t>>
++        m_netIndex; //!< by prefix length, then network
++    void RebuildIndex(); //!< after removals
++    void RemoveRouteUnindexed(uint32_t index); //!< RemoveRoute without the index update
++
+     Ptr<Ipv4> m_ipv4; //!< associated IPv4 instance
+ };
+ 
