@@ -1,3 +1,19 @@
+diff --git a/simulation/src/point-to-point/model/qbb-net-device.cc b/simulation/src/point-to-point/model/qbb-net-device.cc
+index 6d191ed..d5e639f 100644
+--- a/simulation/src/point-to-point/model/qbb-net-device.cc
++++ b/simulation/src/point-to-point/model/qbb-net-device.cc
+@@ -460,8 +460,9 @@ namespace ns3 {
+ 		m_paused[qIndex] = false;
+ 		NS_LOG_INFO("Node " << m_node->GetId() << " dev " << m_ifIndex << " queue " << qIndex <<
+ 			" resumed at " << Simulator::Now().GetSeconds());
+-		Ptr<RdmaQueuePair> lastQp = m_rdmaEQ->GetQp(qIndex);
+-		if(lastQp->nvls_enable == 1 && m_node->GetNodeType() == 2) SwitchAsHostSend(); 
++		// TwiNS patch: a switch port has no m_rdmaEQ, and a host may have fewer than qIndex + 1 queue
++		// pairs; look at the queue pair only on an NVSwitch (was: GetQp(qIndex) first, which crashes)
++		if(m_node->GetNodeType() == 2 && m_rdmaEQ->GetQp(qIndex)->nvls_enable == 1) SwitchAsHostSend();
+ 		else DequeueAndTransmit();
+ 	}
+ 
 diff --git a/simulation/src/point-to-point/model/switch-mmu.cc b/simulation/src/point-to-point/model/switch-mmu.cc
 index 4baa387..bb4e3da 100644
 --- a/simulation/src/point-to-point/model/switch-mmu.cc
@@ -59,3 +75,16 @@ index 76d4ca3..8366eff 100644
  	void ConfigHdrm(uint32_t port, uint32_t size);
  	void ConfigNPort(uint32_t n_port);
  	void ConfigBufferSize(uint32_t size);
+diff --git a/simulation/src/point-to-point/model/switch-node.cc b/simulation/src/point-to-point/model/switch-node.cc
+index 263a768..a2df90f 100644
+--- a/simulation/src/point-to-point/model/switch-node.cc
++++ b/simulation/src/point-to-point/model/switch-node.cc
+@@ -222,7 +222,7 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
+ 	if (1){
+ 		uint8_t* buf = p->GetBuffer();
+ 		if (buf[PppHeader::GetStaticSize() + 9] == 0x11){ // udp packet
+-			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 6]; // ppp, ip, udp, SeqTs, INT
++			IntHeader *ih = (IntHeader*)&buf[PppHeader::GetStaticSize() + 20 + 8 + 10]; // ppp, ip, udp, SeqTs, INT (TwiNS patch: SimpleSeqTsHeader is 10 bytes, was 6)
+ 			Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(m_devices[ifIndex]);
+ 			if (m_ccMode == 3){ // HPCC
+ 				ih->PushHop(Simulator::Now().GetTimeStep(), m_txBytes[ifIndex], dev->GetQueue()->GetNBytesTotal(), dev->GetDataRate().GetBitRate());

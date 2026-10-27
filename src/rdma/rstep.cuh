@@ -23,11 +23,14 @@ __host__ __device__ __forceinline__ int64_t ns_seconds(double x)
 
 // Seconds(DataRate(bps).CalculateTxTime(bytes)): bytes * 8 / bps in double
 __host__ __device__ __forceinline__ int64_t tx_ns(uint64_t bps, uint32_t bytes) { return ns_seconds((double)bytes * 8 / (double)bps); }
+// ns-3.36's DataRate::CalculateBytesTxTime: Seconds(bytes * 8) / bps, an integer division
+__host__ __device__ __forceinline__ int64_t tx_ns36(uint64_t bps, uint32_t bytes) { return (int64_t)((uint64_t)bytes * 8000000000ull / bps); }
+__host__ __device__ __forceinline__ int64_t tx_ns(int simai, uint64_t bps, uint32_t bytes) { return simai ? tx_ns36(bps, bytes) : tx_ns(bps, bytes); }
 
 // tx_ns(link rate, bytes) for frames below TXT_N bytes (main fills it)
-constexpr int TXT_N = 8192;
+constexpr int TXT_N = 9216;
 __constant__ int32_t c_txt[TXT_N];
-__device__ __forceinline__ int64_t link_tx(const Sim &s, uint32_t bytes) { return bytes < TXT_N ? c_txt[bytes] : tx_ns(s.P.bps, bytes); }
+__device__ __forceinline__ int64_t link_tx(const Sim &s, uint32_t bytes) { return bytes < TXT_N ? c_txt[bytes] : tx_ns(s.P.simai, s.P.bps, bytes); }
 
 // DataRate(d) from a double (DataRate(uint64_t), truncation)
 __device__ __forceinline__ uint64_t rate_of(double d) { return (uint64_t)d; }
@@ -296,10 +299,11 @@ __device__ __forceinline__ void trace_event(int, int64_t, const char *, int, con
 // ------------------------------------------------------------------ frames
 __host__ __device__ __forceinline__ uint32_t node_ip(int id) { return 0x0b000001u + (id / 256) * 0x00010000u + (id % 256) * 0x00000100u; }
 
-__device__ __forceinline__ uint32_t data_size(const Params &P, uint32_t payload) { return payload + 48 + P.int_size; }
+__device__ __forceinline__ uint32_t data_hdr(const Params &P) { return 48 + P.seq_extra + P.int_size; }
+__device__ __forceinline__ uint32_t data_size(const Params &P, uint32_t payload) { return payload + data_hdr(P); }
 __device__ __forceinline__ uint32_t ack_size(const Params &P)
 {
-    int base = 12 + P.int_size, pad = 60 - 14 - 20 - base;
+    int base = 12 + P.seq_extra + P.int_size, pad = 60 - 14 - 20 - base;
     return (pad > 0 ? pad : 0) + base + 20 + 14;
 }
 constexpr uint32_t PFC_SIZE = 9 + 20 + 14;
@@ -431,13 +435,13 @@ __device__ __forceinline__ uint64_t bytes_left(const SndQP &q) { return q.size >
 
 // tx_ns(rate, bytes) for a QP, remembering the last one (PktSent and ChangeRate ask for the same
 // rate and size in turn)
-__device__ __forceinline__ int64_t qp_tx(SndQP &q, uint64_t rate, uint32_t bytes)
+__device__ __forceinline__ int64_t qp_tx(const Params &P, SndQP &q, uint64_t rate, uint32_t bytes)
 {
     if (rate != q.tx_rate || bytes != q.tx_size)
     {
         q.tx_rate = rate;
         q.tx_size = bytes;
-        q.tx_val = tx_ns(rate, bytes);
+        q.tx_val = tx_ns(P.simai, rate, bytes);
     }
     return q.tx_val;
 }
@@ -462,6 +466,14 @@ __device__ __forceinline__ void h_transmit(HCtx &c, Pkt p)
     const Sim &s = *c.s;
     int64_t tx = link_tx(s, p.size);
     c.st.tc_at = c.now + tx;
+    if (c.P->simai && p.size > 60 && p.size < 9000)
+    {
+        // ns-3-alibabacloud's TransmitStart first schedules SendCallback (RdmaHw::SendPacketComplete,
+        // which fires SendComplete if the frame's (dip, sport, pg) finds a queue pair: a data frame)
+        c.ord++;
+        if (p.kind == K_DATA && s.sent[p.flow] < 0)
+            s.sent[p.flow] = c.now + tx;
+    }
     cpush(&s.h_tc[c.h], ccode(tx, c.ord++), c.cur);
     if (c.nout >= MAXF)
     {
@@ -557,14 +569,14 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
         h_transmit(c, p);
         // RdmaHw::PktSent, UpdateNextAvail
         q.last_pkt = p.size;
-        q.next_avail = c.now + qp_tx(q, c.P->rate_bound ? q.rate : q.max_rate, p.size);
+        q.next_avail = c.now + qp_tx(*c.P, q, c.P->rate_bound ? q.rate : q.max_rate, p.size);
         return;
     }
     int64_t t = INT64_MAX;
     for (int i = 0; i < c.st.qp_n; i++)
     {
         const SndQP &q = s.qp[list[i]];
-        if (bytes_left(q) == 0)
+        if (bytes_left(q) == 0 && !c.P->simai) // ns-3-alibabacloud dropped this skip
             continue;
         t = q.next_avail < t ? q.next_avail : t;
     }
@@ -575,7 +587,7 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
 // RdmaHw::ChangeRate (and QbbNetDevice::UpdateNextAvail)
 __device__ __forceinline__ void change_rate(HCtx &c, SndQP &q, uint64_t new_rate)
 {
-    int64_t st = qp_tx(q, q.rate, q.last_pkt), nt = qp_tx(q, new_rate, q.last_pkt);
+    int64_t st = qp_tx(*c.P, q, q.rate, q.last_pkt), nt = qp_tx(*c.P, q, new_rate, q.last_pkt);
     q.next_avail = q.next_avail + nt - st;
     if (c.st.ns_at >= 0 && q.next_avail < c.st.ns_at)
         h_schedule_ns(c, q.next_avail < c.now ? c.now : q.next_avail);
@@ -793,7 +805,7 @@ __device__ __forceinline__ void h_data(HCtx &c, const Pkt &p)
 {
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
-    uint32_t payload = p.size - 48 - c.P->int_size;
+    uint32_t payload = p.size - data_hdr(*c.P);
     // data for a flow received whole: if the sender has completed by now, ns-3 has deleted the
     // receiving queue pair, and a new one would answer with a NACK (not modelled; needs a drop)
     if (r.expected >= s.fi[p.flow].size)
@@ -853,8 +865,8 @@ __device__ __forceinline__ void h_start(HCtx &c, int f)
     q = SndQP{};
     q.size = fi.size;
     q.rate = q.max_rate = s.P.bps;
-    q.win = c.P->win;
-    q.base_rtt = c.P->base_rtt;
+    q.win = fi.win;
+    q.base_rtt = fi.base_rtt;
     q.alpha = 1;
     q.first_cnp = 1;
     q.target = s.P.bps;

@@ -14,6 +14,12 @@
 // overwritten tail are reported as "on lost tails"
 //
 // out: "id start_ns fct_ns" per flow, by id.
+// --sent=F (SimAI topologies): "id ns" per flow at its first SendComplete, by id.
+//
+// Topologies: TwiNS's ("hosts H", "switches S", "link A B"; --rate and --delay for every link), or
+// SimAI's (gen_Topo_Template.py: "nodes gpus_per_server nvswitches switches links gpu_type", the
+// NVSwitch ids, the switch ids, then "src dst rate delay error_rate" per link). A SimAI topology
+// selects ns-3-alibabacloud's behaviour (Params::simai; reference validation/simai/simai-ref.cc).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -122,6 +128,40 @@ static uint64_t parse_rate(const string &s)
     return (uint64_t)(v * m);
 }
 
+// ns-3 Time strings as SimAI writes them: a number and a unit (ms, us, ns, s)
+static int64_t parse_delay(const string &s)
+{
+    size_t i = 0;
+    while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '.'))
+        i++;
+    double v = atof(s.substr(0, i).c_str());
+    string u = s.substr(i);
+    double m = u == "s" ? 1e9 : u == "ms" ? 1e6 : u == "us" ? 1e3 : 1;
+    return (int64_t)llround(v * m);
+}
+
+// the first link's rate and delay of a SimAI topology file (0 for TwiNS's format)
+static bool simai_link0(const string &path, uint64_t *bps, int64_t *delay)
+{
+    std::ifstream f(path);
+    string x;
+    if (!(f >> x) || x.empty() || !isdigit((unsigned char)x[0]))
+        return false;
+    int nodes = atoi(x.c_str()), gps, nvs, sws, nl;
+    string gpu_type;
+    f >> gps >> nvs >> sws >> nl >> gpu_type;
+    for (int i = 0; i < nvs + sws; i++)
+        f >> x;
+    int u, v;
+    string r, d;
+    if (!(f >> u >> v >> r >> d))
+        return false;
+    *bps = parse_rate(r);
+    *delay = parse_delay(d);
+    (void)nodes;
+    return true;
+}
+
 static void host_push(Chain *c, int64_t lead, int ord) { cpush(c, ccode(lead, ord), Chain(*c)); }
 
 // One network: its parameters, topology, routes and flows, numbered within it.
@@ -224,12 +264,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         fprintf(stderr, "%s: DCQCN timer intervals must be at least the link delay\n", w.name.c_str());
         return false;
     }
-    if (cfg.u32("GLOBAL_T", 1) != 1)
-    {
-        fprintf(stderr, "%s: GLOBAL_T 0 is not modelled\n", w.name.c_str());
-        return false;
-    }
-    w.max_slots = (int64_t)(cfg.num("SIMULATOR_STOP_TIME", 10.0) * 1e9) / delay;
+    const int global_t = cfg.u32("GLOBAL_T", 1);
 
     // ---- topology
     int &H = w.H, &S = w.S;
@@ -242,20 +277,77 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             return false;
         }
         string a, b, x;
-        while (f >> x)
+        f >> x;
+        if (!x.empty() && isdigit((unsigned char)x[0]))
         {
-            if (x == "hosts")
-                f >> H;
-            else if (x == "switches")
-                f >> S;
-            else if (x == "link")
+            // SimAI's format: node ids are GPUs first, then (here) switches; no NVSwitches yet
+            int nodes = atoi(x.c_str()), gps, nvs, sws, nl;
+            string gpu_type;
+            f >> gps >> nvs >> sws >> nl >> gpu_type;
+            if (nvs != 0)
             {
-                f >> a >> b;
-                auto id = [&](const string &y) { return (y[0] == 'h' ? 0 : H) + atoi(y.c_str() + 1); };
-                links.push_back({id(a), id(b)});
+                fprintf(stderr, "%s: NVSwitches are not modelled yet\n", w.name.c_str());
+                return false;
             }
+            H = nodes - sws, S = sws;
+            for (int i = 0; i < sws; i++)
+            {
+                int id;
+                f >> id;
+                if (id < H)
+                {
+                    fprintf(stderr, "%s: switch %d: SimAI topologies must list GPUs before switches\n", w.name.c_str(), id);
+                    return false;
+                }
+            }
+            for (int i = 0; i < nl; i++)
+            {
+                int u, v;
+                string r, d;
+                double err;
+                f >> u >> v >> r >> d >> err;
+                uint64_t lr = parse_rate(r);
+                int64_t ld = parse_delay(d);
+                if (err != 0)
+                {
+                    fprintf(stderr, "%s: link error rates are not modelled\n", w.name.c_str());
+                    return false;
+                }
+                if (lr != bps || ld != delay)
+                {
+                    fprintf(stderr, "%s: link %d-%d runs at %s, %s; links of different rates or delays are not modelled yet (all must be "
+                                    "the first link's %llu bps, %lld ns)\n",
+                            w.name.c_str(), u, v, r.c_str(), d.c_str(), (unsigned long long)bps, (long long)delay);
+                    return false;
+                }
+                links.push_back({u, v});
+            }
+            P.simai = 1;
         }
+        else
+            do
+            {
+                if (x == "hosts")
+                    f >> H;
+                else if (x == "switches")
+                    f >> S;
+                else if (x == "link")
+                {
+                    f >> a >> b;
+                    auto id = [&](const string &y) { return (y[0] == 'h' ? 0 : H) + atoi(y.c_str() + 1); };
+                    links.push_back({id(a), id(b)});
+                }
+            } while (f >> x);
     }
+    P.seq_extra = P.simai ? 4 : 0;
+    P.ecn_pcnt = P.simai ? 1025 : 257;
+    if (global_t != 1 && !P.simai)
+    {
+        fprintf(stderr, "%s: GLOBAL_T 0 is modelled for SimAI topologies only\n", w.name.c_str());
+        return false;
+    }
+    // SimAI.conf stops at 4e13 s: clamp (in double, before the conversion overflows)
+    w.max_slots = (int64_t)std::min(cfg.num("SIMULATOR_STOP_TIME", P.simai ? 3.01 : 10.0) * 1e9 / (double)delay, 1e15);
     int N = w.N = H + S, L = w.L = 2 * (int)links.size();
     vector<int> &deg = w.deg;
     deg.assign(N, 0);
@@ -355,7 +447,13 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         max_bdp = max_rtt * P.bps / 1000000000ull / 8;
     }
     P.base_rtt = max_rtt;
-    P.win = cfg.u32("HAS_WIN", 1) ? (uint32_t)max_bdp : 0;
+    const int has_win = cfg.u32("HAS_WIN", 1);
+    P.win = has_win ? (uint32_t)max_bdp : 0;
+    // a pair's RTT and BDP (GLOBAL_T 0): delay * 2 + txDelay over its path, uniform links
+    auto pair_rtt = [&](int a, int b) {
+        uint64_t hops = (uint64_t)hop_n[a][b];
+        return hops * (uint64_t)delay * 2 + hops * ((uint64_t)P.mtu * 1000000000ull * 8 / P.bps);
+    };
 
     // ---- flows (rows in start order, stable; per host pair ports from 10000)
     vector<FlowInfo> &fi = w.fi;
@@ -381,11 +479,21 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     }
     int F = fi.size();
     for (auto &x : fi)
+    {
         if (x.src >= H || x.dst >= H)
         {
             fprintf(stderr, "%s: a flow between %d and %d: not hosts\n", w.name.c_str(), x.src, x.dst);
             return false;
         }
+        if (global_t == 1)
+            x.win = P.win, x.base_rtt = P.base_rtt;
+        else
+        {
+            uint64_t rtt = pair_rtt(x.src, x.dst);
+            x.win = has_win ? (uint32_t)(rtt * P.bps / 1000000000ull / 8) : 0;
+            x.base_rtt = rtt;
+        }
+    }
     vector<int> order(F);
     for (int i = 0; i < F; i++)
         order[i] = i;
@@ -448,7 +556,7 @@ int main(int argc, char **argv)
     Config base;
     if (!read_config(argv[1], base))
         return 1;
-    string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "";
+    string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0;
     for (int i = 2; i < argc; i++)
@@ -470,6 +578,8 @@ int main(int argc, char **argv)
             data_dirs = v;
         else if (k == "--txtrace")
             tx_file = v;
+        else if (k == "--sent")
+            sent_file = v;
         else if (k == "--from")
             tx_from = atoll(v.c_str());
         else if (k == "--until")
@@ -494,7 +604,7 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    const uint64_t bps = parse_rate(rate_s);
+    uint64_t bps = parse_rate(rate_s);
 
     // ---- the worlds: one, or a job file's lines "name topo flows [KEY=VALUE ...]" (the files
     // looked up in the --path directories, colon separated, and as given)
@@ -516,6 +626,7 @@ int main(int argc, char **argv)
     };
     if (batch_file.empty())
     {
+        simai_link0(topo_file, &bps, &delay); // a SimAI topology gives the rate and delay
         worlds.emplace_back();
         worlds[0].name = "run";
         if (!build_world(worlds[0], base, topo_file, flow_file, bps, delay))
@@ -552,10 +663,17 @@ int main(int argc, char **argv)
                 }
                 set_override(cfg, kv.substr(0, eq), kv.substr(eq + 1));
             }
+            if (worlds.empty())
+                simai_link0(find_file(topo), &bps, &delay);
             worlds.emplace_back();
             worlds.back().name = name;
             if (!build_world(worlds.back(), cfg, find_file(topo), find_file(flows), bps, delay))
                 return 1;
+            if (worlds.back().P.simai != worlds[0].P.simai)
+            {
+                fprintf(stderr, "%s: a batch mixes SimAI and HPCC topologies\n", name.c_str());
+                return 1;
+            }
         }
         if (worlds.empty())
         {
@@ -708,7 +826,7 @@ int main(int argc, char **argv)
                 pt = Port{};
                 pt.tc_at = -1;
                 // ConfigEcnStream(port, node * SwitchMmu::pCnt + device)
-                pt.rng = nsm_rng::stream_state(1, (uint64_t)node * 257 + (p + 1), 1);
+                pt.rng = nsm_rng::stream_state(1, (uint64_t)node * Pw[s_world[x]].ecn_pcnt + (p + 1), 1);
             }
         }
         s.sw = dev_copy(sw);
@@ -737,6 +855,7 @@ int main(int argc, char **argv)
     {
         vector<int64_t> fct(F, -1);
         s.fct = dev_copy(fct);
+        s.sent = dev_copy(fct);
     }
     if (!tx_file.empty())
     {
@@ -758,7 +877,7 @@ int main(int argc, char **argv)
     {
         vector<int32_t> txt(TXT_N);
         for (int b = 0; b < TXT_N; b++)
-            txt[b] = (int32_t)tx_ns(P.bps, b);
+            txt[b] = (int32_t)tx_ns(P.simai, P.bps, b);
         CK(hipMemcpyToSymbol(HIP_SYMBOL(c_txt), txt.data(), sizeof(int32_t) * TXT_N));
     }
     // a block (one wave) per host and per switch; a switch keeps its ports in LDS
@@ -828,6 +947,25 @@ int main(int argc, char **argv)
                 fprintf(fo, "%zu %lld %lld\n", i, (long long)fi[g].start, (long long)fct[g]);
         }
         fclose(fo);
+    }
+    if (!sent_file.empty() || (!batch_file.empty() && P.simai))
+    {
+        vector<int64_t> sent(F);
+        CK(cudaMemcpy(sent.data(), s.sent, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        for (int wi = 0; wi < W; wi++)
+        {
+            string path = batch_file.empty() ? sent_file : out_dir + "/" + worlds[wi].name + ".sent";
+            FILE *fo = fopen(path.c_str(), "w");
+            if (!fo)
+            {
+                fprintf(stderr, "cannot write %s\n", path.c_str());
+                return 1;
+            }
+            for (size_t i = 0; i < worlds[wi].fi.size(); i++)
+                if (sent[fbase[wi] + i] >= 0)
+                    fprintf(fo, "%zu %lld\n", i, (long long)sent[fbase[wi] + i]);
+            fclose(fo);
+        }
     }
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);

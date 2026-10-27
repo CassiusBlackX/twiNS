@@ -36,8 +36,17 @@ without it the run crashes.
 - Repeated runs are byte-identical, in flow completion times and iteration time.
 - It is also faster than stock SimAI with `-t 1` (`docs/ai/baseline.md`).
 
-`simai-ref` adds `simai.patch` (ns-3-alibabacloud): each switch egress port draws its ECN marks
-from its own random stream, as `validation/hpcc/hpcc.patch` does for the HPCC fork.
+`simai-ref` adds `simai.patch` (ns-3-alibabacloud):
+- **ECN**: each switch egress port draws its ECN marks from its own random stream, as
+  `validation/hpcc/hpcc.patch` does for the HPCC fork.
+- **Two crashes fixed.** Both change only runs that crash in stock SimAI.
+  - **PFC.** `QbbNetDevice::Resume` asks `m_rdmaEQ->GetQp(qIndex)` whether NVLS is on before it
+    checks the node type. A switch port has no `m_rdmaEQ`, so the first RESUME frame a switch
+    receives crashes SimAI; a host may have fewer than `qIndex + 1` queue pairs. The patch checks
+    for an NVSwitch first.
+  - **HPCC.** The switch writes INT at `ppp + 20 + 8 + 6`, the HPCC fork's offset, but SimAI's SeqTs
+    header is 10 bytes. INT overwrites the data frame's sequence number and priority, and the next
+    switch enqueues the frame into queue 168. The patch writes INT at `+ 10`.
 - The ECN draws then no longer depend on how many draws happened before anywhere in the network.
 - That is what lets twins-rdma reproduce them.
 
@@ -71,3 +80,24 @@ container, with outputs in `~/netsim/aiwork/runs/NAME`.
 - `AS_SEND_LAT=3` is always set.
 - NVLS (`AS_NVLS_ENABLE=1`) only works within one server: across servers SimCCL generates no
   flows at all.
+
+## TwiNS-RDMA against simai-ref
+
+A SimAI topology file switches twins-rdma to ns-3-alibabacloud's behaviour (`Params::simai`):
+- header sizes;
+- tx times `floor(bytes * 8e9 / bps)`;
+- the host wake-up that counts queue pairs that have sent everything;
+- `GLOBAL_T 0`;
+- ECN stream ids with `pCnt` 1025.
+
+`--sent=F` writes every flow's first `SendComplete`.
+
+`check.sh JOBFILE` compares the completion and send-completion times of every flow with
+`out/simai/ref` (made by `run_ref.sh` on a87). `workloads/simai_topo.py` converts TwiNS
+topologies to SimAI's format.
+
+| job file | runs | contents | identical |
+|---|---|---|---|
+| `jobs_net1.txt` | 13 | FatTree k=4 and k=8 in SimAI's format, uniform links (100 Gb/s at 1 µs, 400 Gb/s at 500 ns); SimAI.conf (MTU 9000, DCQCN, `GLOBAL_T 0`) and variants: MTU 1000, HPCC, `GLOBAL_T 1`, 1–2 MB buffers (up to 2456 pauses) | all |
+
+Not modelled yet: links of different rates or delays, NVSwitches, GPUs with two ports, NVLS.

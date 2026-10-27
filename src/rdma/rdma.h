@@ -157,6 +157,8 @@ struct FlowInfo
     int64_t start;      // ns
     uint32_t sport;     // dport is 100
     uint32_t order;     // index in start order
+    uint32_t win;       // its window and base RTT (maxBdp and maxRtt, or the pair's with GLOBAL_T 0)
+    uint64_t base_rtt;
     Chain start_chain;  // the chain of its StartApplication
 };
 
@@ -205,6 +207,12 @@ struct Params
     int64_t delay;        // link delay, ns
     uint32_t win;         // maxBdp (HAS_WIN, GLOBAL_T)
     uint64_t base_rtt;    // maxRtt
+    // SimAI's ns-3-alibabacloud (ns-3.36) instead of the HPCC fork: 64-bit sequence numbers (4 more
+    // header bytes in data and ACK frames), tx times floor(bytes * 8e9 / bps), and the host's wake-up
+    // also counting queue pairs that have sent everything
+    int simai;
+    uint32_t seq_extra;   // 4 with simai
+    uint32_t ecn_pcnt;    // SwitchMmu::pCnt (ECN stream ids): 257, SimAI 1025
     int var_win, rate_bound, ack_high_prio, ecn, qbb;
     // DCQCN
     double g;             // EWMA_GAIN
@@ -287,6 +295,7 @@ struct Sim
     int host_blocks, spread; // spread: lanes per entity (see rdma_slot)
     int serial;              // switches run every slot's events on one lane (no safe slots)
     int64_t *fct;       // [F] completion time - start (ns), -1: not yet
+    int64_t *sent;      // [F] simai: its first SendComplete (ns), -1: none yet
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;
     unsigned long long *tx_cnt, tx_cap;

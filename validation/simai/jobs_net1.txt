@@ -1,0 +1,14 @@
+# SimAI mode on uniform FatTrees (no NVSwitch): SimAI.conf (MTU 9000, DCQCN, GLOBAL_T 0) and variants
+s_ft4_inc1 ft4_100g.topo inc1.csv
+s_ft4_inc1_b1 ft4_100g.topo inc1.csv BUFFER_SIZE=1
+s_ft4_inc1_cc3 ft4_100g.topo inc1.csv CC_MODE=3
+s_ft4_inc1_m1000 ft4_100g.topo inc1.csv PACKET_PAYLOAD_SIZE=1000
+s_ft4_inc1_gt1 ft4_100g.topo inc1.csv GLOBAL_T=1
+s_k8_a2a30 ft8_100g.topo k8_a2a30.csv
+s_k8_a2a30_cc3 ft8_100g.topo k8_a2a30.csv CC_MODE=3
+s_k8_a2a30_m1000 ft8_100g.topo k8_a2a30.csv PACKET_PAYLOAD_SIZE=1000
+s_k8_incast16 ft8_100g.topo k8_incast16.csv
+s_k8_perm ft8_100g.topo k8_perm.csv BUFFER_SIZE=2
+s_k8_400_a2a30 ft8_400g.topo k8_a2a30.csv
+s_k8_400_perm64 ft8_400g.topo k8_perm64_4m.csv
+s_k8_400_incast64 ft8_400g.topo k8_incast64.csv BUFFER_SIZE=2
