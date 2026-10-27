@@ -566,40 +566,28 @@ int main(int argc, char **argv)
     }
     int BS = spread;
     s.host_blocks = H;
-    if (per_sw > 48 * 1024)
-        CK(hipFuncSetAttribute((const void *)rdma_switches, hipFuncAttributeMaxDynamicSharedMemorySize, (int)per_sw));
 
     auto t_start = std::chrono::steady_clock::now();
     int fin = 0;
     long long launches = 0;
-    // a graph of 64 slots: in each, the host and the switch kernel run side by side, and both end
-    // before the next slot's begin
-    hipStream_t sa, sb;
+    // a graph of 64 slots (fewer launch costs)
+    hipStream_t sa;
     CK(hipStreamCreate(&sa));
-    CK(hipStreamCreate(&sb));
     const int GS = 64;
-    vector<hipEvent_t> evs(2 * GS + 1);
-    for (auto &e : evs)
-        CK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+    size_t lds = std::max(per_h, per_sw);
+    if (lds > 48 * 1024)
+        CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
     hipGraph_t graph;
     hipGraphExec_t gexec;
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
-    CK(hipEventRecord(evs[0], sa));
     for (int i = 0; i < GS; i++)
-    {
-        CK(hipStreamWaitEvent(sb, evs[2 * i], 0));
-        rdma_hosts<<<H, BS, per_h, sa>>>(s);
-        rdma_switches<<<S, BS, per_sw, sb>>>(s);
-        CK(hipEventRecord(evs[2 * i + 1], sb));
-        CK(hipStreamWaitEvent(sa, evs[2 * i + 1], 0));
-        CK(hipEventRecord(evs[2 * i + 2], sa));
-    }
+        rdma_slot<<<H + S, BS, lds, sa>>>(s);
     CK(hipStreamEndCapture(sa, &graph));
     CK(hipGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
     while (!fin)
     {
         CK(hipGraphLaunch(gexec, sa));
-        launches += 2 * GS;
+        launches += GS;
         CK(cudaGetLastError());
         CK(hipMemcpyAsync(&fin, s.finished, sizeof(int), hipMemcpyDeviceToHost, sa));
         CK(hipStreamSynchronize(sa));

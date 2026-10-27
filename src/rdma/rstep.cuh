@@ -1927,17 +1927,13 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     __threadfence();
 }
 
-// The slot kernels: a block (one wave) per host, and per switch. A block's lanes load its slot's
-// inputs together, then the first lane runs its events (entities sharing a wave would diverge and
-// run in turn). Hosts and switches are separate kernels, so that each requests only its own LDS:
-// a switch's workspace is several times a host's, and LDS bounds how many blocks a CU holds.
-__global__ void rdma_hosts(Sim s)
+// A block (one wave) per host and per switch. A block's lanes load its slot's inputs together,
+// then the first lane runs its events (entities sharing a wave would diverge and run in turn).
+// Their LDS is kept small: it bounds how many blocks a CU holds.
+__device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
 {
-    if (*s.finished)
-        return;
     int64_t slot = *s.slot;
-    extern __shared__ __align__(16) char smem[];
-    int lane = threadIdx.x, lanes = blockDim.x, h = blockIdx.x;
+    int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
 #endif
@@ -1953,13 +1949,10 @@ __global__ void rdma_hosts(Sim s)
         slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
 }
 
-__global__ void rdma_switches(Sim s)
+__device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem)
 {
-    if (*s.finished)
-        return;
     int64_t slot = *s.slot;
-    extern __shared__ __align__(16) char smem[];
-    int lane = threadIdx.x, lanes = blockDim.x, x = blockIdx.x;
+    int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
 #endif
@@ -1982,6 +1975,18 @@ __global__ void rdma_switches(Sim s)
 #endif
     if (lane == 0)
         slot_end(s, slot, blk_act, ~0ull);
+}
+
+// the slot kernel: blocks 0 .. H - 1 are the hosts, then the switches
+__global__ void rdma_slot(Sim s)
+{
+    extern __shared__ __align__(16) char smem[];
+    if (*s.finished)
+        return;
+    if (blockIdx.x < s.H)
+        host_block(s, blockIdx.x, smem);
+    else
+        switch_block(s, blockIdx.x - s.H, smem);
 }
 
 } // namespace rdma
