@@ -167,7 +167,12 @@ NSM_FN int zeroinfnan(uint64_t i)
 }
 } // namespace nsm_math
 
-NSM_FN double nsm_pow(double x, double y)
+#if defined(__HIPCC__) || defined(__CUDACC__)
+__host__ __device__ __noinline__
+#else
+inline
+#endif
+double nsm_pow(double x, double y)
 {
     using namespace nsm_math;
     const uint32_t SIGN_BIAS = 0x800 << 7;

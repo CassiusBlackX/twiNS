@@ -5,11 +5,15 @@
 // MinTh = MaxTh = K, instantaneous queue), ECMP (per-packet random by default, like GeDES's
 // per-slot spraying), initial cwnd 10, minimum RTO 1 ms.
 //
-// Flow file rows: "node,flow_size,start_ns" (GeDES pairing: node sends to node + N/2) or
-// "src,dst,flow_size,start_ns". Every flow is its own TCP connection. The FCT is measured the
-// way GeDES does: from the moment the sender can send (connection established; GeDES assumes
-// established connections) to the arrival of the ACK covering the last byte.
-// Output CSV: src,dst,flow_size,start_ns,established_ns,completed_ns
+// Flow file rows: "node,flow_size,start_ns" (GeDES pairing: node sends to node + N/2),
+// "src,dst,flow_size,start_ns" (every flow is its own TCP connection) or
+// "src,dst,flow_size,start_ns,conn": rows with the same conn are messages over one connection,
+// written at their start times in file order (the first opens the connection). A flow's FCT runs
+// from the moment it is handed to the socket (connection established; GeDES assumes established
+// connections) to the arrival of the ACK covering its last byte. --fin=1: the sender closes the
+// connection after writing its last message (FIN with the last segment; the PacketSink peer
+// stays in CLOSE_WAIT).
+// Output CSV (one row per flow): src,dst,flow_size,start_ns,established_ns,completed_ns,hash_data,hash_ack,retx
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
@@ -38,13 +42,17 @@ struct FlowRec
     int64_t done_ns = -1;
     uint32_t hash_data = 0, hash_ack = 0; // ns-3 flow hashes of both directions (ECMP)
     uint32_t retx = 0;
+    int64_t conn = -1; // connection id from the flow file (-1: its own)
+    uint64_t end = 0;  // offset of its last byte + 1 in the connection's byte stream
 };
 
 static std::vector<FlowRec> g_flows;
+static bool g_fin = false;
 static std::atomic<uint64_t> g_drops{0}, g_marks{0}, g_retx{0};
 static std::atomic<uint64_t> g_retx_state[5], g_rto{0}; // retransmissions by TcpCongState_t; RTOs
 
-// Sends one flow over its own TCP connection and records connection and completion times.
+// Sends a connection's flows (messages) and records when each is handed to the socket and when
+// its last byte is acknowledged.
 class FlowSender : public Application
 {
   public:
@@ -54,10 +62,19 @@ class FlowSender : public Application
         return tid;
     }
 
-    void Setup(uint32_t flow, Address peer)
+    void Setup(std::vector<uint32_t> msgs, Address peer)
     {
-        m_flow = flow;
+        m_msgs = msgs;
+        m_flow = msgs[0];
         m_peer = peer;
+    }
+
+    // the start of message k (k >= 1; scheduled at setup)
+    void SendMessage(uint32_t k)
+    {
+        m_due = k + 1;
+        if (m_connected)
+            Write();
     }
 
   private:
@@ -84,12 +101,14 @@ class FlowSender : public Application
                 buf[12] = pb & 0xff;
                 return Hash32((char *)buf, sizeof(buf));
             };
-            g_flows[m_flow].hash_data = h(src, dst, sport, dport);
-            g_flows[m_flow].hash_ack = h(dst, src, dport, sport);
+            for (uint32_t i : m_msgs)
+            {
+                g_flows[i].hash_data = h(src, dst, sport, dport);
+                g_flows[i].hash_ack = h(dst, src, dport, sport);
+            }
         }
         m_socket->SetConnectCallback(MakeCallback(&FlowSender::Connected, this),
                                      MakeCallback(&FlowSender::Failed, this));
-        m_socket->SetSendCallback(MakeCallback(&FlowSender::Fill, this));
         m_socket->TraceConnectWithoutContext("HighestRxAck", MakeCallback(&FlowSender::Acked, this));
         m_socket->TraceConnectWithoutContext("Retransmission", MakeCallback(&FlowSender::Retx, this));
         m_socket->TraceConnectWithoutContext("CongState", MakeCallback(&FlowSender::State, this));
@@ -116,10 +135,30 @@ class FlowSender : public Application
     {
     }
 
-    void Connected(Ptr<Socket> s)
+    void Connected(Ptr<Socket>)
     {
-        g_flows[m_flow].est_ns = Simulator::Now().GetNanoSeconds();
-        Fill(s, s->GetTxAvailable());
+        m_connected = true;
+        Write();
+    }
+
+    // hand every due message to the socket (the send buffer holds them all)
+    void Write()
+    {
+        while (m_written < m_due)
+        {
+            FlowRec &r = g_flows[m_msgs[m_written]];
+            r.est_ns = Simulator::Now().GetNanoSeconds();
+            for (uint64_t sent = 0; sent < r.size;)
+            {
+                uint32_t n = (uint32_t)std::min<uint64_t>(r.size - sent, 1u << 20);
+                int x = m_socket->Send(Create<Packet>(n));
+                NS_ABORT_MSG_IF(x <= 0, "send buffer full");
+                sent += x;
+            }
+            m_written++;
+            if (g_fin && m_written == m_msgs.size())
+                m_socket->Close();
+        }
     }
 
     void Failed(Ptr<Socket>)
@@ -127,27 +166,11 @@ class FlowSender : public Application
         std::cerr << "connection failed for flow " << m_flow << std::endl;
     }
 
-    void Fill(Ptr<Socket> s, uint32_t)
-    {
-        uint64_t size = g_flows[m_flow].size;
-        while (m_sent < size)
-        {
-            uint32_t avail = s->GetTxAvailable();
-            if (avail == 0)
-                break;
-            uint32_t n = (uint32_t)std::min<uint64_t>({size - m_sent, avail, 1u << 20});
-            int r = s->Send(Create<Packet>(n));
-            if (r <= 0)
-                break;
-            m_sent += r;
-        }
-    }
-
     void Acked(SequenceNumber32, SequenceNumber32 now)
     {
-        // the SYN takes sequence number 0, data occupies 1..size
-        if (g_flows[m_flow].done_ns < 0 && now.GetValue() >= g_flows[m_flow].size + 1)
-            g_flows[m_flow].done_ns = Simulator::Now().GetNanoSeconds();
+        // the SYN takes sequence number 0, the byte stream starts at 1
+        while (m_done < m_written && now.GetValue() >= g_flows[m_msgs[m_done]].end + 1)
+            g_flows[m_msgs[m_done++]].done_ns = Simulator::Now().GetNanoSeconds();
     }
 
     void Cwnd(uint32_t, uint32_t now)
@@ -193,10 +216,12 @@ class FlowSender : public Application
 
     uint32_t m_state = 0;
     uint32_t m_high = 0;
-    uint32_t m_flow = 0;
+    uint32_t m_flow = 0; // the first message (traces, retransmission counts)
+    std::vector<uint32_t> m_msgs;
+    uint32_t m_due = 1, m_written = 0, m_done = 0;
+    bool m_connected = false;
     Address m_peer;
     Ptr<Socket> m_socket;
-    uint64_t m_sent = 0;
 };
 
 int main(int argc, char *argv[])
@@ -228,6 +253,7 @@ int main(int argc, char *argv[])
     cmd.AddValue("stop", "simulation stop time (s)", stopSec);
     cmd.AddValue("dupthresh", "duplicate ACKs that trigger fast retransmit", dupThresh);
     cmd.AddValue("hostq", "host egress queue: default, red, big", hostQ);
+    cmd.AddValue("fin", "1: senders close their connections after the last flow (FIN)", g_fin);
     cmd.Parse(argc, argv);
 
 #ifdef NS3_MTP
@@ -290,6 +316,8 @@ int main(int argc, char *argv[])
                 r = {(int)v[0], (int)((v[0] + H / 2) % H), (uint64_t)v[1], v[2]};
             else
                 r = {(int)v[0], (int)v[1], (uint64_t)v[2], v[3]};
+            if (v.size() >= 5)
+                r.conn = v[4];
             g_flows.push_back(r);
         }
     }
@@ -457,12 +485,66 @@ int main(int argc, char *argv[])
     for (uint32_t h = 0; h < H; h++)
         if (hasSink[h])
             sink.Install(hosts.Get(h)).Start(Seconds(0));
+    // connections in the order of their first flows; later flows are written at their starts
+    std::map<int64_t, std::vector<uint32_t>> byConn;
+    std::vector<std::vector<uint32_t>> conns;
     for (uint32_t i = 0; i < g_flows.size(); i++)
     {
+        if (g_flows[i].conn < 0)
+        {
+            conns.push_back({i});
+            continue;
+        }
+        auto &v = byConn[g_flows[i].conn];
+        if (v.empty())
+            conns.push_back({});
+        v.push_back(i);
+    }
+    {
+        size_t j = 0;
+        std::map<int64_t, bool> placed;
+        for (uint32_t i = 0; i < g_flows.size(); i++)
+        {
+            if (g_flows[i].conn < 0)
+            {
+                j++;
+                continue;
+            }
+            if (placed[g_flows[i].conn])
+                continue;
+            placed[g_flows[i].conn] = true;
+            conns[j++] = byConn[g_flows[i].conn];
+        }
+    }
+    std::vector<std::pair<Ptr<FlowSender>, std::vector<uint32_t>>> apps;
+    for (auto &c : conns)
+    {
+        uint64_t off = 0;
+        for (uint32_t i : c)
+        {
+            NS_ABORT_MSG_IF(g_flows[i].src != g_flows[c[0]].src || g_flows[i].dst != g_flows[c[0]].dst ||
+                                g_flows[i].start_ns < g_flows[c[0]].start_ns,
+                            "flows of a connection need the same hosts and later starts");
+            off += g_flows[i].size;
+            g_flows[i].end = off;
+        }
         Ptr<FlowSender> app = CreateObject<FlowSender>();
-        app->Setup(i, InetSocketAddress(hostAddr[g_flows[i].dst], port));
-        hosts.Get(g_flows[i].src)->AddApplication(app);
-        app->SetStartTime(NanoSeconds(g_flows[i].start_ns));
+        app->Setup(c, InetSocketAddress(hostAddr[g_flows[c[0]].dst], port));
+        hosts.Get(g_flows[c[0]].src)->AddApplication(app);
+        app->SetStartTime(NanoSeconds(g_flows[c[0]].start_ns));
+        apps.push_back({app, c});
+    }
+    // message starts, scheduled now (before the applications' starts, which are scheduled when
+    // the nodes initialize), in flow-file order
+    {
+        std::vector<std::pair<uint32_t, std::pair<Ptr<FlowSender>, uint32_t>>> starts;
+        for (auto &a : apps)
+            for (uint32_t k = 1; k < a.second.size(); k++)
+                starts.push_back({a.second[k], {a.first, k}});
+        std::sort(starts.begin(), starts.end(), [](const auto &x, const auto &y) { return x.first < y.first; });
+        for (auto &st : starts)
+            Simulator::Schedule(NanoSeconds(g_flows[st.first].start_ns), &FlowSender::SendMessage, st.second.first,
+                                st.second.second);
     }
 
     if (const char *tr = getenv("TRACE_RX"))

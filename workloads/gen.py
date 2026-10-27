@@ -91,6 +91,10 @@ def main():
                     help="1: at most one flow per (src, dst), so per-pair and per-flow connections coincide")
     ap.add_argument("--align", choices=["mss", "byte"], default="mss",
                     help="flow sizes: MSS multiples, or any byte count (a partial last segment)")
+    ap.add_argument("--peers", type=int, default=0,
+                    help="all-to-all: each host sends to this many fixed random peers (0: any host)")
+    ap.add_argument("--reuse", type=int, default=0,
+                    help="1: the flows of a host pair share one connection (a 5th column, conn)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -158,10 +162,14 @@ def multi(args):
         senders = [h for h in range(n) if rng.random() < args.active]
         for src in senders:
             t = rng.expovariate(rate_per_ns)
+            fixed = rng.sample([h for h in range(n) if h != src], args.peers) if args.peers else None
             while t < args.duration_ns:
                 for _ in range(8):  # retry a few destinations if peer limits are hit
-                    dst = rng.randrange(n - 1)
-                    dst += dst >= src
+                    if fixed:
+                        dst = rng.choice(fixed)
+                    else:
+                        dst = rng.randrange(n - 1)
+                        dst += dst >= src
                     if add(src, dst, flow_size(rng, args), int(t)):
                         break
                 t += rng.expovariate(rate_per_ns)
@@ -177,9 +185,15 @@ def multi(args):
             t += args.incast_period_ns
     rows.sort(key=lambda r: (r[0], r[3]))
     with open(args.out, "w") as f:
-        f.write("src,dst,flow_size,start_ns\n")
-        for r in rows:
-            f.write("%d,%d,%d,%d\n" % r)
+        if args.reuse:
+            # one persistent connection per host pair; its flows are messages in start order
+            f.write("src,dst,flow_size,start_ns,conn\n")
+            for r in rows:
+                f.write("%d,%d,%d,%d,%d\n" % (r + (r[0] * n + r[1],)))
+        else:
+            f.write("src,dst,flow_size,start_ns\n")
+            for r in rows:
+                f.write("%d,%d,%d,%d\n" % r)
 
 
 if __name__ == "__main__":

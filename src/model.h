@@ -31,7 +31,6 @@ constexpr int QDISC_CAP = 200;          // default RED MaxSize (packets); per qu
 constexpr int RED_K = 30;               // default RED MinTh = MaxTh (packets), QW = 1
 constexpr int MAX_ACTIVE = 256;         // active flows per host (as sender and as receiver)
 constexpr int MAX_DUE = 16;             // timers due in one slot on one host
-// out-of-order bitmap per receiver: FlowSoA::ooo_w[f] 32-bit words (32 segments each) beyond rcv_nxt
 constexpr int64_t MIN_RTO_PS = 1000000000; // 1 ms
 constexpr int64_t DELACK_PS = 10000000;    // 10 us
 constexpr int64_t CONN_TIMEOUT_PS = 10000000000; // 10 ms (SYN retransmission)
@@ -45,7 +44,21 @@ constexpr int CHAIN = 2 * CHAIN_RUNS + 2;
 constexpr double DCTCP_G = 0.0625;
 
 // frame kinds (flags)
-constexpr uint8_t F_ACK = 1, F_SYN = 2, F_ECE = 4, F_ECT = 8, F_CE = 16, F_DATA = 32, F_CWR = 64;
+constexpr uint8_t F_ACK = 1, F_SYN = 2, F_ECE = 4, F_ECT = 8, F_CE = 16, F_DATA = 32, F_CWR = 64, F_FIN = 128;
+// TcpTxItem flags
+constexpr uint8_t IT_SACKED = 1, IT_LOST = 2, IT_RETX = 4;
+// closing the sending side (FlowRec::fin): Close() called (m_closeOnEmpty), FIN sent
+// (FIN_WAIT_1), FIN acknowledged (FIN_WAIT_2), the peer's FIN received (TIME_WAIT)
+constexpr uint8_t FIN_CLOSE = 1, FIN_SENT = 2, FIN_ACKED = 4, FIN_TW = 8;
+// the receiving socket (FlowRec::r_st): the PacketSink's sockets have ShutdownSend set, so the
+// peer's FIN closes them at once: CLOSE_WAIT -> LAST_ACK, then CLOSED at the last ACK
+enum : uint8_t
+{
+    R_OPEN = 0,
+    R_LAST_ACK,
+    R_CLOSED
+};
+constexpr int DATA_RETRIES = 6; // TcpSocket::DataRetries
 
 // A frame: 64 bytes.
 //
@@ -74,8 +87,8 @@ enum : uint8_t
 {
     S_IDLE = 0,
     S_SYN_SENT,
-    S_EST,
-    S_DONE
+    S_EST,  // ESTABLISHED and the closing states
+    S_DONE  // every message acknowledged
 };
 enum : uint8_t
 {
@@ -94,29 +107,46 @@ enum : uint8_t
     E_CWR_SENT
 };
 
-// Per-flow state, structure of arrays (index = flow id).
+// Per-connection state, structure of arrays (index = connection id; a connection carries one
+// or more flows, its messages). Sequence numbers are relative to the first data byte.
 // X(type, name, initial value)
 #define NS_FLOW_FIELDS(X)                \
     /* static */                         \
     X(int, src, 0)                       \
     X(int, dst, 0)                       \
-    X(uint32_t, size, 0)                 \
-    X(int64_t, start, 0)                 \
     X(uint32_t, hash_data, 0)            \
     X(uint32_t, hash_ack, 0)             \
+    X(int, m_first, 0)                   /* its messages: m_first .. m_first + m_cnt - 1 */ \
+    X(int, m_cnt, 0)                     \
+    X(uint8_t, fin_on, 0)                /* the application closes after its last message */ \
+    /* application */                    \
+    X(int, m_due, 0)                     /* messages whose start has come */ \
+    X(int, m_wr, 0)                      /* messages written to the socket */ \
+    X(int, m_dn, 0)                      /* messages acknowledged */ \
     /* sender */                         \
     X(uint8_t, st, S_IDLE)               \
     X(uint8_t, cong, C_OPEN)             \
-    X(uint32_t, una, 0)                  \
+    X(uint8_t, fin, 0)                   \
+    X(uint32_t, tail, 0)                 /* TcpTxBuffer::TailSequence: bytes written */ \
+    X(uint32_t, una, 0)                  /* SND.UNA (TcpTxBuffer::HeadSequence) */ \
     X(uint32_t, nxt, 0)                  \
-    X(uint32_t, high, 0)                 \
+    X(uint32_t, high, 0)                 /* m_highTxMark, the end of the sent list */ \
     X(uint32_t, cwnd, INIT_CWND)         \
     X(uint32_t, ssthresh, 0xFFFFFFFFu)   \
     X(uint32_t, dupacks, 0)              \
-    X(uint32_t, sacked, 0)               \
-    X(uint32_t, lost_n, 0)               \
-    X(uint32_t, rtx_n, 0)                \
-    X(uint8_t, head_rx, 0)               \
+    /* TcpTxBuffer: the sent list (items it_head.., it_n of them), byte counters, cursor */ \
+    X(uint32_t, it_head, 0)              \
+    X(uint32_t, it_n, 0)                 \
+    X(uint32_t, sack_b, 0)               /* m_sackedOut */ \
+    X(uint32_t, lost_b, 0)               /* m_lostOut */ \
+    X(uint32_t, rtx_b, 0)                /* m_retrans */ \
+    X(uint32_t, sacked_n, 0)             /* sacked items: Reno emulation sacks items 1, 2, .. */ \
+    X(uint32_t, cand_n, 0)               /* items lost, not retransmitted, not sacked */ \
+    X(uint32_t, cand, 0)                 /* no such item below this index */ \
+    X(uint32_t, hisack, 0)               /* m_highestSack.second */ \
+    X(uint8_t, sack_seen, 0)             /* m_sackSeen */ \
+    X(uint32_t, h_head, 0)               /* RTT history (m_history): entries h_head.., h_n */ \
+    X(uint32_t, h_n, 0)                  \
     X(uint32_t, recover, 0)              \
     X(uint8_t, recover_active, 0)        \
     X(uint8_t, first_partial, 1)         \
@@ -154,16 +184,22 @@ enum : uint8_t
     X(int64_t, rto_at, -1)               \
     X(uint32_t, hist_lo, 0)              \
     X(int64_t, timing_time, 0)           \
-    X(int64_t, syn_at, -1)               \
-    X(int64_t, est, -1)                  \
-    X(int64_t, done, -1)                 \
+    X(int64_t, syn_at, -1)               /* SYN timer, or a pending SendPendingData (Send's TimeStep) */ \
     /* receiver */                       \
     X(uint8_t, r_up, 0)                  \
     X(uint8_t, r_est, 0)                 \
+    X(uint8_t, r_st, R_OPEN)             \
+    X(int64_t, r_fin, -1)                /* TcpRxBuffer m_finSeq (-1: no FIN yet) */ \
+    X(int64_t, r_synack_t, -1)           /* the first SYN-ACK (its RTT history entry) */ \
+    X(int64_t, r_srtt, -1)               /* the receiving socket's RTT estimator */ \
+    X(int64_t, r_rttvar, 0)              \
+    X(int64_t, r_last_at, -1)            /* LastAckTimeout */ \
+    X(uint8_t, r_last_n, 0)              /* its retries left (m_dataRetrCount) */ \
+    X(int64_t, r_frx_at, -1)             /* the FIN+ACK's own retransmission (SendEmptyPacket) */ \
     X(uint8_t, srv_syn_n, 0)             \
     X(int64_t, srv_syn_at, -1)           \
     X(uint32_t, rcv_nxt, 0)              \
-    X(uint32_t, ooo_n, 0)                \
+    X(uint32_t, ooo_n, 0)                /* out-of-order blocks */ \
     X(uint8_t, delack_count, 0)          \
     X(int64_t, delack_at, -1)            \
     X(uint8_t, ce_state, 0)              \
@@ -196,14 +232,30 @@ struct FlowSoA
 #define NS_PTR(T, n, v) Field<T> n;
     NS_FLOW_FIELDS(NS_PTR)
 #undef NS_PTR
-    uint32_t *ooo_bm; // out-of-order segments (bit per segment, ring of ooo_w[f] words at ooo_off[f])
-    uint16_t *dchain;   // [flows][CHAIN] event-order chain of the delayed-ACK timer
-    uint16_t *rchain;   // [flows][CHAIN] ... of the retransmission (or SYN) timer
-    int64_t *hist_t;    // first-transmission time of segment (ring of hist_n[f] entries at hist_off[f])
-    uint32_t *hist_tag; // segment index + 1 of the entry, 0 = none/retransmitted
-    // per-flow sizes: min(the flow's segments, a cap), so flows shorter than the cap never wrap
-    uint64_t *hist_off, *ooo_off;
-    uint32_t *hist_n, *ooo_w;
+    uint16_t *dchain;   // [conns][CHAIN] event-order chain of the delayed-ACK timer
+    uint16_t *rchain;   // [conns][CHAIN] ... of the retransmission (or SYN) timer
+    uint16_t *schain;   // [conns][CHAIN] ... of a pending SendPendingData (Send's TimeStep)
+    // per-connection rings of cap[f] entries at off[f]: the sent list (item start, flags) and the
+    // RTT history (seq, count with the retransmitted flag in bit 31, time)
+    uint64_t *it_off;
+    uint32_t *it_cap;
+    uint32_t *it_start;
+    uint8_t *it_fl;
+    uint32_t *h_seq, *h_cnt;
+    int64_t *h_t;
+    // out-of-order blocks of the receiver, [start, end), sorted (oo_cap[f] at oo_off[f])
+    uint64_t *oo_off;
+    uint32_t *oo_cap;
+    uint32_t *oo_s, *oo_e;
+};
+
+// Flows as the application sees them: messages written to a connection at their start times.
+struct MsgSoA
+{
+    int *conn;
+    uint32_t *size, *end; // end: offset of its last byte + 1 in the connection's byte stream
+    int64_t *start;       // ps
+    int64_t *est, *done;  // handed to the socket; its last byte acknowledged (ps, -1: not yet)
 };
 
 struct HostSoA
@@ -216,8 +268,8 @@ struct HostSoA
     int *red_k, *qcap;    // [H] the host qdisc's RED threshold and limit
     int *act_snd, *n_snd; // [H][MAX_ACTIVE], flows this host sends
     int *act_rcv, *n_rcv; // [H][MAX_ACTIVE], flows this host receives
-    int *pend_next, *pend_end; // flows by (src, start): next not yet started, end of the host's range
-    int *pend_flow;            // [flows] flow ids sorted by (src, start)
+    int *pend_next, *pend_end; // messages by (src, start): next not yet started, end of the host's range
+    int *pend_msg;             // [messages] message ids sorted by (src, start, id)
     int64_t *wake;             // earliest slot the host must run (no input)
 };
 
@@ -255,7 +307,8 @@ enum : int
 
 struct Sim
 {
-    int k, hk, H, S, L, F; // k: ports per switch (FatTree: its k)
+    int k, hk, H, S, L, F; // k: ports per switch (FatTree: its k); F: connections
+    int M;                 // messages (flows)
     int H1, S1;            // hosts and switches of one world (worlds are disjoint copies)
     int topo;              // TOPO_FATTREE, TOPO_LEAFSPINE
     int leaves, spines, hpl; // leaf-spine: switches 0..leaves-1 are leaves, then the spines
@@ -264,6 +317,8 @@ struct Sim
     // TCP of a host (its world): CC_NEWRENO, CC_DCTCP (ECN), CC_CUBIC
     int ring; // egress FIFO capacity: the largest queue limit + the device queue + 1
     FlowSoA fl;
+    MsgSoA mg;
+    int *mg_first_of_world; // [worlds] the first message of each world (message keys are world-local)
     HostSoA hs;
     PortSoA ps;
     int *host_in_link; // [H]

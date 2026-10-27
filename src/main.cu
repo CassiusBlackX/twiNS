@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -111,7 +112,7 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref)
         {
             __threadfence();
             unsigned int fd = atomicAdd(s.flows_done, 0u);
-            if (fd >= (unsigned int)s.F || t + 1 >= s.max_slots)
+            if (fd >= (unsigned int)s.M || t + 1 >= s.max_slots)
             {
                 *s.finished = 1;
                 *s.finished_host = 1;
@@ -170,6 +171,7 @@ struct FlowIn
 {
     int src, dst;
     int64_t size, start_ns;
+    int64_t conn = -1; // connection id from the file (-1: its own connection)
 };
 
 static std::vector<FlowIn> load_flows(const std::string &path, int H)
@@ -195,6 +197,8 @@ static std::vector<FlowIn> load_flows(const std::string &path, int H)
             out.push_back({(int)v[0], (int)((v[0] + H / 2) % H), v[1], v[2]});
         else if (v.size() == 4)
             out.push_back({(int)v[0], (int)v[1], v[2], v[3]});
+        else if (v.size() == 5)
+            out.push_back({(int)v[0], (int)v[1], v[2], v[3], v[4]});
     }
     return out;
 }
@@ -208,7 +212,7 @@ int main(int argc, char **argv)
     int ooo_segs = 0;   // per-flow caps; 0: default
     int rtt_ring = 0;
     std::string topo = "fattree", worlds_file;
-    int ecn_k = RED_K, queue_pkts = QDISC_CAP;
+    int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0;
     int leaves = 16, spines = 8, hpl = 16;
     int64_t max_slots = 2000000;
     for (int i = 1; i < argc; i++)
@@ -253,6 +257,8 @@ int main(int argc, char **argv)
             spines = std::stoi(val("--spines="));
         else if (a.rfind("--hpl=", 0) == 0)
             hpl = std::stoi(val("--hpl="));
+        else if (a.rfind("--fin=", 0) == 0)
+            fin = std::stoi(val("--fin="));
         else if (a.rfind("--graph_k=", 0) == 0)
             graph_k = std::stoi(val("--graph_k="));
         else
@@ -267,8 +273,9 @@ int main(int argc, char **argv)
     if ((flow_file.empty() && worlds_file.empty()) || bad_topo || (tcp != "dctcp" && tcp != "newreno" && tcp != "cubic"))
     {
         fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N)\n"
-                        "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--ecmp_from=csv]\n"
-                        "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,ecmp_from=..,out=..)\n"
+                        "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--fin=0|1]\n"
+                        "          [--ecmp_from=csv]\n"
+                        "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,ecmp_from=..,out=..)\n"
                         "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
         return 1;
     }
@@ -280,11 +287,12 @@ int main(int argc, char **argv)
         std::string flows, ecmp_from, out;
         uint8_t cc = CC_DCTCP;
         int red_k = RED_K, qcap = QDISC_CAP;
+        int fin = 0;
     };
     auto cc_of = [](const std::string &t) -> int { return t == "dctcp" ? CC_DCTCP : t == "newreno" ? CC_NEWRENO : t == "cubic" ? CC_CUBIC : -1; };
     std::vector<World> worlds;
     if (worlds_file.empty())
-        worlds.push_back({flow_file, ecmp_from, output, (uint8_t)cc_of(tcp), ecn_k, queue_pkts});
+        worlds.push_back({flow_file, ecmp_from, output, (uint8_t)cc_of(tcp), ecn_k, queue_pkts, fin});
     else
     {
         std::ifstream in(worlds_file);
@@ -297,6 +305,7 @@ int main(int argc, char **argv)
             w.cc = (uint8_t)cc_of(tcp);
             w.red_k = ecn_k;
             w.qcap = queue_pkts;
+            w.fin = fin;
             std::stringstream ss(line);
             std::string kv;
             while (std::getline(ss, kv, ','))
@@ -311,6 +320,8 @@ int main(int argc, char **argv)
                     w.red_k = std::stoi(v);
                 else if (key == "queue")
                     w.qcap = std::stoi(v);
+                else if (key == "fin")
+                    w.fin = std::stoi(v);
                 else if (key == "ecmp_from")
                     w.ecmp_from = v;
                 else if (key == "out")
@@ -369,40 +380,125 @@ int main(int argc, char **argv)
     s.max_slots = max_slots;
     const int H = s.H, S = s.S, E = k * hk, H1 = s.H1, S1 = s.S1;
 
-    // ---- flows (sorted by (src, start) for the per-host start queues)
-    std::vector<FlowIn> flows;
-    std::vector<int> wfirst(W + 1);
+    // ---- flows: messages (rows of the flow files) over connections. A connection is a row
+    // without a conn column, or the rows of one conn id (same hosts, later starts, in file order).
+    std::vector<FlowIn> flows; // messages, by world in file order
+    std::vector<int> wfirst(W + 1), cfirst(W + 1);
+    std::vector<int> msg_conn;                     // message -> connection
+    std::vector<std::vector<int>> conn_msgs;       // connection -> messages
     for (int w = 0; w < W; w++)
     {
         wfirst[w] = (int)flows.size();
+        cfirst[w] = (int)conn_msgs.size();
+        std::map<int64_t, int> by_id;
         for (FlowIn f : load_flows(worlds[w].flows, H1))
         {
             f.src += w * H1;
             f.dst += w * H1;
+            int m = (int)flows.size(), c;
+            if (f.conn < 0 || !by_id.count(f.conn))
+            {
+                c = (int)conn_msgs.size();
+                conn_msgs.push_back({});
+                if (f.conn >= 0)
+                    by_id[f.conn] = c;
+            }
+            else
+            {
+                c = by_id[f.conn];
+                const FlowIn &first = flows[conn_msgs[c][0]];
+                if (first.src != f.src || first.dst != f.dst || f.start_ns < flows[conn_msgs[c].back()].start_ns)
+                {
+                    fprintf(stderr, "%s: the flows of connection %lld need the same hosts and later starts\n",
+                            worlds[w].flows.c_str(), (long long)f.conn);
+                    return 1;
+                }
+            }
+            conn_msgs[c].push_back(m);
+            msg_conn.push_back(c);
             flows.push_back(f);
         }
     }
     wfirst[W] = (int)flows.size();
-    int F = (int)flows.size();
+    cfirst[W] = (int)conn_msgs.size();
+    int M = (int)flows.size(), F = (int)conn_msgs.size();
+    s.M = M;
     s.F = F;
-    std::vector<int> order(F);
-    for (int i = 0; i < F; i++)
-        order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return flows[a].src != flows[b].src ? flows[a].src < flows[b].src : flows[a].start_ns < flows[b].start_ns;
-    });
+    // messages renumbered so that each connection's are consecutive (in its order)
+    std::vector<int> mnew(M), mold;
+    for (int c = 0; c < F; c++)
+        for (int m : conn_msgs[c])
+        {
+            mnew[m] = (int)mold.size();
+            mold.push_back(m);
+        }
+    // per-host queues of application events in ns-3's order at equal times: message writes
+    // (scheduled in main) before connection starts (scheduled as the nodes initialize)
+    std::vector<int> order(M);
+    for (int i = 0; i < M; i++)
+        order[i] = mnew[i];
+    auto is_first = [&](int i) { return conn_msgs[msg_conn[i]][0] == i; };
+    {
+        std::vector<int> byold(M);
+        for (int i = 0; i < M; i++)
+            byold[i] = i;
+        std::stable_sort(byold.begin(), byold.end(), [&](int a, int b) {
+            if (flows[a].src != flows[b].src)
+                return flows[a].src < flows[b].src;
+            if (flows[a].start_ns != flows[b].start_ns)
+                return flows[a].start_ns < flows[b].start_ns;
+            bool fa = is_first(a), fb = is_first(b);
+            if (fa != fb)
+                return !fa;
+            return fa ? msg_conn[a] < msg_conn[b] : a < b;
+        });
+        for (int i = 0; i < M; i++)
+            order[i] = mnew[byold[i]];
+    }
     std::vector<int> pend_next(H, 0), pend_end(H, 0);
     {
         int i = 0;
         for (int h = 0; h < H; h++)
         {
             pend_next[h] = i;
-            while (i < F && flows[order[i]].src == h)
+            while (i < M && flows[mold[order[i]]].src == h)
                 i++;
             pend_end[h] = i;
         }
     }
-    // ---- flow state
+    {
+        std::vector<int> conn(M), mfw(W);
+        std::vector<uint32_t> size(M), end(M);
+        std::vector<int64_t> start(M), neg(M, -1);
+        for (int c = 0; c < F; c++)
+        {
+            uint64_t off = 0;
+            for (int m : conn_msgs[c])
+            {
+                off += flows[m].size;
+                if (off >= 0xFFFFFFFFull)
+                {
+                    fprintf(stderr, "connection %d carries 4 GB or more\n", c);
+                    return 1;
+                }
+                int j = mnew[m];
+                conn[j] = c;
+                size[j] = (uint32_t)flows[m].size;
+                end[j] = (uint32_t)off;
+                start[j] = flows[m].start_ns * 1000;
+            }
+        }
+        for (int w = 0; w < W; w++)
+            mfw[w] = wfirst[w] == M ? M : mnew[wfirst[w]];
+        s.mg.conn = dupload(conn);
+        s.mg.size = dupload(size);
+        s.mg.end = dupload(end);
+        s.mg.start = dupload(start);
+        s.mg.est = dupload(neg);
+        s.mg.done = dupload(neg);
+        s.mg_first_of_world = dupload(mfw);
+    }
+    // ---- connection state
     std::vector<FlowRec> recs(F);
     for (auto &r : recs)
     {
@@ -410,16 +506,21 @@ int main(int argc, char **argv)
         NS_FLOW_FIELDS(NS_INIT)
 #undef NS_INIT
     }
+    std::vector<uint64_t> conn_bytes(F, 0);
     {
-        for (int i = 0; i < F; i++)
+        for (int c = 0; c < F; c++)
         {
-            recs[i].src = flows[i].src;
-            recs[i].dst = flows[i].dst;
-            recs[i].size = (uint32_t)flows[i].size;
-            recs[i].start = flows[i].start_ns * 1000;
+            const FlowIn &first = flows[conn_msgs[c][0]];
+            recs[c].src = first.src;
+            recs[c].dst = first.dst;
+            recs[c].m_first = mnew[conn_msgs[c][0]];
+            recs[c].m_cnt = (int)conn_msgs[c].size();
+            recs[c].fin_on = (uint8_t)(worlds[first.src / H1].fin != 0);
+            for (int m : conn_msgs[c])
+                conn_bytes[c] += flows[m].size;
         }
-        // ECMP hashes: from an ns-3 run of the same flows (identical paths), or a hash of the
-        // flow id and direction (statistically equivalent)
+        // ECMP hashes: from an ns-3 run of the same flows (identical paths; a connection's rows
+        // carry its hashes), or a hash of the connection id and direction (statistically equivalent)
         auto mix = [](uint32_t x) {
             x ^= x >> 16;
             x *= 0x7feb352du;
@@ -441,8 +542,8 @@ int main(int argc, char **argv)
             std::ifstream in(ecmp_from);
             std::string line;
             std::getline(in, line);
-            int i = wfirst[w], F = wfirst[w + 1];
-            while (std::getline(in, line) && i < F)
+            int i = wfirst[w], n = wfirst[w + 1];
+            while (std::getline(in, line) && i < n)
             {
                 std::stringstream ss(line);
                 std::string f;
@@ -454,13 +555,16 @@ int main(int argc, char **argv)
                     fprintf(stderr, "%s has no hash columns\n", ecmp_from.c_str());
                     exit(1);
                 }
-                recs[i].hash_data = (uint32_t)std::stoul(v[6]);
-                recs[i].hash_ack = (uint32_t)std::stoul(v[7]);
+                if (is_first(i))
+                {
+                    recs[msg_conn[i]].hash_data = (uint32_t)std::stoul(v[6]);
+                    recs[msg_conn[i]].hash_ack = (uint32_t)std::stoul(v[7]);
+                }
                 i++;
             }
-            if (i != F)
+            if (i != n)
             {
-                fprintf(stderr, "%s: %d rows for %d flows\n", ecmp_from.c_str(), i - wfirst[w], F - wfirst[w]);
+                fprintf(stderr, "%s: %d rows for %d flows\n", ecmp_from.c_str(), i - wfirst[w], n - wfirst[w]);
                 exit(1);
             }
         }
@@ -469,37 +573,42 @@ int main(int argc, char **argv)
 #define NS_BASE(T, n, v) s.fl.n.base = reinterpret_cast<char *>(s.fl.rec) + offsetof(FlowRec, n);
     NS_FLOW_FIELDS(NS_BASE)
 #undef NS_BASE
-    // out-of-order window and RTT history, per flow: min(the flow's segments, a cap). A flow with
-    // at most cap segments cannot overflow either; longer flows overflow only with more than cap
-    // segments in flight (counted as ooo-ovf, rtt-ovf)
+    // per connection: the sent list and the RTT history (one entry per segment in flight; a
+    // connection's segments are at most its bytes / MSS plus one per message), and the receiver's
+    // out-of-order blocks (at most one per two segments), each capped (overflows: rtt-ovf, ooo-ovf)
     if (ooo_segs <= 0)
-        ooo_segs = 65536;
+        ooo_segs = 512;
     if (rtt_ring <= 0)
         rtt_ring = 65536;
     {
-        std::vector<uint64_t> hoff(F), ooff(F);
-        std::vector<uint32_t> hn(F), ow(F);
-        uint64_t ht = 0, ot = 0;
+        std::vector<uint64_t> ioff(F), ooff(F);
+        std::vector<uint32_t> icap(F), ocap(F);
+        uint64_t it = 0, ot = 0;
         for (int i = 0; i < F; i++)
         {
-            uint64_t segs = (recs[i].size + MSS - 1) / MSS + 1;
-            hn[i] = (uint32_t)std::min<uint64_t>(segs, rtt_ring);
-            ow[i] = (uint32_t)((std::min<uint64_t>(segs, ooo_segs) + 31) / 32);
-            hoff[i] = ht;
+            uint64_t segs = (conn_bytes[i] + MSS - 1) / MSS + recs[i].m_cnt + 1;
+            icap[i] = (uint32_t)std::min<uint64_t>(segs, rtt_ring);
+            ocap[i] = (uint32_t)std::min<uint64_t>(segs / 2 + 2, ooo_segs);
+            ioff[i] = it;
             ooff[i] = ot;
-            ht += hn[i];
-            ot += ow[i];
+            it += icap[i];
+            ot += ocap[i];
         }
-        s.fl.hist_off = dupload(hoff);
-        s.fl.hist_n = dupload(hn);
-        s.fl.ooo_off = dupload(ooff);
-        s.fl.ooo_w = dupload(ow);
-        s.fl.hist_t = dalloc<int64_t>(ht);
-        s.fl.hist_tag = dalloc<uint32_t>(ht);
-        s.fl.ooo_bm = dalloc<uint32_t>(ot);
+        s.fl.it_off = dupload(ioff);
+        s.fl.it_cap = dupload(icap);
+        s.fl.oo_off = dupload(ooff);
+        s.fl.oo_cap = dupload(ocap);
+        s.fl.it_start = dalloc<uint32_t>(it);
+        s.fl.it_fl = dalloc<uint8_t>(it);
+        s.fl.h_seq = dalloc<uint32_t>(it);
+        s.fl.h_cnt = dalloc<uint32_t>(it);
+        s.fl.h_t = dalloc<int64_t>(it);
+        s.fl.oo_s = dalloc<uint32_t>(ot);
+        s.fl.oo_e = dalloc<uint32_t>(ot);
     }
     s.fl.dchain = dalloc<uint16_t>((size_t)F * CHAIN);
     s.fl.rchain = dalloc<uint16_t>((size_t)F * CHAIN);
+    s.fl.schain = dalloc<uint16_t>((size_t)F * CHAIN);
     // ---- hosts and ports
     s.ring = 0;
     for (const World &w : worlds)
@@ -516,7 +625,7 @@ int main(int argc, char **argv)
     s.hs.n_rcv = dalloc<int>(H);
     s.hs.pend_next = dupload(pend_next);
     s.hs.pend_end = dupload(pend_end);
-    s.hs.pend_flow = dupload(order);
+    s.hs.pend_msg = dupload(order);
     s.hs.wake = dalloc<int64_t>(H); // 0: every host runs its first slot
     {
         std::vector<uint8_t> cc(H);
@@ -632,7 +741,7 @@ int main(int argc, char **argv)
     CHECK(cudaHostAlloc((void **)&h_finished, sizeof(int), cudaHostAllocMapped));
     *h_finished = 0;
     CHECK(cudaHostGetDevicePointer((void **)&s.finished_host, h_finished, 0));
-    if (F == 0)
+    if (M == 0)
         *h_finished = 1;
     Due *due = dalloc<Due>((size_t)H * MAX_DUE);
     size_t per_sw = (size_t)k * 2 * MAX_TX;
@@ -681,7 +790,7 @@ int main(int argc, char **argv)
     printf("Executed Slots: %lld\n", (long long)slots);
     printf("flows %d completed %u wall %.4f s drops %llu marks %llu retx %llu rto %llu | tx-cap %llu active-ovf %llu ooo-ovf %llu due-ovf %llu"
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu\n",
-           F, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19]);
+           M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19]);
     if (ev[5] || ev[6] || ev[7] || ev[14] || ev[19])
         fprintf(stderr, "warning: a capacity overflowed (active/ooo/due/rtt/ring-ovf); the results may differ from ns-3\n");
 
@@ -716,22 +825,24 @@ int main(int argc, char **argv)
             v[i] = out_rec[i].*member;
         return v;
     };
-    std::vector<int64_t> est = field(&FlowRec::est), done = field(&FlowRec::done);
-    if (fd < (unsigned)F)
+    std::vector<int64_t> est = ddown(s.mg.est, M), done = ddown(s.mg.done, M);
+    if (fd < (unsigned)M)
     {
         auto st = field(&FlowRec::st), cong = field(&FlowRec::cong);
         auto una = field(&FlowRec::una), nxt = field(&FlowRec::nxt), high = field(&FlowRec::high), cwnd = field(&FlowRec::cwnd);
-        auto ssth = field(&FlowRec::ssthresh), rcv = field(&FlowRec::rcv_nxt), dup = field(&FlowRec::dupacks), sk = field(&FlowRec::sacked);
+        auto ssth = field(&FlowRec::ssthresh), rcv = field(&FlowRec::rcv_nxt), dup = field(&FlowRec::dupacks), sk = field(&FlowRec::sacked_n);
         auto rto_at = field(&FlowRec::rto_at);
-        auto rec = field(&FlowRec::recover), size = field(&FlowRec::size);
+        auto tail = field(&FlowRec::tail), items = field(&FlowRec::it_n), rec = field(&FlowRec::recover);
+        auto mdn = field(&FlowRec::m_dn), mcnt = field(&FlowRec::m_cnt);
         auto nsnd = ddown(s.hs.n_snd, H), nrcv = ddown(s.hs.n_rcv, H);
         int shown = 0;
-        for (int i = 0; i < F && shown < 6; i++)
-            if (done[i] < 0)
+        for (int c = 0; c < F && shown < 6; c++)
+            if (mdn[c] < mcnt[c])
             {
-                printf("stuck flow %d %d->%d size %u st %d cong %d una %u nxt %u high %u cwnd %u ssth %u dup %u sacked %u recover %u rto_at %lld rcv_nxt %u | n_snd %d n_rcv %d\n",
-                       i, flows[i].src, flows[i].dst, size[i], st[i], cong[i], una[i], nxt[i], high[i], cwnd[i], ssth[i], dup[i], sk[i],
-                       rec[i], (long long)rto_at[i], rcv[i], nsnd[flows[i].src], nrcv[flows[i].dst]);
+                printf("stuck connection %d %d->%d messages %d/%d tail %u st %d cong %d una %u nxt %u high %u items %u cwnd %u ssth %u dup %u "
+                       "sacked %u recover %u rto_at %lld rcv_nxt %u | n_snd %d n_rcv %d\n",
+                       c, recs[c].src, recs[c].dst, mdn[c], mcnt[c], tail[c], st[c], cong[c], una[c], nxt[c], high[c], items[c], cwnd[c],
+                       ssth[c], dup[c], sk[c], rec[c], (long long)rto_at[c], rcv[c], nsnd[recs[c].src], nrcv[recs[c].dst]);
                 shown++;
             }
     }
@@ -740,8 +851,11 @@ int main(int argc, char **argv)
         std::ofstream o(worlds[w].out);
         o << "src,dst,flow_size,start_ns,established_ns,completed_ns\n";
         for (int i = wfirst[w]; i < wfirst[w + 1]; i++)
+        {
+            int j = mnew[i];
             o << flows[i].src - w * H1 << "," << flows[i].dst - w * H1 << "," << flows[i].size << "," << flows[i].start_ns << ","
-              << (est[i] >= 0 ? est[i] / 1000 : -1) << "," << (done[i] >= 0 ? done[i] / 1000 : -1) << "\n";
+              << (est[j] >= 0 ? est[j] / 1000 : -1) << "," << (done[j] >= 0 ? done[j] / 1000 : -1) << "\n";
+        }
     }
     if (W > 1)
         printf("worlds %d\n", W);

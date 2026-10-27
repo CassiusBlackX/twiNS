@@ -9,5 +9,9 @@ K8="k8_paper k8_fullsync k8_fullexp k8_a2a30 k8_incast16 k8_a2a50s"
     for v in jit jit1 jit2 jit3 jit4; do validation/check_exact.sh "$K8" "$T" $v; done
     # flow sizes that are not MSS multiples
     validation/check_exact.sh "k8_a2a30b k8_a2a50b k8_incastb ls_a2a30b k16_a2a30b" "$T"
+    # persistent connections carrying several flows; with and without FIN
+    R="k8_r30 k8_r50 k8_r40p1 k8_rpc ls_r30 k16_r30"
+    validation/check_exact.sh "$R" "$T"
+    validation/check_exact.sh "$R k8_a2a30 k8_incast16 k8_a2a50s k8_a2a30b" "$T" fin
 } | awk '{split($4, a, "/"); if (a[1] != a[2]) print "MISMATCH", $0; else n++} END {print n " runs identical"}'
 [ "$1" = --no-sweeps ] || validation/check_sweeps.sh

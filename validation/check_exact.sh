@@ -4,7 +4,8 @@
 # usage: validation/check_exact.sh "<workloads>" "<tcps>" [variant] [extra twins args]
 #   workloads: e.g. "k8_paper k8_a2a30" (the k is taken from the name; ls_* = leaf-spine, whose
 #              topology is in data/flows/<w>.csv.topo)
-#   tcps: dctcp newreno cubic; variant: base (default) or jit, jit1, ...
+#   tcps: dctcp newreno cubic; variant: base (default), jit, jit1, ... (start-jittered flow files)
+#   or fin (the base flows, senders closing their connections)
 cd "$(dirname "$0")/.."
 FL=data/flows
 REF=data/ns3/ref
@@ -19,13 +20,20 @@ for w in $1; do
         newreno) T=TcpNewReno ;;
         cubic) T=TcpCubic ;;
         esac
-        if [ "$V" = base ]; then fl=$FL/$w.csv; rf=$REF/${w}_$T.csv; else fl=$FL/${w}_$V.csv; rf=$REF/${w}_${T}_$V.csv; fi
+        X=$EXTRA
+        if [ "$V" = base ]; then
+            fl=$FL/$w.csv; rf=$REF/${w}_$T.csv
+        elif [ "$V" = fin ]; then
+            fl=$FL/$w.csv; rf=$REF/${w}_${T}_fin.csv; X="$X --fin=1" # senders close (FIN)
+        else
+            fl=$FL/${w}_$V.csv; rf=$REF/${w}_${T}_$V.csv
+        fi
         case $w in
         ls_*) topo=$(sed -n 's/^# twins //p' $FL/$w.csv.topo 2>/dev/null) ;;
         *) topo="--k=$(echo $w | sed 's/k\([0-9]*\)_.*/\1/')" ;;
         esac
         out=$OUT/${w}_${t}_$V.csv
-        ./build/twins $topo --flows=$fl --out=$out --tcp=$t --ecmp_from=$rf $EXTRA > /dev/null
+        ./build/twins $topo --flows=$fl --out=$out --tcp=$t --ecmp_from=$rf $X > /dev/null
         paste -d, <(tail -n +2 $rf | cut -d, -f5,6) <(tail -n +2 $out | cut -d, -f5,6) |
             awk -F, -v w=$w -v t=$t -v v=$V '{n++; if ($1 == $3 && $2 == $4) x++} END {printf "%s %s %s: %d/%d flows identical\n", w, t, v, x, n}'
     done
