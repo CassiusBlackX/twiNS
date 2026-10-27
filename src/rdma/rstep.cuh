@@ -1485,8 +1485,10 @@ __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPort
 //  - otherwise lane 0 runs all events in order.
 // Last, the lanes store the ports back together.
 constexpr int SAFE_LANES = 32; // safe slots need a lane per port
-// the LDS int workspace of a switch with K ports (the pool's index lists are in global memory)
-__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)K * K; }
+// the LDS int workspace of a switch with K ports, then LK arrival keys: their times in the slot,
+// egress ports, and two index lists (uint16, uint8, 2 x uint16)
+constexpr int LK = 512;
+__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)K * K + (LK * 7 + 3) / 4; }
 __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
                                             int *shared_int)
 {
@@ -1503,8 +1505,11 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     uint32_t *ing0 = (uint32_t *)(shared_int + 3 * K);   // ing at the slot's start
     int *ocnt = shared_int + 4 * K, *obase = shared_int + 5 * K; // safe: arrivals per egress port
     int *mcur = shared_int + 6 * K;                       // safe: merge cursors [egress][ingress]
-    int *olist = pidx, *onext = pidx + POOL;              // safe: pool indices by egress port, in order;
-                                                          // the next arrival of its ingress with the same egress
+    // safe: per arrival its time in the slot and its egress port; pool indices by egress port, in
+    // order; the next arrival of its ingress with the same egress
+    uint16_t *kts = (uint16_t *)(mcur + K * K), *olist = kts + LK, *onext = olist + LK;
+    int8_t *own = (int8_t *)(onext + LK);
+    (void)pidx;
     for (int p = lane; p < deg; p += lanes)
     {
         SwPortLds &q = w[p];
@@ -1558,13 +1563,18 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 atomicAdd(&abytes[p], (uint32_t)f.p.size);
             // its egress port in a safe slot: the route's, or its own port for a PFC frame (a
             // frame without a route belongs to none)
-            int own = a.out >= 0 ? a.out : (f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? p : -1);
-            if (own >= 0)
-                atomicAdd(&ocnt[own], 1);
+            int ow = a.out >= 0 ? a.out : (f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? p : -1);
+            if (ow >= 0)
+                atomicAdd(&ocnt[ow], 1);
+            if (j < LK)
+            {
+                kts[j] = (uint16_t)(f.ts - t0);
+                own[j] = (int8_t)ow;
+            }
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = pooled && deg <= lanes && deg <= SAFE_LANES && !s.serial;
+    bool safe = pooled && total <= LK && D <= 65535 && deg <= lanes && deg <= SAFE_LANES && !s.serial;
     if (safe)
     {
         const Switch &sw = s.sw[x];
@@ -1589,7 +1599,6 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     {
         // each egress port's arrivals (counted above), merged from the ingress ports in order: lane
         // p links its port's arrivals to the next one with the same egress, then lane o merges
-        auto owner = [&](const ArrLds &a) { return a.out >= 0 ? (int)a.out : (a.p.kind == K_PAUSE || a.p.kind == K_RESUME ? (int)a.in : -1); };
         if (lane < deg)
         {
             int p = lane, b = 0;
@@ -1599,10 +1608,10 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 mcur[o * K + p] = -1;
             for (int k = b + cnt[p] - 1; k >= b; k--)
             {
-                int o = owner(pool[k]);
+                int o = own[k];
                 if (o < 0)
                     continue;
-                onext[k] = mcur[o * K + p];
+                onext[k] = (uint16_t)mcur[o * K + p]; // (-1, the end: 0xFFFF)
                 mcur[o * K + p] = k;
             }
         }
@@ -1627,15 +1636,17 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                         bp = p;
                         continue;
                     }
-                    const ArrLds &A = pool[k], &B = pool[cur[bp]];
-                    if (A.ts != B.ts ? A.ts < B.ts : ({
+                    int kb = cur[bp];
+                    if (kts[k] != kts[kb] ? kts[k] < kts[kb] : ({
+                            const ArrLds &A = pool[k], &B = pool[kb];
                             int r = pcmp(A.ap, B.ap);
                             r ? r < 0 : before(s, A.ts, A.acode, s.msg[A.frame].c, B.ts, B.acode, s.msg[B.frame].c);
                         }))
                         bp = p;
                 }
                 olist[base + n] = cur[bp];
-                cur[bp] = onext[cur[bp]];
+                int nx = onext[cur[bp]];
+                cur[bp] = nx == 0xFFFF ? -1 : nx;
             }
         }
         if (lane < deg)
@@ -1655,7 +1666,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             SwPortLds &me = w[o];
             for (;;)
             {
-                int64_t ta = oi < oe ? pool[olist[oi]].ts : INT64_MAX, tc = me.pt.tc_at;
+                int64_t ta = oi < oe ? t0 + kts[olist[oi]] : INT64_MAX, tc = me.pt.tc_at;
                 bool htc = tc >= 0 && tc < t1;
                 if (ta == INT64_MAX && !htc)
                     break;
