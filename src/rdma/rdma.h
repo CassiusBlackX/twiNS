@@ -123,6 +123,10 @@ struct SndQP
     uint64_t cur_rate;
     double u;
     uint64_t hop[MAX_HOP];
+    // the last tx time computed for this QP: tx_ns(tx_rate, tx_size) = tx_val (a division saved)
+    uint64_t tx_rate;
+    uint32_t tx_size;
+    int64_t tx_val;
 };
 
 struct QPChains

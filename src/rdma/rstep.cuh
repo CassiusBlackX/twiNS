@@ -428,6 +428,19 @@ struct HCtx
 
 __device__ __forceinline__ uint64_t bytes_left(const SndQP &q) { return q.size >= q.snd_nxt ? q.size - q.snd_nxt : 0; }
 
+// tx_ns(rate, bytes) for a QP, remembering the last one (PktSent and ChangeRate ask for the same
+// rate and size in turn)
+__device__ __forceinline__ int64_t qp_tx(SndQP &q, uint64_t rate, uint32_t bytes)
+{
+    if (rate != q.tx_rate || bytes != q.tx_size)
+    {
+        q.tx_rate = rate;
+        q.tx_size = bytes;
+        q.tx_val = tx_ns(rate, bytes);
+    }
+    return q.tx_val;
+}
+
 __device__ __forceinline__ bool win_bound(const Sim &s, const SndQP &q)
 {
     if (q.win == 0)
@@ -543,7 +556,7 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
         h_transmit(c, p);
         // RdmaHw::PktSent, UpdateNextAvail
         q.last_pkt = p.size;
-        q.next_avail = c.now + tx_ns(s.P.rate_bound ? q.rate : q.max_rate, p.size);
+        q.next_avail = c.now + qp_tx(q, s.P.rate_bound ? q.rate : q.max_rate, p.size);
         return;
     }
     int64_t t = INT64_MAX;
@@ -561,7 +574,7 @@ __device__ __forceinline__ void h_dequeue(HCtx &c)
 // RdmaHw::ChangeRate (and QbbNetDevice::UpdateNextAvail)
 __device__ __forceinline__ void change_rate(HCtx &c, SndQP &q, uint64_t new_rate)
 {
-    int64_t st = tx_ns(q.rate, q.last_pkt), nt = tx_ns(new_rate, q.last_pkt);
+    int64_t st = qp_tx(q, q.rate, q.last_pkt), nt = qp_tx(q, new_rate, q.last_pkt);
     q.next_avail = q.next_avail + nt - st;
     if (c.st.ns_at >= 0 && q.next_avail < c.st.ns_at)
         h_schedule_ns(c, q.next_avail < c.now ? c.now : q.next_avail);
@@ -987,11 +1000,14 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         }
     int di = 0;
     uint32_t acode = 0;
+    int64_t ats = 0, sf_t = INT64_MAX;
+    int sf = -1, sf_at = -1;
     const LFrame *af = nullptr;
     bool act = false;
     for (;;)
     {
         // candidates: 0 arrival, 1 TransmitComplete, 2 m_nextSend, 3 a DCQCN timer, 4 a flow start
+        // (the arrival's and the flow start's times are kept between events)
         if (!af)
         {
             if (pooled)
@@ -1000,18 +1016,27 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                 {
                     af = &s.msg[pool[ai].frame];
                     acode = pool[ai].acode;
+                    ats = pool[ai].ts;
                 }
             }
             else
             {
                 af = in.peek(t1);
                 if (af)
+                {
                     acode = arrival_code(s, *af);
+                    ats = af->ts;
+                }
             }
         }
         while (di < nd && due_now(s, due[di]) != due[di].at)
             di++; // cancelled or moved
-        int sf = c.st.next_start < c.st.start_end ? s.start_list[c.st.next_start] : -1;
+        if (sf_at != c.st.next_start)
+        {
+            sf_at = c.st.next_start;
+            sf = sf_at < c.st.start_end ? s.start_list[sf_at] : -1;
+            sf_t = sf >= 0 ? s.fi[sf].start : INT64_MAX;
+        }
         // a candidate's chain is cpush(code(k), chain(k)). The selection keeps only indices: a
         // version that carried a pointer to the best candidate's chain along gave wrong results at
         // -O2 and above (the pointer was stale at a flow start), and right ones at -O1
@@ -1020,11 +1045,11 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             return k == 0 ? af->c : k == 1 ? s.h_tc[h] : k == 2 ? s.h_ns[h] : k == 3 ? due_chain(s, due[di]) : s.fi[sf].start_chain;
         };
         int64_t ct[5];
-        ct[0] = af ? af->ts : INT64_MAX;
+        ct[0] = af ? ats : INT64_MAX;
         ct[1] = c.st.tc_at >= 0 && c.st.tc_at < t1 ? c.st.tc_at : INT64_MAX;
         ct[2] = c.st.ns_at >= 0 && c.st.ns_at < t1 ? c.st.ns_at : INT64_MAX;
         ct[3] = di < nd ? due[di].at : INT64_MAX;
-        ct[4] = sf >= 0 && s.fi[sf].start < t1 ? s.fi[sf].start : INT64_MAX;
+        ct[4] = sf_t < t1 ? sf_t : INT64_MAX;
         int best = -1;
         for (int k = 0; k < 5; k++)
             if (ct[k] != INT64_MAX && (best < 0 || before(s, ct[k], code(k), chain(k), ct[best], code(best), chain(best))))
