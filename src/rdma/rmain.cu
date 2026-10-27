@@ -7,7 +7,7 @@
 //
 // --batch: every line "name topo flows [KEY=VALUE ...]" of the job file is a world of its own
 // (its overrides on top of CONFIG's and the command line's), run side by side with the others;
-// world name's results go to DIR/name.fct. The worlds share the link rate and delay.
+// world name's results go to DIR/name.fct. The worlds share the slot (the shortest link delay).
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
@@ -19,7 +19,8 @@
 // Topologies: TwiNS's ("hosts H", "switches S", "link A B"; --rate and --delay for every link), or
 // SimAI's (gen_Topo_Template.py: "nodes gpus_per_server nvswitches switches links gpu_type", the
 // NVSwitch ids, the switch ids, then "src dst rate delay error_rate" per link). A SimAI topology
-// selects ns-3-alibabacloud's behaviour (Params::simai; reference validation/simai/simai-ref.cc).
+// selects ns-3-alibabacloud's behaviour (Params::simai; reference validation/simai/simai-ref.cc),
+// and gives every link its own rate and delay.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -174,7 +175,10 @@ struct World
     vector<Route> rt;                                         // [S H]
     vector<FlowInfo> fi;
     vector<int> start_list, start_off;
-    int64_t max_slots = 0;
+    vector<uint64_t> lbps;  // [L] per directed link
+    vector<int64_t> ldelay; // [L]
+    vector<PortCfg> pcfg;   // its switches' ports in turn
+    double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
 
 static bool build_world(World &w, const Config &config, const string &topo_file, const string &flow_file, uint64_t bps, int64_t delay)
@@ -234,41 +238,27 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.int_multi = cfg.u32("INT_MULTI", 1);
     P.buffer_size = cfg.u32("BUFFER_SIZE", 16) * 1024 * 1024;
     P.pfc_shift = 3;
-    {
-        // KMAX_MAP n rate k ...: kmin and kmax in KB (ConfigEcn multiplies by 1000)
-        auto lookup = [&](const char *key, double *out) {
-            if (!cfg.has(key))
-                return false;
-            const vector<string> &v = config.at(key);
-            int n = atoi(v[0].c_str());
-            for (int i = 0; i < n; i++)
-                if (strtoull(v[1 + 2 * i].c_str(), 0, 10) == P.bps)
-                {
-                    *out = atof(v[2 + 2 * i].c_str());
-                    return true;
-                }
+    // KMAX_MAP n rate k ...: a port's kmin and kmax in KB (ConfigEcn multiplies by 1000), by its rate
+    auto ecn_lookup = [&](const char *key, uint64_t rate, double *out) {
+        if (!cfg.has(key))
             return false;
-        };
-        double kmin, kmax, pmax;
-        if (!lookup("KMIN_MAP", &kmin) || !lookup("KMAX_MAP", &kmax) || !lookup("PMAX_MAP", &pmax))
-        {
-            fprintf(stderr, "%s: KMIN/KMAX/PMAX_MAP: no entry for %llu bps\n", w.name.c_str(), (unsigned long long)P.bps);
-            return false;
-        }
-        P.kmin = (uint32_t)kmin * 1000;
-        P.kmax = (uint32_t)kmax * 1000;
-        P.pmax = pmax;
-    }
-    if (P.cc == 1 && (P.alpha_int < delay || P.dec_int < delay || P.rp_int < delay))
-    {
-        fprintf(stderr, "%s: DCQCN timer intervals must be at least the link delay\n", w.name.c_str());
+        const vector<string> &v = config.at(key);
+        int n = atoi(v[0].c_str());
+        for (int i = 0; i < n; i++)
+            if (strtoull(v[1 + 2 * i].c_str(), 0, 10) == rate)
+            {
+                *out = atof(v[2 + 2 * i].c_str());
+                return true;
+            }
         return false;
-    }
+    };
     const int global_t = cfg.u32("GLOBAL_T", 1);
 
     // ---- topology
     int &H = w.H, &S = w.S;
     vector<std::pair<int, int>> links;
+    vector<uint64_t> link_rate; // per undirected link
+    vector<int64_t> link_delay;
     {
         std::ifstream f(topo_file);
         if (!f)
@@ -313,14 +303,14 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     fprintf(stderr, "%s: link error rates are not modelled\n", w.name.c_str());
                     return false;
                 }
-                if (lr != bps || ld != delay)
+                if (lr == 0 || ld <= 0)
                 {
-                    fprintf(stderr, "%s: link %d-%d runs at %s, %s; links of different rates or delays are not modelled yet (all must be "
-                                    "the first link's %llu bps, %lld ns)\n",
-                            w.name.c_str(), u, v, r.c_str(), d.c_str(), (unsigned long long)bps, (long long)delay);
+                    fprintf(stderr, "%s: link %d-%d: rate %s, delay %s\n", w.name.c_str(), u, v, r.c_str(), d.c_str());
                     return false;
                 }
                 links.push_back({u, v});
+                link_rate.push_back(lr);
+                link_delay.push_back(ld);
             }
             P.simai = 1;
         }
@@ -336,9 +326,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     f >> a >> b;
                     auto id = [&](const string &y) { return (y[0] == 'h' ? 0 : H) + atoi(y.c_str() + 1); };
                     links.push_back({id(a), id(b)});
+                    link_rate.push_back(bps);
+                    link_delay.push_back(delay);
                 }
             } while (f >> x);
     }
+    P.bps = link_rate.empty() ? bps : link_rate[0];
     P.seq_extra = P.simai ? 4 : 0;
     P.ecn_pcnt = P.simai ? 1025 : 257;
     if (global_t != 1 && !P.simai)
@@ -347,7 +340,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         return false;
     }
     // SimAI.conf stops at 4e13 s: clamp (in double, before the conversion overflows)
-    w.max_slots = (int64_t)std::min(cfg.num("SIMULATOR_STOP_TIME", P.simai ? 3.01 : 10.0) * 1e9 / (double)delay, 1e15);
+    w.stop_ns = cfg.num("SIMULATOR_STOP_TIME", P.simai ? 3.01 : 10.0) * 1e9;
     int N = w.N = H + S, L = w.L = 2 * (int)links.size();
     vector<int> &deg = w.deg;
     deg.assign(N, 0);
@@ -372,6 +365,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     w.in_link.assign((size_t)N * K, -1);
     w.link_dst.assign(L, 0);
     w.link_dport.assign(L, 0);
+    w.lbps.assign(L, 0);
+    w.ldelay.assign(L, 0);
     vector<std::map<int, int>> nbr(N); // neighbour -> port (ns-3's nbr2if: by node id, the last link wins)
     {
         vector<int> d(N, 0);
@@ -384,6 +379,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             w.in_link[(size_t)b * K + pb] = 2 * i;
             w.link_dst[2 * i] = b, w.link_dport[2 * i] = pb;
             w.link_dst[2 * i + 1] = a, w.link_dport[2 * i + 1] = pa;
+            w.lbps[2 * i] = w.lbps[2 * i + 1] = link_rate[i];
+            w.ldelay[2 * i] = w.ldelay[2 * i + 1] = link_delay[i];
             nbr[a][b] = pa;
             nbr[b][a] = pb;
         }
@@ -391,10 +388,15 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     // routes (CalculateRoute: BFS from each host over switches, neighbours by id)
     vector<vector<vector<int>>> next_hop(S, vector<vector<int>>(H)); // [switch][host] -> next nodes
     vector<vector<int64_t>> hop_n(N, vector<int64_t>(H, -1));         // links from node to host
+    // CalculateRoute's sums along the path that first reaches a node: pairDelay, pairTxDelay
+    // (one MTU frame per hop) and pairBw (the slowest link), from host i to host h at [i][h]
+    vector<vector<uint64_t>> pdelay(H, vector<uint64_t>(H, 0)), ptx(H, vector<uint64_t>(H, 0)), pbw(H, vector<uint64_t>(H, 0));
     for (int h = 0; h < H; h++)
     {
         vector<int> q = {h}, dis(N, -1);
+        vector<uint64_t> dl(N, 0), txd(N, 0), bw(N, 0);
         dis[h] = 0;
+        bw[h] = ~0ull;
         for (size_t i = 0; i < q.size(); i++)
         {
             int now = q[i], d = dis[now];
@@ -403,7 +405,11 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 int next = e.first;
                 if (dis[next] < 0)
                 {
+                    int l = w.out_link[(size_t)now * K + e.second];
                     dis[next] = d + 1;
+                    dl[next] = dl[now] + (uint64_t)w.ldelay[l];
+                    txd[next] = txd[now] + (uint64_t)P.mtu * 1000000000ull * 8 / w.lbps[l];
+                    bw[next] = std::min(bw[now], w.lbps[l]);
                     if (next >= H)
                         q.push_back(next);
                 }
@@ -413,6 +419,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         }
         for (int n = 0; n < N; n++)
             hop_n[n][h] = dis[n];
+        for (int i = 0; i < H; i++)
+            pdelay[i][h] = dl[i], ptx[i][h] = txd[i], pbw[i][h] = bw[i];
     }
     w.rt.assign((size_t)S * H, Route{});
     for (int x = 0; x < S; x++)
@@ -429,8 +437,10 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             for (int i = 0; i < r.n; i++)
                 r.port[i] = nbr[H + x][next_hop[x][h][i]];
         }
-    // maxRtt, maxBdp: delay * 2 + txDelay over host pairs (uniform links)
+    // maxRtt, maxBdp: delay * 2 + txDelay, and its product with the bandwidth, over host pairs
     uint64_t max_rtt = 0, max_bdp = 0;
+    auto pair_rtt = [&](int a, int b) { return pdelay[a][b] * 2 + ptx[a][b]; };
+    auto pair_bdp = [&](int a, int b) { return pair_rtt(a, b) * pbw[a][b] / 1000000000ull / 8; };
     {
         int64_t far = 0;
         for (int i = 0; i < H; i++)
@@ -442,18 +452,47 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             fprintf(stderr, "%s: HPCC: paths of %lld switches (INT records at most %d)\n", w.name.c_str(), (long long)(far - 1), MAX_HOP);
             return false;
         }
-        uint64_t per_hop_tx = (uint64_t)P.mtu * 1000000000ull * 8 / P.bps;
-        max_rtt = (uint64_t)far * (uint64_t)delay * 2 + (uint64_t)far * per_hop_tx;
-        max_bdp = max_rtt * P.bps / 1000000000ull / 8;
+        for (int i = 0; i < H; i++)
+            for (int j = 0; j < H; j++)
+            {
+                max_rtt = std::max<uint64_t>(max_rtt, pair_rtt(i, j));
+                max_bdp = std::max<uint64_t>(max_bdp, pair_bdp(i, j));
+            }
     }
     P.base_rtt = max_rtt;
     const int has_win = cfg.u32("HAS_WIN", 1);
     P.win = has_win ? (uint32_t)max_bdp : 0;
-    // a pair's RTT and BDP (GLOBAL_T 0): delay * 2 + txDelay over its path, uniform links
-    auto pair_rtt = [&](int a, int b) {
-        uint64_t hops = (uint64_t)hop_n[a][b];
-        return hops * (uint64_t)delay * 2 + hops * ((uint64_t)P.mtu * 1000000000ull * 8 / P.bps);
-    };
+
+    // ---- switch ports: headroom, pfc_a_shift (from 3, one less per halving of the rate above the
+    // NIC rate, which is host 0's first link's), ECN thresholds by rate
+    {
+        uint64_t nic_rate = w.lbps[w.out_link[0]];
+        for (int x = 0; x < S; x++)
+            for (int p = 0; p < deg[H + x]; p++)
+            {
+                int l = w.out_link[(size_t)(H + x) * K + p];
+                PortCfg pc = {};
+                uint64_t r = w.lbps[l];
+                pc.bps = r;
+                pc.hdrm_cap = (uint32_t)(r * (uint64_t)w.ldelay[l] / 8 / 1000000000ull * 3);
+                pc.shift = 3;
+                while (r > nic_rate && pc.shift > 0)
+                {
+                    pc.shift--;
+                    r /= 2;
+                }
+                double kmin, kmax, pmax;
+                if (!ecn_lookup("KMIN_MAP", pc.bps, &kmin) || !ecn_lookup("KMAX_MAP", pc.bps, &kmax) || !ecn_lookup("PMAX_MAP", pc.bps, &pmax))
+                {
+                    fprintf(stderr, "%s: KMIN/KMAX/PMAX_MAP: no entry for %llu bps\n", w.name.c_str(), (unsigned long long)pc.bps);
+                    return false;
+                }
+                pc.kmin = (uint32_t)kmin * 1000;
+                pc.kmax = (uint32_t)kmax * 1000;
+                pc.pmax = pmax;
+                w.pcfg.push_back(pc);
+            }
+    }
 
     // ---- flows (rows in start order, stable; per host pair ports from 10000)
     vector<FlowInfo> &fi = w.fi;
@@ -489,9 +528,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             x.win = P.win, x.base_rtt = P.base_rtt;
         else
         {
-            uint64_t rtt = pair_rtt(x.src, x.dst);
-            x.win = has_win ? (uint32_t)(rtt * P.bps / 1000000000ull / 8) : 0;
-            x.base_rtt = rtt;
+            x.win = has_win ? (uint32_t)pair_bdp(x.src, x.dst) : 0;
+            x.base_rtt = pair_rtt(x.src, x.dst);
         }
     }
     vector<int> order(F);
@@ -682,6 +720,22 @@ int main(int argc, char **argv)
         }
     }
     const int W = worlds.size();
+    // the slot: the shortest link delay of all worlds
+    int64_t D = INT64_MAX;
+    for (auto &w : worlds)
+        for (int64_t d : w.ldelay)
+            D = std::min(D, d);
+    for (auto &w : worlds)
+    {
+        w.P.delay = D;
+        if (w.P.cc == 1 && (w.P.alpha_int < D || w.P.dec_int < D || w.P.rp_int < D))
+        {
+            fprintf(stderr, "%s: DCQCN timer intervals must be at least the slot (the shortest link delay, %lld ns)\n", w.name.c_str(),
+                    (long long)D);
+            return 1;
+        }
+    }
+    delay = D;
 
     // ---- the worlds side by side: hosts of all worlds, then switches; links and flows in turn
     int H = 0, S = 0, L = 0, F = 0, K = 1;
@@ -706,7 +760,7 @@ int main(int argc, char **argv)
     {
         World &w = worlds[wi];
         Pw[wi] = w.P;
-        max_slots = std::max(max_slots, w.max_slots);
+        max_slots = std::max(max_slots, (int64_t)std::min(w.stop_ns / (double)D, 1e15));
         for (int n = 0; n < w.N; n++)
         {
             int g = gnode(wi, n);
@@ -811,14 +865,19 @@ int main(int argc, char **argv)
     {
         vector<Switch> sw(S);
         vector<Port> ps(nports);
-        uint32_t headroom = (uint32_t)(P.bps * (uint64_t)delay / 8 / 1000000000ull * 3);
+        vector<PortCfg> pc;
+        for (auto &w : worlds)
+            pc.insert(pc.end(), w.pcfg.begin(), w.pcfg.end());
         for (int x = 0; x < S; x++)
         {
             int n = deg[H + x];
             uint32_t node = si[x].seed; // the switch's node id in its world
             sw[x] = Switch{};
-            sw[x].headroom = headroom;
-            sw[x].total_hdrm = headroom * n;
+            for (int p = 0; p < n; p++)
+            {
+                sw[x].total_hdrm += pc[pbase[x] + p].hdrm_cap;
+                sw[x].max_shift = std::max(sw[x].max_shift, pc[pbase[x] + p].shift);
+            }
             sw[x].total_rsrv = RESERVE * n;
             for (int p = 0; p < n; p++)
             {
@@ -831,17 +890,61 @@ int main(int argc, char **argv)
         }
         s.sw = dev_copy(sw);
         s.ps = dev_copy(ps);
+        s.pc = dev_copy(pc);
     }
     s.p_tc = dev_alloc<Chain>(nports);
     s.q0_cap = 64;
     s.q3_cap = q3cap;
     s.q0 = dev_alloc<Pkt>((size_t)nports * s.q0_cap);
     s.q3 = dev_alloc<Pkt>((size_t)nports * s.q3_cap);
-    s.msg = dev_alloc<LFrame>((size_t)NB * L * MAXF);
+    // links: rate classes (tx tables), and the rings of arrival slots. A frame starting in slot k
+    // arrives by (k + 1) D - 1 + its tx time + the delay, so at most 1 + (txmax + delay - 1) / D
+    // slots later; a slot's bucket holds the frames that can arrive in D at one per shortest frame
+    vector<uint64_t> rates;
+    vector<LinkInfo> li(L);
+    size_t nframes = 0, ncnt = 0;
+    int pend_n = 2;
     {
-        vector<long long> mc((size_t)NB * L, -(1ll << 16));
+        uint32_t mtu = 0;
+        for (auto &w : worlds)
+            mtu = std::max(mtu, w.P.mtu);
+        for (int wi = 0; wi < W; wi++)
+            for (int l = 0; l < worlds[wi].L; l++)
+            {
+                LinkInfo &x = li[lbase[wi] + l];
+                x.delay = worlds[wi].ldelay[l];
+                x.bps = worlds[wi].lbps[l];
+                size_t r = std::find(rates.begin(), rates.end(), x.bps) - rates.begin();
+                if (r == rates.size())
+                    rates.push_back(x.bps);
+                x.rc = (uint32_t)r;
+                int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = std::max<int64_t>(1, tx_ns(P.simai, x.bps, PFC_SIZE));
+                int64_t nb = 2 + (txmax + x.delay - 1) / D;
+                int64_t cap = std::min<int64_t>(MAXF, D / txmin + 1);
+                if (nb > 4096)
+                {
+                    fprintf(stderr, "a link's delay (%lld ns) is too long for the slot (%lld ns)\n", (long long)x.delay, (long long)D);
+                    return 1;
+                }
+                x.nb = (uint16_t)nb;
+                x.cap = (uint16_t)cap;
+                x.moff = nframes;
+                x.coff = (uint32_t)ncnt;
+                nframes += (size_t)nb * cap;
+                ncnt += nb;
+                pend_n = std::max(pend_n, (int)nb);
+            }
+    }
+    s.li = dev_copy(li);
+    s.msg = dev_alloc<LFrame>(nframes);
+    {
+        vector<long long> mc(ncnt, -(1ll << 16));
         s.msg_cnt = dev_copy(mc);
     }
+    s.pend_n = pend_n;
+    s.pend = dev_alloc<unsigned int>(pend_n);
+    if (W == 1 && rates.size() > 1)
+        printf("slot %lld ns, %zu link rates, %.1f MB of link buffers\n", (long long)D, rates.size(), nframes * sizeof(LFrame) / 1e6);
     s.slot = dev_alloc<int64_t>(1);
     s.done_blocks = dev_alloc<unsigned int>(1);
     s.flows_done = dev_alloc<unsigned int>(1);
@@ -875,10 +978,13 @@ int main(int argc, char **argv)
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
     }
     {
-        vector<int32_t> txt(TXT_N);
-        for (int b = 0; b < TXT_N; b++)
-            txt[b] = (int32_t)tx_ns(P.simai, P.bps, b);
+        vector<int32_t> txt(rates.size() * TXT_N);
+        for (size_t r = 0; r < rates.size(); r++)
+            for (int b = 0; b < TXT_N; b++)
+                txt[r * TXT_N + b] = (int32_t)tx_ns(P.simai, rates[r], b);
         CK(hipMemcpyToSymbol(HIP_SYMBOL(c_txt), txt.data(), sizeof(int32_t) * TXT_N));
+        s.txt = dev_copy(txt);
+        s.R = rates.size();
     }
     // a block (one wave) per host and per switch; a switch keeps its ports in LDS
     s.spread = spread;

@@ -7,12 +7,12 @@ cd "$(dirname "$0")/../.."
 REF=${REF:-out/rdma/ref}
 BIN=${BIN:-build/twins-rdma}
 CFG=${CFG:-validation/hpcc/hpcc.cfg}
-OUT=out/rdma/batch
+OUT=${OUT:-out/rdma/batch}
 mkdir -p $OUT
 jobs=$1
 shift
 grep -v "^#" "$jobs" | cut -d" " -f1 | grep -v "^$" | while read -r n; do rm -f $OUT/$n.fct; done
-$BIN $CFG --batch="$jobs" --outdir=$OUT --path=data/rdma:data/topo:data/flows "$@" > $OUT/batch.log 2>&1
+$BIN $CFG --batch="$jobs" --outdir=$OUT --path=${DATA:-data/rdma:data/topo:data/flows} "$@" > $OUT/batch.log 2>&1
 rc=$?
 tail -3 $OUT/batch.log
 ok=0

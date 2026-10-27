@@ -99,5 +99,16 @@ topologies to SimAI's format.
 | job file | runs | contents | identical |
 |---|---|---|---|
 | `jobs_net1.txt` | 13 | FatTree k=4 and k=8 in SimAI's format, uniform links (100 Gb/s at 1 µs, 400 Gb/s at 500 ns); SimAI.conf (MTU 9000, DCQCN, `GLOBAL_T 0`) and variants: MTU 1000, HPCC, `GLOBAL_T 1`, 1–2 MB buffers (up to 2456 pauses) | all |
+| `jobs_net2.txt` | 15 | FatTree k=4 and k=8 with host links and switch links of different rates (25–400 Gb/s) and delays (100 ns–2 µs, up to 20× apart); DCQCN and HPCC, 1–2 MB buffers | all |
 
-Not modelled yet: links of different rates or delays, NVSwitches, GPUs with two ports, NVLS.
+The 28 runs also give identical results as one batch (`check_batch.sh` with `REF=out/simai/ref
+CFG=validation/simai/SimAI.conf OUT=out/simai/batch DATA=data/simai:data/rdma:data/topo:data/flows`).
+
+**Links of different delays.** The slot is the shortest link delay (of all worlds of a batch).
+- Each link files its frames under the slot they arrive in: a ring of buckets, deep enough for its
+  delay plus its longest frame (`LinkInfo`).
+- Each switch port has its own headroom, `pfc_a_shift` and ECN thresholds (`PortCfg`), as
+  `SetupNetwork` configures them.
+- Pair RTTs, BDPs and bandwidths follow `CalculateRoute`'s path sums.
+
+Not modelled yet: NVSwitches, GPUs with two ports, NVLS.

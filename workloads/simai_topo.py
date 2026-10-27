@@ -4,13 +4,15 @@
 then "src dst rate delay error_rate" per link, in the same order. Hosts keep ids 0..H-1 and
 switches H..H+S-1, so flow files carry over unchanged.
 
-usage: simai_topo.py TOPO RATE DELAY > OUT     (e.g. fattree8.txt 100Gbps 1000ns)
+usage: simai_topo.py TOPO RATE DELAY [SWRATE SWDELAY] > OUT   (e.g. fattree8.txt 100Gbps 1000ns)
+  RATE, DELAY: host links (and all links); SWRATE, SWDELAY: links between switches
 """
 import sys
 
 
 def main():
     path, rate, delay = sys.argv[1:4]
+    swrate, swdelay = (sys.argv[4], sys.argv[5]) if len(sys.argv) > 5 else (rate, delay)
     H = S = 0
     links = []
     with open(path) as f:
@@ -36,7 +38,8 @@ def main():
     print(H + S, 1, 0, S, len(links), "H100")
     print(" ".join(str(H + j) for j in range(S)))
     for a, b in links:
-        print(nid(a), nid(b), rate, delay, 0)
+        sw = a[0] != "h" and b[0] != "h"
+        print(nid(a), nid(b), swrate if sw else rate, swdelay if sw else delay, 0)
 
 
 if __name__ == "__main__":

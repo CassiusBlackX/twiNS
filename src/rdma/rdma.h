@@ -6,11 +6,12 @@
 // The network: hosts with one RDMA NIC each (queue pairs paced by rate, a window, go-back-N with
 // NACKs, ACKs in a high-priority queue), switches with a shared-buffer MMU (PFC with dynamic
 // thresholds and headroom, ECN marking at dequeue), PFC pause/resume, and congestion control
-// DCQCN (Mellanox's version, CC_MODE 1) or HPCC (INT, CC_MODE 3). All links run at one rate and
-// delay. Times are nanoseconds (ns-3.17's resolution).
+// DCQCN (Mellanox's version, CC_MODE 1) or HPCC (INT, CC_MODE 3). Links have their own rates and
+// delays. Times are nanoseconds (ns-3's resolution).
 //
-// Execution model (as TwiNS's TCP model): slots of the link delay D, the lookahead. A frame that
-// starts in slot s arrives no earlier than slot s + 1. In a slot each host and each switch
+// Execution model (as TwiNS's TCP model): slots of the shortest link delay D, the lookahead. A frame
+// that starts in slot s arrives no earlier than slot s + 1; its link files it under the slot it
+// arrives in (see LinkInfo). In a slot each host and each switch
 // processes its own events in ns-3's order: by time, and simultaneous events by their chains (see
 // Chain). A switch is processed by one thread, all its ports together, since its MMU couples them.
 #ifndef TWINS_RDMA_H
@@ -27,8 +28,7 @@ namespace rdma
 #define TWINS_RDMA_RUNS 6
 #endif
 constexpr int RUNS = TWINS_RDMA_RUNS; // chain runs kept
-constexpr int MAXF = 256;    // frames a link can start in one slot
-constexpr int NB = 3;        // message ring: slot s is written, slots s - 1 and s - 2 read
+constexpr int MAXF = 256;    // frames a link can deliver in one slot, at most
 constexpr int MAX_HOP = 5;   // IntHeader::maxHop
 constexpr int PG = 3;        // the data priority (flows' pg), RdmaEgressQueue::ack_q_idx
 constexpr uint32_t RESERVE = 4 * 1024, RESUME_OFFSET = 3 * 1024; // SwitchMmu
@@ -192,7 +192,31 @@ struct Switch
 {
     uint32_t shared_used; // SwitchMmu::shared_used_bytes
     uint32_t total_hdrm, total_rsrv;
-    uint32_t headroom;    // per port (uniform links)
+    uint32_t max_shift;   // the largest pfc_a_shift of its ports (the lowest PFC threshold)
+};
+
+// a switch port's configuration: its link's rate, SwitchMmu's headroom, pfc_a_shift and ECN
+// thresholds (by the rate: KMIN_MAP, KMAX_MAP, PMAX_MAP)
+struct PortCfg
+{
+    uint64_t bps;
+    uint32_t hdrm_cap, shift;
+    uint32_t kmin, kmax;  // bytes
+    double pmax;
+};
+
+// A directed link. Its frames are filed by the slot they arrive in: bucket a % nb of its ring
+// holds those arriving in slot a (s.msg[moff + bucket * cap ..], s.msg_cnt[coff + bucket] = a << 16
+// | frames). Its sender writes bucket a during slots before a, its receiver reads it in slot a; nb
+// exceeds the most slots a frame can take, so a bucket is never written while it is read.
+struct LinkInfo
+{
+    int64_t delay;  // ns
+    uint64_t bps;
+    uint64_t moff;
+    uint32_t coff;
+    uint16_t nb, cap;
+    uint32_t rc;    // its rate's tx table
 };
 
 struct Params
@@ -203,8 +227,8 @@ struct Params
     uint32_t ack_interval; // L2_ACK_INTERVAL
     uint32_t chunk;       // L2_CHUNK_SIZE
     int64_t nack_interval; // ns
-    uint64_t bps;         // link rate
-    int64_t delay;        // link delay, ns
+    uint64_t bps;         // the first link's rate (uniform links: every link's)
+    int64_t delay;        // the slot: the shortest link delay of all worlds, ns
     uint32_t win;         // maxBdp (HAS_WIN, GLOBAL_T)
     uint64_t base_rtt;    // maxRtt
     // SimAI's ns-3-alibabacloud (ns-3.36) instead of the HPCC fork: 64-bit sequence numbers (4 more
@@ -243,8 +267,8 @@ struct SwInfo
 };
 
 // Worlds are independent networks run side by side (a batch): their hosts come first, then their
-// switches, links and flows, in world order. They share the link rate and delay (P.bps, P.delay:
-// the slot); everything else is per world (Pw).
+// switches, links and flows, in world order. They share the slot (P.delay, the shortest link delay)
+// and the tx rule (P.simai); everything else is per world (Pw) or per link and port.
 struct Sim
 {
     int H, S, N, L, K; // hosts, switches, nodes (hosts first), directed links, max ports per node
@@ -273,6 +297,7 @@ struct Sim
     int qps_cap;
     // switches
     Switch *sw;
+    const PortCfg *pc;  // [ports]
     // switch x's ports are pbase[x] .. pbase[x] + deg - 1 of the per-port arrays
     const int *pbase;
     Port *ps;           // [ports]
@@ -282,8 +307,13 @@ struct Sim
     int *aidx;          // [S][2 POOL] their order per egress port (safe slots)
     int q0_cap, q3_cap;
     // links
-    LFrame *msg;        // [NB][L][MAXF]
-    long long *msg_cnt; // [NB][L] slot << 16 | frames
+    const LinkInfo *li; // [L]
+    LFrame *msg;        // per link [nb][cap]
+    long long *msg_cnt; // per link [nb]: slot << 16 | frames
+    const int32_t *txt; // [R][TXT_N] tx times by rate class (c_txt holds class 0)
+    int R;
+    unsigned int *pend; // [pend_n] a frame arrives in slot a: pend[a % pend_n] != 0 (idle skipping)
+    int pend_n;
     // run control
     int64_t *slot;
     unsigned int *done_blocks;
@@ -320,11 +350,13 @@ struct TxRec
     uint8_t kind, ecn;
 };
 
-__host__ __device__ inline int64_t mi(const Sim &s, int64_t slot, int link) { return ((slot % NB + NB) % NB) * s.L + link; }
-
-__host__ __device__ inline int msg_count(const Sim &s, int64_t slot, int link)
+// a link's frames arriving in a slot: their count, and the index of the first in s.msg
+__host__ __device__ inline int bucket(const Sim &s, int link, int64_t slot, uint32_t *base)
 {
-    long long v = s.msg_cnt[mi(s, slot, link)];
+    const LinkInfo &l = s.li[link];
+    int b = (int)(slot % l.nb);
+    long long v = s.msg_cnt[l.coff + b];
+    *base = (uint32_t)(l.moff + (uint64_t)b * l.cap);
     return (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;
 }
 

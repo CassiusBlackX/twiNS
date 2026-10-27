@@ -27,10 +27,63 @@ __host__ __device__ __forceinline__ int64_t tx_ns(uint64_t bps, uint32_t bytes) 
 __host__ __device__ __forceinline__ int64_t tx_ns36(uint64_t bps, uint32_t bytes) { return (int64_t)((uint64_t)bytes * 8000000000ull / bps); }
 __host__ __device__ __forceinline__ int64_t tx_ns(int simai, uint64_t bps, uint32_t bytes) { return simai ? tx_ns36(bps, bytes) : tx_ns(bps, bytes); }
 
-// tx_ns(link rate, bytes) for frames below TXT_N bytes (main fills it)
+// tx_ns(a link's rate, bytes) for frames below TXT_N bytes: c_txt for rate class 0 (the only one
+// with uniform links), s.txt for all (main fills them)
 constexpr int TXT_N = 9216;
 __constant__ int32_t c_txt[TXT_N];
-__device__ __forceinline__ int64_t link_tx(const Sim &s, uint32_t bytes) { return bytes < TXT_N ? c_txt[bytes] : tx_ns(s.P.simai, s.P.bps, bytes); }
+__device__ __forceinline__ int64_t link_tx(const Sim &s, int link, uint32_t bytes)
+{
+    if (s.R == 1 && bytes < TXT_N)
+        return c_txt[bytes];
+    const LinkInfo &l = s.li[link];
+    if (bytes >= TXT_N)
+        return tx_ns(s.P.simai, l.bps, bytes);
+    return s.txt[(size_t)l.rc * TXT_N + bytes];
+}
+
+// A sender's place in a link's ring: the bucket it fills (a link's frames arrive in order, so its
+// buckets follow one another) and the frames in it. The count goes to s.msg_cnt when the sender
+// moves on to the next bucket and at the end of its slot (flush).
+struct OutBucket
+{
+    int64_t lo, hi; // its slot's times (hi = 0: none)
+    uint32_t base;  // its first frame in s.msg
+    uint32_t cnt;   // its count in s.msg_cnt
+    uint16_t n, cap;
+};
+__device__ __forceinline__ void link_flush(const Sim &s, OutBucket &o)
+{
+    if (o.hi == 0)
+        return;
+    s.msg_cnt[o.cnt] = (long long)(o.lo / s.P.delay) << 16 | o.n;
+    o.hi = 0;
+}
+// a frame for a link, arriving at ts: a place in the bucket of its arrival slot (null: the bucket
+// is full, counted as an overflow)
+__device__ __forceinline__ LFrame *link_push(const Sim &s, int link, int64_t ts, OutBucket &o)
+{
+    if (ts >= o.hi)
+    {
+        link_flush(s, o);
+        const LinkInfo &l = s.li[link];
+        int64_t a = ts / s.P.delay;
+        int b = (int)(a % l.nb);
+        o.cnt = l.coff + b;
+        long long v = s.msg_cnt[o.cnt];
+        o.lo = a * s.P.delay;
+        o.hi = o.lo + s.P.delay;
+        o.base = (uint32_t)(l.moff + (uint64_t)b * l.cap);
+        o.cap = l.cap;
+        o.n = (v >> 16) == a ? (uint16_t)(v & 0xFFFF) : 0;
+        s.pend[a % s.pend_n] = 1;
+    }
+    if (o.n >= o.cap)
+    {
+        atomicAdd(&s.ev[4], 1ull);
+        return nullptr;
+    }
+    return s.msg + o.base + o.n++;
+}
 
 // DataRate(d) from a double (DataRate(uint64_t), truncation)
 __device__ __forceinline__ uint64_t rate_of(double d) { return (uint64_t)d; }
@@ -386,33 +439,28 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
     }
 }
 
-// a link's frames arriving in [t0, t1): those of slot - 2 from t0 on, then those of slot - 1 before t1
+// a link's frames arriving in the slot, in order
 struct Arrivals
 {
-    const LFrame *a, *b;
-    int na, nb, i;
-    __device__ void init(const Sim &s, int link, int64_t slot, int64_t t0)
+    const LFrame *a;
+    int na, i;
+    __device__ void init(const Sim &s, int link, int64_t slot)
     {
-        a = s.msg + mi(s, slot - 2, link) * MAXF;
-        b = s.msg + mi(s, slot - 1, link) * MAXF;
-        na = slot >= 2 ? msg_count(s, slot - 2, link) : 0;
-        nb = slot >= 1 ? msg_count(s, slot - 1, link) : 0;
+        uint32_t base;
+        na = bucket(s, link, slot, &base);
+        a = s.msg + base;
         i = 0;
-        while (i < na && a[i].ts < t0)
-            i++;
     }
-    __device__ const LFrame *peek(int64_t t1) const
-    {
-        if (i < na)
-            return &a[i];
-        int j = i - na;
-        return j < nb && b[j].ts < t1 ? &b[j] : nullptr;
-    }
+    __device__ const LFrame *peek() const { return i < na ? &a[i] : nullptr; }
     __device__ void pop() { i++; }
 };
 
-// a frame's arrival: [lead tx + D, its ordinal] + the chain of its start
-__device__ __forceinline__ uint32_t arrival_code(const Sim &s, const LFrame &f) { return ccode(link_tx(s, f.p.size) + s.P.delay, f.p.ord); }
+// a frame's arrival over a link of the given delay: [lead tx + delay, its ordinal] + the chain of
+// its start
+__device__ __forceinline__ uint32_t arrival_code(const Sim &s, int link, int64_t delay, const LFrame &f)
+{
+    return ccode(link_tx(s, link, f.p.size) + delay, f.p.ord);
+}
 
 // ------------------------------------------------------------------ host: the NIC
 struct HCtx
@@ -428,7 +476,9 @@ struct HCtx
     Chain cur; // the running event's chain
     int ord;   // events it has scheduled
     LFrame *out;
-    int nout, link;
+    int nout, link; // frames it sent this slot; its link
+    int64_t ldelay;
+    OutBucket ob;
 };
 
 __device__ __forceinline__ uint64_t bytes_left(const SndQP &q) { return q.size >= q.snd_nxt ? q.size - q.snd_nxt : 0; }
@@ -464,7 +514,7 @@ __device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
 __device__ __forceinline__ void h_transmit(HCtx &c, Pkt p)
 {
     const Sim &s = *c.s;
-    int64_t tx = link_tx(s, p.size);
+    int64_t tx = link_tx(s, c.link, p.size);
     c.st.tc_at = c.now + tx;
     if (c.P->simai && p.size > 60 && p.size < 9000)
     {
@@ -475,17 +525,16 @@ __device__ __forceinline__ void h_transmit(HCtx &c, Pkt p)
             s.sent[p.flow] = c.now + tx;
     }
     cpush(&s.h_tc[c.h], ccode(tx, c.ord++), c.cur);
-    if (c.nout >= MAXF)
-    {
-        atomicAdd(&s.ev[4], 1ull);
-        return;
-    }
-    LFrame &f = c.out[c.nout++];
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
     c.ord++;
-    f.ts = c.now + tx + s.P.delay;
-    f.c = c.cur;
-    f.p = p;
+    c.nout++;
+    int64_t ts = c.now + tx + c.ldelay;
+    LFrame *f = link_push(s, c.link, ts, c.ob);
+    if (!f)
+        return;
+    f->ts = ts;
+    f->c = c.cur;
+    f->p = p;
     trace_tx(s, c.now, c.h, 0, p);
 }
 
@@ -757,8 +806,8 @@ __device__ __forceinline__ void dcqcn_timer(HCtx &c, int f, int kind)
         if (q.rp_stage >= P.rpg_threshold)
         {
             q.target += q.rp_stage == P.rpg_threshold ? P.rai : P.rhai;
-            if (q.target > P.bps)
-                q.target = P.bps;
+            if (q.target > q.max_rate) // the NIC's rate
+                q.target = q.max_rate;
         }
         q.rate = rate_of((double)q.rate / 2) + rate_of((double)q.target / 2);
         q.rp_stage++;
@@ -864,14 +913,15 @@ __device__ __forceinline__ void h_start(HCtx &c, int f)
     SndQP &q = s.qp[f];
     q = SndQP{};
     q.size = fi.size;
-    q.rate = q.max_rate = s.P.bps;
+    const uint64_t nic = s.li[c.link].bps;
+    q.rate = q.max_rate = nic;
     q.win = fi.win;
     q.base_rtt = fi.base_rtt;
     q.alpha = 1;
     q.first_cnp = 1;
-    q.target = s.P.bps;
+    q.target = nic;
     q.t_alpha = q.t_dec = q.t_rp = -1;
-    q.cur_rate = s.P.bps;
+    q.cur_rate = nic;
     q.u = 1;
     q.next_avail = c.now;
     if (c.st.qp_n >= s.qps_cap)
@@ -922,34 +972,28 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
 {
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const int link_in = s.in_link[(size_t)h * s.K];
+    const int64_t in_delay = s.li[link_in].delay;
     const Params &WP = s.Pw[s.h_world[h]];
+    (void)t0;
     if (lane == 0)
     {
-        // the arrivals: at most the last frame of slot s - 2, the frames of slot s - 1 but perhaps the last
-        int an2 = slot >= 2 ? msg_count(s, slot - 2, link_in) : 0, an1 = slot >= 1 ? msg_count(s, slot - 1, link_in) : 0;
-        const LFrame *a2 = s.msg + mi(s, slot - 2, link_in) * MAXF, *a1 = s.msg + mi(s, slot - 1, link_in) * MAXF;
-        int f2 = an2, n1 = an1;
-        while (f2 > 0 && a2[f2 - 1].ts >= t0)
-            f2--;
-        while (n1 > 0 && a1[n1 - 1].ts >= t1)
-            n1--;
-        hints[0] = an2 - f2 + n1;
-        hints[1] = f2;
-        hints[2] = an2;
+        uint32_t base;
+        hints[0] = bucket(s, link_in, slot, &base);
+        hints[1] = (int)base;
     }
     __syncthreads();
-    const int total = hints[0], f2 = hints[1], an2 = hints[2];
+    const int total = hints[0];
+    const uint32_t abase = (uint32_t)hints[1];
     const bool pooled = total <= HPOOL;
     if (pooled)
         for (int j = lane; j < total; j += lanes)
         {
-            int n2 = an2 - f2;
-            uint32_t fi = j < n2 ? (uint32_t)(mi(s, slot - 2, link_in) * MAXF + f2 + j) : (uint32_t)(mi(s, slot - 1, link_in) * MAXF + (j - n2));
+            uint32_t fi = abase + j;
             const LFrame &f = s.msg[fi];
             HArr &a = pool[j];
             a.ts = f.ts;
             a.p = f.p;
-            a.acode = arrival_code(s, f);
+            a.acode = arrival_code(s, link_in, in_delay, f);
             a.frame = fi;
             a.pre = 0;
         }
@@ -980,11 +1024,12 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     c.st = s.hs[h];
     c.slot = slot;
     c.link = s.out_link[(size_t)h * s.K];
-    c.out = s.msg + mi(s, slot, c.link) * MAXF;
+    c.ldelay = s.li[c.link].delay;
+    c.ob.hi = 0;
     c.nout = 0;
     c.pre_ok = false;
     Arrivals in;
-    in.init(s, link_in, slot, t0);
+    in.init(s, link_in, slot);
     int ai = 0; // the next pooled arrival
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
     Due due[MAX_DUE];
@@ -1036,10 +1081,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             }
             else
             {
-                af = in.peek(t1);
+                af = in.peek();
                 if (af)
                 {
-                    acode = arrival_code(s, *af);
+                    acode = arrival_code(s, link_in, in_delay, *af);
                     ats = af->ts;
                 }
             }
@@ -1130,8 +1175,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             h_start(c, sf);
         }
     }
-    if (c.nout)
-        s.msg_cnt[mi(s, slot, c.link)] = (long long)slot << 16 | c.nout;
+    link_flush(s, c.ob);
     act = c.nout > 0 || c.st.ackq_n > 0 || c.st.tc_at >= 0;
     // the earliest event without input
     int64_t w = INT64_MAX;
@@ -1168,7 +1212,11 @@ struct SwPortLds
     Port pt;
     int64_t ats;       // the next arrival's time (INT64_MAX: none)
     int ai, aend;      // pool: the next arrival and the end of the port's range
-    int an2, an1, link_in, nout; // the fallback cursor (ai) and its frame counts; link; frames sent
+    int an, link_in, nout; // the fallback cursor (ai) runs over the an frames from abase; link; frames sent
+    uint32_t abase;
+    int32_t in_delay, out_delay; // link_in's delay, its out link's
+    uint32_t kmin, kmax;   // its PortCfg's
+    OutBucket ob;          // its out link's
     uint32_t acode;    // the next arrival's code
     Run ap[PRE], tp[PRE]; // the prefixes of the next arrival's chain and of tc's
 };
@@ -1222,35 +1270,35 @@ __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
 }
 
 // SwitchMmu, priority PG
-__device__ __forceinline__ uint32_t pfc_thresh(const SCtx &c)
+__device__ __forceinline__ const PortCfg &pcfg(const SCtx &c, int port) { return c.s->pc[c.s->pbase[c.x] + port]; }
+__device__ __forceinline__ uint32_t pfc_thresh(const SCtx &c, int port)
 {
     const Params &P = *c.P;
-    return (P.buffer_size - c.sw.total_hdrm - c.sw.total_rsrv - c.sw.shared_used) >> P.pfc_shift;
+    return (P.buffer_size - c.sw.total_hdrm - c.sw.total_rsrv - c.sw.shared_used) >> pcfg(c, port).shift;
 }
 __device__ __forceinline__ uint32_t shared_used(const Port &p) { return p.ing > RESERVE ? p.ing - RESERVE : 0; }
 
 __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
 {
     const Sim &s = *c.s;
-    int64_t tx = link_tx(s, p.size);
+    int link = s.out_link[(size_t)c.node * s.K + port];
+    int64_t tx = link_tx(s, link, p.size);
     c.w[port].pt.tc_at = c.now + tx;
     const Chain &cur = sc_cur(c);
     Chain tcc;
     cpush(&tcc, ccode(tx, c.ord++), cur);
     c.tc[port] = tcc;
     cprefix(c.w[port].tp, 0, tcc);
-    int link = s.out_link[(size_t)c.node * s.K + port];
-    if (c.w[port].nout >= MAXF)
-    {
-        atomicAdd(&s.ev[4], 1ull);
-        return;
-    }
-    LFrame &f = s.msg[mi(s, c.slot, link) * MAXF + c.w[port].nout++];
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
     c.ord++;
-    f.ts = c.now + tx + s.P.delay;
-    f.c = cur;
-    f.p = p;
+    c.w[port].nout++;
+    int64_t ts = c.now + tx + c.w[port].out_delay;
+    LFrame *f = link_push(s, link, ts, c.w[port].ob);
+    if (!f)
+        return;
+    f->ts = ts;
+    f->c = cur;
+    f->p = p;
     trace_tx(s, c.now, c.node, port, p);
 }
 
@@ -1363,18 +1411,19 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
 #ifdef RDMA_TRACE_NODE
         if (c.node == RDMA_TRACE_NODE && c.now >= RDMA_TRACE_FROM && c.now <= RDMA_TRACE_UNTIL)
             printf("mmu %lld node %d in %d out %d deq %u ing %u hdrm %u shared %u thresh %u pkt %d>%d %u q3n %d\n", (long long)c.now, c.node, p.inport + 1,
-                   port + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c), p.src, p.dst, p.seq, pt.q3_n);
+                   port + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, p.inport), p.src, p.dst, p.seq, pt.q3_n);
 #endif
     }
     if (P.ecn)
     {
         // SwitchMmu::ShouldSendCN
         bool mark = false;
-        if (pt.egr > P.kmax)
+        const uint32_t kmin = c.w[port].kmin, kmax = c.w[port].kmax;
+        if (pt.egr > kmax)
             mark = true;
-        else if (pt.egr > P.kmin)
+        else if (pt.egr > kmin)
         {
-            double pr = P.pmax * (double)(pt.egr - P.kmin) / (double)(P.kmax - P.kmin);
+            double pr = pcfg(c, port).pmax * (double)(pt.egr - kmin) / (double)(kmax - kmin);
             mark = nsm_rng::rand_u01(pt.rng) < pr;
         }
         if (mark)
@@ -1387,7 +1436,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     if (!c.safe && in.mmu_paused)
     {
         uint32_t su = shared_used(in);
-        if (in.hdrm == 0 && (su == 0 || su + RESUME_OFFSET <= pfc_thresh(c)))
+        if (in.hdrm == 0 && (su == 0 || su + RESUME_OFFSET <= pfc_thresh(c, p.inport)))
         {
             s_send_pfc(c, p.inport, 1);
             in.mmu_paused = 0;
@@ -1395,7 +1444,7 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     }
     if (p.kind == K_DATA && P.cc == 3 && p.nhop < 0xFFFF)
     {
-        p.hop[p.nhop % MAX_HOP] = hop_make((uint64_t)c.now, pt.tx_bytes, pt.bytes_total, P.bps, P.int_multi);
+        p.hop[p.nhop % MAX_HOP] = hop_make((uint64_t)c.now, pt.tx_bytes, pt.bytes_total, pcfg(c, port).bps, P.int_multi);
         p.nhop++;
     }
     pt.tx_bytes += p.size;
@@ -1435,9 +1484,9 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     else if (q != 0)
     {
         Port &in = c.w[inport].pt;
-        uint32_t th = pfc_thresh(c);
+        uint32_t th = pfc_thresh(c, inport);
         // CheckIngressAdmission
-        if (p.size + in.hdrm > c.sw.headroom && p.size + shared_used(in) > th)
+        if (p.size + in.hdrm > pcfg(c, inport).hdrm_cap && p.size + shared_used(in) > th)
         {
             atomicAdd(&s.ev[0], 1ull);
             return;
@@ -1457,10 +1506,10 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
 #ifdef RDMA_TRACE_NODE
         if (c.node == RDMA_TRACE_NODE && c.now >= RDMA_TRACE_FROM && c.now <= RDMA_TRACE_UNTIL)
             printf("mmu %lld node %d in %d out %d enq %u ing %u hdrm %u shared %u thresh %u pkt %d>%d %u q3n %d\n", (long long)c.now, c.node, inport + 1,
-                   out + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c), p.src, p.dst, p.seq, c.w[out].pt.q3_n);
+                   out + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, inport), p.src, p.dst, p.seq, c.w[out].pt.q3_n);
 #endif
         // CheckAndSendPfc
-        if (!in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c)))
+        if (!in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c, inport)))
         {
             s_send_pfc(c, inport, 0);
             in.mmu_paused = 1;
@@ -1478,10 +1527,7 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     s_dequeue(c, out);
 }
 
-__device__ __forceinline__ const LFrame &sw_frame(const Sim &s, const SwPortLds &w, int64_t slot)
-{
-    return w.ai < w.an2 ? s.msg[mi(s, slot - 2, w.link_in) * MAXF + w.ai] : s.msg[mi(s, slot - 1, w.link_in) * MAXF + (w.ai - w.an2)];
-}
+__device__ __forceinline__ const LFrame &sw_frame(const Sim &s, const SwPortLds &w) { return s.msg[w.abase + w.ai]; }
 
 // the next arrival of a port in [t0, t1), or none (INT64_MAX)
 __device__ __forceinline__ void sw_peek(const SCtx &c, SwPortLds &w, int64_t t1)
@@ -1500,22 +1546,20 @@ __device__ __forceinline__ void sw_peek(const SCtx &c, SwPortLds &w, int64_t t1)
         }
         return;
     }
-    if (w.ai < w.an2 + w.an1)
+    (void)t1;
+    if (w.ai < w.an)
     {
-        const LFrame &f = sw_frame(s, w, c.slot);
-        if (f.ts < t1)
-        {
-            w.ats = f.ts;
-            w.acode = arrival_code(s, f);
-            cprefix(w.ap, w.acode, f.c);
-        }
+        const LFrame &f = sw_frame(s, w);
+        w.ats = f.ts;
+        w.acode = arrival_code(s, w.link_in, w.in_delay, f);
+        cprefix(w.ap, w.acode, f.c);
     }
 }
 
 // the chain of a port's next arrival (without its own code)
 __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPortLds &w)
 {
-    return c.pool ? c.s->msg[c.pool[w.ai].frame].c : sw_frame(*c.s, w, c.slot).c;
+    return c.pool ? c.s->msg[c.pool[w.ai].frame].c : sw_frame(*c.s, w).c;
 }
 
 // A switch's slot, run by the lanes of one wave. They load its ports, this slot's arrivals (into
@@ -1563,18 +1607,15 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         ocnt[p] = 0;
         ing0[p] = q.pt.ing;
         q.link_in = s.in_link[(size_t)node * s.K + p];
-        q.an2 = slot >= 2 ? msg_count(s, slot - 2, q.link_in) : 0;
-        q.an1 = slot >= 1 ? msg_count(s, slot - 1, q.link_in) : 0;
+        q.an = bucket(s, q.link_in, slot, &q.abase);
+        q.in_delay = (int32_t)s.li[q.link_in].delay;
+        q.out_delay = (int32_t)s.li[s.out_link[(size_t)node * s.K + p]].delay;
+        q.kmin = s.pc[s.pbase[x] + p].kmin;
+        q.kmax = s.pc[s.pbase[x] + p].kmax;
+        q.ob.hi = 0;
         q.nout = 0;
-        const LFrame *a2 = s.msg + mi(s, slot - 2, q.link_in) * MAXF, *a1 = s.msg + mi(s, slot - 1, q.link_in) * MAXF;
-        int f2 = q.an2;
-        while (f2 > 0 && a2[f2 - 1].ts >= t0)
-            f2--;
-        int n1 = q.an1;
-        while (n1 > 0 && a1[n1 - 1].ts >= t1)
-            n1--;
-        first[p] = f2;
-        cnt[p] = (q.an2 - f2) + n1;
+        first[p] = 0;
+        cnt[p] = q.an;
         if (q.pt.tc_at >= 0)
             cprefix(q.tp, 0, tcs[p]);
     }
@@ -1590,14 +1631,13 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             int p = 0, base = 0;
             while (j - base >= cnt[p])
                 base += cnt[p++];
-            int k = j - base, an2 = w[p].an2, n2 = an2 - first[p];
-            uint32_t fi = k < n2 ? (uint32_t)(mi(s, slot - 2, w[p].link_in) * MAXF + first[p] + k)
-                                 : (uint32_t)(mi(s, slot - 1, w[p].link_in) * MAXF + (k - n2));
+            int k = j - base;
+            uint32_t fi = w[p].abase + k;
             const LFrame &f = s.msg[fi];
             ArrLds &a = pool[j];
             a.ts = f.ts;
             a.p = f.p;
-            a.acode = arrival_code(s, f);
+            a.acode = arrival_code(s, w[p].link_in, w[p].in_delay, f);
             cprefix(a.ap, a.acode, f.c);
             a.frame = fi;
             int q = 0;
@@ -1631,7 +1671,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 safe = false;
         }
         int64_t room = (int64_t)WP.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
-        int64_t th_min = room > 0 ? room >> WP.pfc_shift : -1;
+        int64_t th_min = room > 0 ? room >> sw.max_shift : -1;
         for (int p = 0; p < deg && safe; p++)
         {
             int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
@@ -1812,7 +1852,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                 base += cnt[p];
             }
             else
-                w[p].ai = first[p] < w[p].an2 ? first[p] : w[p].an2;
+                w[p].ai = 0;
             sw_peek(c, w[p], t1);
         }
 #ifdef RDMA_PROF
@@ -1896,7 +1936,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             }
             else
             {
-                const LFrame &f = sw_frame(s, w[p], slot);
+                const LFrame &f = sw_frame(s, w[p]);
                 c.cur_src = &f.c;
                 pk = f.p;
                 out = pk.kind == K_PAUSE || pk.kind == K_RESUME ? -1 : s_route(s, WP, x, pk, &q);
@@ -1943,8 +1983,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     __syncthreads();
     for (int p = lane; p < deg; p += lanes)
     {
-        if (w[p].nout)
-            s.msg_cnt[mi(s, slot, s.out_link[(size_t)node * s.K + p])] = (long long)slot << 16 | w[p].nout;
+        link_flush(s, w[p].ob);
         if (w[p].nout > 0 || w[p].pt.q0_n > 0 || w[p].pt.q3_n > 0 || w[p].pt.tc_at >= 0)
             act = true;
         gp[p] = w[p].pt;
@@ -1969,15 +2008,22 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     unsigned int fd = atomicAdd(s.flows_done, 0u);
     if (fd >= (unsigned int)s.F || slot + 1 >= s.max_slots)
         *s.finished = 1;
-    // idle skip: nothing sent in this slot or the previous one (so nothing arrives in the
-    // next) and nothing queued: go on at the slot of the earliest host event
-    unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
+    // idle skip: nothing sent and nothing queued in this slot: go on at the slot of the earliest
+    // host event or arrival (this slot's arrivals are read: its pending flag is cleared)
+    unsigned int cur = atomicAdd(&s.activity[0], 0u);
     unsigned long long nw = atomicAdd(s.next_wake, 0ull);
+    s.pend[slot % s.pend_n] = 0;
     int64_t next = slot + 1;
-    if (cur == 0 && prev == 0 && nw != ~0ull)
+    if (cur == 0)
     {
-        int64_t ws = (int64_t)nw / s.P.delay;
-        if (ws > next)
+        int64_t ws = nw != ~0ull ? (int64_t)nw / s.P.delay : INT64_MAX;
+        for (int i = 1; i < s.pend_n; i++)
+            if (s.pend[(slot + i) % s.pend_n])
+            {
+                ws = slot + i < ws ? slot + i : ws;
+                break;
+            }
+        if (ws != INT64_MAX && ws > next)
             next = ws < s.max_slots ? ws : s.max_slots;
     }
 #ifdef RDMA_PROF

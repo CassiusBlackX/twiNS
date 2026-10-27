@@ -1,0 +1,16 @@
+# SimAI mode, links of different rates and delays (FatTree k=4/8 in SimAI's format)
+h_ft8_rate_a2a30 ft8_h100_s400.topo k8_a2a30.csv
+h_ft8_rate_a2a30_cc3 ft8_h100_s400.topo k8_a2a30.csv CC_MODE=3
+h_ft8_rate_incast16 ft8_h100_s400.topo k8_incast16.csv BUFFER_SIZE=2
+h_ft8_rd_a2a30 ft8_h100d500_s400d1000.topo k8_a2a30.csv
+h_ft8_rd_perm ft8_h100d500_s400d1000.topo k8_perm.csv BUFFER_SIZE=2
+h_ft8_rd_a2a30_m1000 ft8_h100d500_s400d1000.topo k8_a2a30.csv PACKET_PAYLOAD_SIZE=1000
+h_ft8_dcn_perm64 ft8_dcn.topo k8_perm64_4m.csv
+h_ft8_dcn_incast64 ft8_dcn.topo k8_incast64.csv BUFFER_SIZE=2
+h_ft8_dcn_a2a30_cc3 ft8_dcn.topo k8_a2a30.csv CC_MODE=3
+h_ft8_long_a2a30 ft8_h100d100_s400d2000.topo k8_a2a30.csv
+h_ft8_long_incast16 ft8_h100d100_s400d2000.topo k8_incast16.csv BUFFER_SIZE=1
+h_ft8_long_perm_gt1 ft8_h100d100_s400d2000.topo k8_perm.csv GLOBAL_T=1
+h_ft4_inv_inc1 ft4_h25d1500_s100d300.topo inc1.csv
+h_ft4_inv_inc1_b1 ft4_h25d1500_s100d300.topo inc1.csv BUFFER_SIZE=1
+h_ft4_inv_inc1_cc3 ft4_h25d1500_s100d300.topo inc1.csv CC_MODE=3
