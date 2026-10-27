@@ -366,10 +366,17 @@ __device__ inline void send_ack(HostCtx &c, int f, uint32_t ack, bool force_ece,
 //   sacked  : the block [1, 1 + sacked)       (AddRenoSack sacks the first unsacked after the head)
 //   lost    : the prefix [0, lost_n)          (MarkHeadAsLost, SetSentListLost)
 //   retrans : the prefix [0, rtx_n), except the head when !head_rx (MarkHeadAsLost clears it)
-// All segments are MSS long (flow sizes are MSS multiples).
+// Segments are MSS long except the flow's last, so the first n items hold sb_bytes(n) bytes.
 __device__ inline uint32_t sb_items(const FlowSoA &F, int f)
 {
     return (F.high[f] - F.una[f] + MSS - 1) / MSS;
+}
+
+__device__ inline uint32_t sb_bytes(const FlowSoA &F, int f, uint32_t n)
+{
+    uint32_t sent = F.high[f] - F.una[f];
+    uint64_t b = (uint64_t)n * MSS;
+    return b < sent ? (uint32_t)b : sent;
 }
 
 __device__ inline uint32_t sb_retrans(const FlowSoA &F, int f)
@@ -378,12 +385,16 @@ __device__ inline uint32_t sb_retrans(const FlowSoA &F, int f)
     return r == 0 ? 0 : r - (F.head_rx[f] ? 0 : 1);
 }
 
-// TcpTxBuffer::BytesInFlight = sent - (sacked + lost) + retrans
+// TcpTxBuffer::BytesInFlight = sent - (sacked + lost) + retrans, in bytes
 __device__ inline uint32_t inflight(const FlowSoA &F, int f)
 {
-    uint32_t sent = F.high[f] - F.una[f];
-    uint32_t left = (F.sacked[f] + F.lost_n[f] - sb_retrans(F, f)) * MSS;
-    return sent > left ? sent - left : 0;
+    int64_t sent = F.high[f] - F.una[f];
+    int64_t sacked = F.sacked[f] ? sb_bytes(F, f, 1 + F.sacked[f]) - sb_bytes(F, f, 1) : 0;
+    int64_t lost = sb_bytes(F, f, F.lost_n[f]);
+    uint32_t r = F.rtx_n[f];
+    int64_t rtx = r == 0 ? 0 : sb_bytes(F, f, r) - (F.head_rx[f] ? 0 : sb_bytes(F, f, 1));
+    int64_t v = sent - (sacked + lost) + rtx;
+    return v > 0 ? (uint32_t)v : 0;
 }
 
 __device__ inline void sb_add_reno_sack(const FlowSoA &F, int f)
@@ -578,9 +589,9 @@ __device__ inline void send_pending(HostCtx &c, int f, int64_t now)
         uint32_t seq = sb_next_seg(F, f);
         if (seq == 0xFFFFFFFFu)
             return;
-        uint32_t remaining = size - seq;
+        uint32_t remaining = size - seq; // TcpTxBuffer::SizeFromSequence (the app wrote the whole flow)
         if (avail < MSS && remaining > avail)
-            return;
+            return; // silly window (Nagle is off: TcpSocket::TcpNoDelay defaults to true)
         send_segment(c, f, seq, now);
         uint32_t len = remaining < MSS ? remaining : MSS;
         F.nxt[f] = seq + len;
@@ -984,9 +995,16 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
     }
     else if (advancing)
     {
-        uint32_t segs = (ack - old) / MSS;
-        if ((ack - old) % MSS)
-            segs++; // the final partial segment counts as one (sizes are MSS multiples)
+        // currentDelivered: the acknowledged items, whole segments plus the remainder that
+        // ns-3 accumulates in m_bytesAckedNotProcessed
+        uint32_t delivered = ack - old;
+        uint32_t segs = delivered / MSS;
+        F.ack_rem[f] += delivered % MSS;
+        if (F.ack_rem[f] >= MSS)
+        {
+            segs++;
+            F.ack_rem[f] -= MSS;
+        }
         if (!dupack)
             F.dupacks[f] = 0;
         uint8_t cg = F.cong[f];
@@ -1028,6 +1046,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
             else if (cg == C_RECOVERY)
             {
                 F.first_partial[f] = 1;
+                segs = (ack - old) / MSS; // recounted, without the remainder
                 pkts_acked(c, f, segs, ack, now);
                 F.cong[f] = C_OPEN;
                 exited = true;

@@ -121,6 +121,7 @@ enum : uint8_t
     X(uint8_t, recover_active, 0)        \
     X(uint8_t, first_partial, 1)         \
     X(uint32_t, cwnd_cnt, 0)             \
+    X(uint32_t, ack_rem, 0)              /* m_bytesAckedNotProcessed */ \
     X(uint8_t, cwnd_limited, 0)          \
     /* TcpCubic (ns-3 member names in comments) */ \
     X(uint32_t, cub_cnt, 0)              /* m_cWndCnt */ \

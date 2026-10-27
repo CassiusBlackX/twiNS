@@ -43,9 +43,13 @@ def flow_size(rng, args):
     elif args.size == "uniform":
         pkts = rng.randint(args.min_pkts, args.max_pkts)
     elif args.size == "websearch":
+        if args.align == "byte":
+            return max(1, int(sample_cdf(rng, WEBSEARCH_CDF)))
         pkts = max(1, math.ceil(sample_cdf(rng, WEBSEARCH_CDF) / MSS))
     else:
         raise ValueError(args.size)
+    if args.align == "byte":
+        return int(pkts) * MSS - rng.randrange(MSS)  # the last segment 1..MSS bytes
     return int(pkts) * MSS
 
 
@@ -85,6 +89,8 @@ def main():
     ap.add_argument("--max_peers", type=int, default=255, help="connections per host")
     ap.add_argument("--unique_pairs", type=int, default=0,
                     help="1: at most one flow per (src, dst), so per-pair and per-flow connections coincide")
+    ap.add_argument("--align", choices=["mss", "byte"], default="mss",
+                    help="flow sizes: MSS multiples, or any byte count (a partial last segment)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -160,7 +166,7 @@ def multi(args):
                         break
                 t += rng.expovariate(rate_per_ns)
     if args.pattern == "incast":
-        size = (args.incast_bytes + MSS - 1) // MSS * MSS
+        size = args.incast_bytes if args.align == "byte" else (args.incast_bytes + MSS - 1) // MSS * MSS
         t = args.incast_period_ns // 2
         while t < args.duration_ns:
             r = rng.randrange(n)
