@@ -260,7 +260,7 @@ struct Sim
     unsigned long long *next_wake;
     int *finished;
     int64_t max_slots;
-    int host_blocks;
+    int host_blocks, spread; // spread: lanes per entity (see rdma_slot)
     int64_t *fct;       // [F] completion time - start (ns), -1: not yet
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;

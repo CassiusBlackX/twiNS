@@ -109,7 +109,7 @@ int main(int argc, char **argv)
     }
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps";
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 8192, tail_log2 = 24;
+    int q3cap = 8192, tail_log2 = 24, spread = 32;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -135,6 +135,8 @@ int main(int argc, char **argv)
             q3cap = atoi(v.c_str());
         else if (k == "--tail")
             tail_log2 = atoi(v.c_str());
+        else if (k == "--spread")
+            spread = atoi(v.c_str());
         else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
         {
             // KEY=VALUE, or KEY=V1,V2,... for a key with several values (KMAX_MAP=1,100000000000,800)
@@ -548,13 +550,23 @@ int main(int argc, char **argv)
             txt[b] = (int32_t)tx_ns(P.bps, b);
         CK(hipMemcpyToSymbol(HIP_SYMBOL(c_txt), txt.data(), sizeof(int32_t) * TXT_N));
     }
-    // one thread per host or switch; a switch thread keeps its ports in LDS
-    int BS = 64;
-    while (BS > 1 && (size_t)BS * K * sizeof(SwPortLds) > 48 * 1024)
-        BS /= 2;
-    s.host_blocks = (H + BS - 1) / BS;
-    int blocks = s.host_blocks + (S + BS - 1) / BS;
-    size_t lds = (size_t)BS * K * sizeof(SwPortLds);
+    // one thread per host or switch, each in a wave of its own; a switch thread keeps its ports in LDS
+    s.spread = spread;
+    size_t per_sw = (size_t)K * sizeof(SwPortLds) + POOL * sizeof(ArrLds) + 2 * KMAX * sizeof(int);
+    int EPB = 4; // entities per block
+    while (EPB > 1 && (size_t)EPB * per_sw > 60 * 1024)
+        EPB /= 2;
+    if (per_sw > 64 * 1024)
+    {
+        fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw, K);
+        return 1;
+    }
+    int BS = EPB * spread;
+    s.host_blocks = (H + EPB - 1) / EPB;
+    int blocks = s.host_blocks + (S + EPB - 1) / EPB;
+    size_t lds = (size_t)EPB * per_sw;
+    if (lds > 48 * 1024)
+        CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
 
     auto t_start = std::chrono::steady_clock::now();
     int fin = 0;
