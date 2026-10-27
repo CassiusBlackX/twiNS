@@ -282,6 +282,10 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
         }
         if (ca != cb)
             ord = (ca & 7) > (cb & 7) ? -1 : 1;
+        // at the same tail node, at the same place in it: the rest is one lineage (the chains met at
+        // a common ancestor), so the deepest ordinal difference is one seen above
+        if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
+            return ord;
         uint32_t m = A.left < B.left ? A.left : B.left;
         A.left -= m;
         B.left -= m;
