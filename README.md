@@ -32,10 +32,10 @@ simulator is the ns-3 fork that RDMA studies build on (ns3-rdma, ConWeave). twin
 - ECN marking at dequeue;
 - DCQCN and HPCC with INT.
 
-In 39 validation runs every flow's completion time equals the reference's. The runs span FatTree
+In 47 validation runs every flow's completion time equals the reference's. The runs span FatTree
 k=4–16, leaf-spine, Jellyfish, torus and Dragonfly, PFC storms, and every switch of the config.
-twins-rdma is 3.5–52× faster than the reference (30–52× on the larger workloads; incasts, whose
-hot switch serializes everything, 4–5×). See [RDMA](#rdma).
+twins-rdma is 4–74× faster than the reference (20–74× on the larger workloads; incasts, whose
+hot switch port serializes everything, 4–9×). See [RDMA](#rdma).
 
 ## Build
 
@@ -275,12 +275,13 @@ variable created before it. `validation/hpcc/README.md` covers:
 
 | run | flows | reference | twins-rdma | speedup |
 |---|---|---|---|---|
-| k16 a2a30, DCQCN | 2253 | 199.8 s | 6.2 s | 32× |
-| k16 a2a30, HPCC | 2253 | 215.9 s | 7.0 s | 31× |
-| k8 a2a50s, HPCC | 12519 | 35.3 s | 1.08 s | 33× |
-| k8 permutation, HPCC | 382 | 10.6 s | 0.25 s | 43× |
-| leaf-spine a2a30, DCQCN | 541 | 30.4 s | 2.8 s | 11× |
-| Jellyfish a2a30, HPCC | 289 | 20.1 s | 1.6 s | 13× |
+| k16 a2a30, DCQCN | 2253 | 199.8 s | 3.95 s | 51× |
+| k16 a2a30, HPCC | 2253 | 215.9 s | 4.37 s | 49× |
+| k16 a2a50s, DCQCN, 2 MB buffers (4043 pauses) | 50818 | 210.0 s | 4.38 s | 48× |
+| k8 a2a50s, HPCC | 12519 | 35.3 s | 0.70 s | 50× |
+| k8 permutation, HPCC | 382 | 10.6 s | 0.165 s | 64× |
+| leaf-spine a2a30, DCQCN | 541 | 30.4 s | 1.01 s | 30× |
+| Jellyfish a2a30, HPCC | 289 | 20.1 s | 1.01 s | 20× |
 | k8 incast64, 1 MB buffers (4315 pauses), DCQCN | 64 | 4.1 s | 0.90 s | 4.6× |
 
 These are wall times on the RX 9060 XT against the reference on one core of a Xeon Gold 5218.
