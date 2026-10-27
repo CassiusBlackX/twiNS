@@ -69,15 +69,25 @@ def main():
         t0 = time.time()
         r = subprocess.run(["./build/twins", f"--k={a.k}", f"--worlds={wf}"], capture_output=True, text=True, check=True)
         if "undecided" in r.stderr:
-            # ties the recorded histories could not decide: the batch again, with longer histories
-            # (twice the frame memory: in halves if it does not fit)
-            print(f"batch {b // a.batch}: undecided ties, rerun with twins128", flush=True)
-            r = run_long(a.k, open(wf).read().splitlines(), wf)
+            # ties the recorded histories could not decide: those worlds again, with longer
+            # histories (twice the frame memory: in halves if they do not fit)
+            m = re.search(r"undecided-ties by world:([ 0-9]*)", r.stdout)
+            lines = open(wf).read().splitlines()
+            redo = [lines[int(w)] for w in m.group(1).split()] if m else lines
+            print(f"batch {b // a.batch}: undecided ties in {len(redo)} worlds, rerun with twins128", flush=True)
+            rf = wf + ".long"
+            open(rf, "w").write("\n".join(redo) + "\n")
+            rl = run_long(a.k, redo, rf)
+            sim += float(re.search(r"Simulation Duration: ([0-9.]+)s", rl.stdout).group(1))
+            r.stderr = rl.stderr
         total += time.time() - t0
-        if "warning" in r.stderr:
-            raise SystemExit(f"batch {b // a.batch}: {r.stderr.strip()}")
+        bad = [l for l in r.stderr.splitlines() if "warning" in l and "undecided" not in l]
+        if bad:
+            raise SystemExit(f"batch {b // a.batch}: {bad[0]}")
+        if "undecided" in r.stderr:
+            print(f"batch {b // a.batch}: ties still undecided with twins128 (results may differ from ns-3)", flush=True)
         sim += float(re.search(r"Simulation Duration: ([0-9.]+)s", r.stdout).group(1))
-        last = r.stdout.strip().splitlines()[-2]
+        last = [l for l in r.stdout.splitlines() if l.startswith("flows ")][-1]
         print(f"batch {b // a.batch}: {min(a.batch, len(cfg) - b)} worlds, {last[:90]}", flush=True)
     print(f"{len(cfg)} configurations in batches of {a.batch}: simulation {sim:.2f} s, total {total:.2f} s")
 

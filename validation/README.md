@@ -67,13 +67,32 @@ The run scripts in `ns3/` work in `$NS3_WORK` (default `~/netsim/cmp`). That dir
 With ns-3's hashes (`--ecmp_from`), TwiNS gives every flow the same establishment and
 completion time as ns-3 in all of these runs:
 
-| workloads | flows | TCP | runs | identical flows |
+| set | flows | TCP | runs | identical flows |
 |---|---|---|---|---|
 | k=8: paper, fullsync, fullexp, a2a30, incast16, a2a50s × 6 variants | 128 to 12519 | DCTCP, NewReno, Cubic | 108 | all |
 | k=16: paper, a2a30, incast16, a2a50s | 160 to 50818 | DCTCP, NewReno, Cubic | 12 | all |
 | leaf-spine 16×16, 8 spines: paper, a2a30, incast16, a2a50s | 160 to 25390 | DCTCP, NewReno, Cubic | 12 | all |
+| sizes not MSS multiples: k8 a2a30b, a2a50b, incastb; ls a2a30b; k16 a2a30b | 288 to 2280 | DCTCP, NewReno, Cubic | 15 | all |
+| persistent connections (`conn`): k8 r30, r50, r40p1, rpc; ls r30; k16 r30; each with and without FIN; FIN on k8 a2a30, incast16, a2a50s, a2a30b | 157 to 25344 | DCTCP, NewReno, Cubic | 48 | all |
+| per-packet spraying: k8 paper, a2a30, incast16, a2a50s, a2a30b; ls a2a30; k16 a2a30; k8 r30 with FIN | 128 to 12519 | DCTCP, NewReno, Cubic | 24 | all |
+| topology files: Jellyfish 32 sw (a2a30, a2a50, incast), torus 6×6, Dragonfly 4×9, Jellyfish 256 sw; flow ECMP and spraying | 289 to 2316 | DCTCP, NewReno, Cubic | 48 | all |
+| link failures/recoveries: FatTree k=8 file (2 workloads), Jellyfish, torus; flow ECMP and spraying | 273 to 12519 | DCTCP, NewReno, Cubic | 24 | all |
 | k=8 sweep: a2a30, a2a50w × K × queue limit | 273, 576 | DCTCP, NewReno, Cubic | 138 | all |
 | k=16 sweep: a2a30, a2a50w × K ∈ {10,20,40,80} × queue ∈ {100,400} | 2253, 3788 | DCTCP, NewReno, Cubic | 48 | all |
+
+That is 477 runs; `check_all.sh` reruns them all. Some need `twins128` (see below).
+
+**New scenario options** (`ns3/twins-ref.cc`): a fifth flow-file column `conn` (messages over one
+connection, written at their start times), `--fin=1`, `--flowEcmp=0` with deterministic routing
+streams (stream = node id), `--topo=file --topofile=F` (and `DUMP_ROUTES=path` to print the
+equal-cost routes), `--fail=T:sA:sB[:up],...`. `ns3/run_jobs.sh` runs reference jobs from a job
+file (`ns3/jobs_*.txt`). `tools/rng_ref.cc` and `tools/rng_check.cu` check src/rng.h against
+ns-3's MRG32k3a.
+
+**Undecided ties.** A frame records 9 runs of its event history. In symmetric situations (spraying
+over equal paths, large sweeps) two simultaneous events can have equal histories over all 9; TwiNS
+then counts an undecided tie and warns. `twins128` records 25 runs; `check_exact.sh` and
+`bench/sweep.py` fall back to it. In the runs above, it decided every such case that mattered.
 
 They include ECN marking, RED drops, fast recovery, RTOs with backoff, SYN and SYN-ACK
 retransmissions, and incast.

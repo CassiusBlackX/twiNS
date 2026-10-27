@@ -203,7 +203,8 @@ enum : uint8_t
     X(uint8_t, srv_syn_n, 0)             \
     X(int64_t, srv_syn_at, -1)           \
     X(uint32_t, rcv_nxt, 0)              \
-    X(uint32_t, ooo_n, 0)                /* out-of-order blocks */ \
+    X(uint32_t, ooo_n, 0)                /* out-of-order blocks (a ring from ooo_h) */ \
+    X(uint32_t, ooo_h, 0)                \
     X(uint8_t, delack_count, 0)          \
     X(int64_t, delack_at, -1)            \
     X(uint8_t, ce_state, 0)              \
@@ -354,6 +355,7 @@ struct Sim
     unsigned long long *qtrace_cnt;
     unsigned long long qtrace_n;
     int64_t qtrace_until, qtrace_from;
+    unsigned long long *ties_w; // [worlds] undecided ties per world
     unsigned long long *ev; // [16] counters: drops, marks, retx, rto, tx-cap hits, active overflow, ooo overflow,
                             // due overflow, retransmissions by congestion state (8 + C_*)
 };

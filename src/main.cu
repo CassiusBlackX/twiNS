@@ -978,6 +978,7 @@ int main(int argc, char **argv)
     s.finished = dalloc<int>(1);
     s.error = dalloc<int>(1);
     s.ev = dalloc<unsigned long long>(32);
+    s.ties_w = dalloc<unsigned long long>(W);
     s.qtrace = nullptr;
     s.qtrace_cnt = dalloc<unsigned long long>(1);
     s.qtrace_n = 0;
@@ -1125,6 +1126,18 @@ int main(int argc, char **argv)
         }
     }
     if (W > 1)
+    {
         printf("worlds %d\n", W);
+        if (ev[25])
+        {
+            // the worlds to rerun with twins128
+            std::vector<unsigned long long> tw = ddown(s.ties_w, W);
+            printf("undecided-ties by world:"); // (bench/sweep.py reruns these with twins128)
+            for (int w = 0; w < W; w++)
+                if (tw[w])
+                    printf(" %d", w);
+            printf("\n");
+        }
+    }
     return 0;
 }

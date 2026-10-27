@@ -14,13 +14,17 @@ It models:
   link failures and recoveries.
 
 On one consumer GPU (AMD RX 9060 XT) it is:
-- 55–970× faster than sequential ns-3;
-- 10–279× faster than 32-thread Unison, with the gap growing with the topology (k=8: 10–30×,
-  k=16: 41–83×, k=32: 184–279×);
-- 4–13× faster than GeDES, whose simplified model is off by 15–92% in mean FCT.
+- 5–618× faster than sequential ns-3 (28–618× on all but the 160-flow incasts);
+- 4–199× faster than 32-thread Unison, with the gap growing with the topology (k=8: 4–16×,
+  k=16: 15–40×, k=32: 118–199×);
+- 2–9× faster than GeDES, whose simplified model is off by 15–92% in mean FCT.
 
 Because results are exact, a parameter sweep run with TwiNS gives ns-3's conclusions. The k=16
-sweep below took 10.4 s, against 1,953 s for ns-3 on 32 cores.
+sweep below took 24 s, against 1,953 s for ns-3 on 32 cores.
+
+(The general TcpTxBuffer that persistent connections and partial segments need made the model
+1.4–1.8× slower than the first version, which handled one MSS-aligned flow per connection; see
+"Limits".)
 
 ## Build
 
@@ -126,15 +130,25 @@ enqueue and then reading the ns-3 source (see `validation/README.md`).
 ## Results
 
 **Exactness.** Every flow's establishment and completion time equals sequential ns-3's in all
-318 runs. Every row covers DCTCP, NewReno and Cubic.
+477 runs. Every row covers DCTCP, NewReno and Cubic.
 
 | set | runs |
 |---|---|
 | FatTree k=8: 6 workloads × 6 start-time variants (5 jittered by 0–10 ns) | 108 |
 | FatTree k=16: 4 workloads, up to 50,818 flows | 12 |
 | Leaf-spine, 16 leaves × 16 hosts, 8 spines: 4 workloads, up to 25,390 flows | 12 |
+| Flow sizes that are not MSS multiples: k=8 (3 workloads), leaf-spine, k=16 | 15 |
+| Persistent connections carrying several flows (up to 25,344 over 256 connections), with and without FIN, and FIN on 4 earlier workloads | 48 |
+| Per-packet spraying: k=8 (5 workloads), leaf-spine, k=16, reuse with FIN | 24 |
+| Topology files: Jellyfish (128 and 1,024 hosts), 2-D torus, Dragonfly; per-flow ECMP and spraying | 48 |
+| Link failures and recoveries on FatTree, Jellyfish, torus; per-flow ECMP and spraying | 24 |
 | k=8 sweep: ECN threshold K × queue limit × 2 loads | 138 |
 | k=16 sweep: K × queue limit × 2 loads | 48 |
+
+A few runs (3 of 138 k=8 and 8 of 48 k=16 sweep configurations, k16 a2a30 NewReno with spraying)
+contain simultaneous events whose recorded histories are equal over all 9 runs a 64-byte frame
+holds. TwiNS counts such undecided ties and warns; `twins128` (128-byte frames, 25 runs) decides
+them, and the validation scripts and `bench/sweep.py` rerun with it when needed.
 
 For comparison:
 - The GeDES model is off by 15–92% in mean FCT on the same workloads.
@@ -151,33 +165,33 @@ For comparison:
 
 | workload | flows | TCP | ns-3 | Unison (32 thr) | GeDES | TwiNS | vs ns-3 | vs Unison |
 |---|---|---|---|---|---|---|---|---|
-| k8 paper | 128 | DCTCP | 24.8 s | 3.45 s | 1.65 s | 0.224 s | 111× | 15× |
-| k8 paper | 128 | NewReno | 40.3 s | 11.0 s | 1.65 s | 0.365 s | 110× | 30× |
-| k8 fullsync | 128 | DCTCP | 2.82 s | 0.457 s | | 0.035 s | 81× | 13× |
-| k8 fullexp | 128 | DCTCP | 4.09 s | 0.757 s | | 0.075 s | 55× | 10× |
-| k8 a2a30 | 273 | DCTCP | 21.5 s | 3.19 s | | 0.326 s | 66× | 10× |
-| k8 a2a30 | 273 | NewReno | 30.3 s | 8.27 s | | 0.396 s | 76× | 21× |
-| k8 incast16 | 160 | DCTCP | 0.658 s | 0.512 s | | 0.085 s | 8× | 6× |
-| k8 a2a50s | 12519 | DCTCP | 55.1 s | 4.97 s | | 0.357 s | 154× | 14× |
-| k8 a2a50s | 12519 | NewReno | 55.4 s | 7.81 s | | 0.438 s | 126× | 18× |
-| k16 paper | 1024 | DCTCP | 352 s | 23.1 s | 2.51 s | 0.434 s | 811× | 53× |
-| k16 paper | 1024 | NewReno | 535 s | 45.9 s | 2.51 s | 0.551 s | 971× | 83× |
-| k16 a2a30 | 2253 | DCTCP | 419 s | 25.9 s | | 0.637 s | 658× | 41× |
-| k16 a2a30 | 2253 | NewReno | 491 s | 54.6 s | | 0.833 s | 590× | 66× |
-| k16 incast16 | 160 | DCTCP | 0.913 s | 1.90 s | | 0.076 s | 12× | 25× |
-| k16 a2a50s | 50818 | DCTCP | 486 s | 31.6 s | | 0.507 s | 958× | 62× |
-| k16 a2a50s | 50818 | NewReno | 444 s | 61.3 s | | 1.050 s | 423× | 58× |
+| k8 paper | 128 | DCTCP | 24.8 s | 3.45 s | 1.65 s | 0.401 s | 62× | 9× |
+| k8 paper | 128 | NewReno | 40.3 s | 11.0 s | 1.65 s | 0.676 s | 60× | 16× |
+| k8 fullsync | 128 | DCTCP | 2.82 s | 0.457 s | | 0.054 s | 52× | 8× |
+| k8 fullexp | 128 | DCTCP | 4.09 s | 0.757 s | | 0.149 s | 28× | 5× |
+| k8 a2a30 | 273 | DCTCP | 21.5 s | 3.19 s | | 0.566 s | 38× | 6× |
+| k8 a2a30 | 273 | NewReno | 30.3 s | 8.27 s | | 0.782 s | 39× | 11× |
+| k8 incast16 | 160 | DCTCP | 0.658 s | 0.512 s | | 0.121 s | 5× | 4× |
+| k8 a2a50s | 12519 | DCTCP | 55.1 s | 4.97 s | | 0.534 s | 103× | 9× |
+| k8 a2a50s | 12519 | NewReno | 55.4 s | 7.81 s | | 0.676 s | 82× | 12× |
+| k16 paper | 1024 | DCTCP | 352 s | 23.1 s | 2.51 s | 0.775 s | 454× | 30× |
+| k16 paper | 1024 | NewReno | 535 s | 45.9 s | 2.51 s | 1.25 s | 428× | 37× |
+| k16 a2a30 | 2253 | DCTCP | 419 s | 25.9 s | | 1.25 s | 336× | 21× |
+| k16 a2a30 | 2253 | NewReno | 491 s | 54.6 s | | 1.80 s | 273× | 30× |
+| k16 incast16 | 160 | DCTCP | 0.913 s | 1.90 s | | 0.124 s | 7× | 15× |
+| k16 a2a50s | 50818 | DCTCP | 486 s | 31.6 s | | 0.786 s | 618× | 40× |
+| k16 a2a50s | 50818 | NewReno | 444 s | 61.3 s | | 1.72 s | 258× | 36× |
 
 At k=32 (8,192 hosts), DCTCP:
-- TwiNS takes 1.2–1.7 s per workload.
+- TwiNS takes 0.12–1.9 s per workload.
 - GeDES takes 15.9 s on the paper workload.
 - Before its event loop starts, ns-3 spends 2–2.6 hours on routing set-up alone.
 
 | workload | flows | Unison (32 thr) | TwiNS | speedup |
 |---|---|---|---|---|
-| k32 paper | 8192 | 220 s | 1.20 s | 184× |
-| k32 a2a50s | 162505 | 337 s | 1.21 s | 279× |
-| k32 incast16 | 160 | 16.3 s | 0.073 s | 223× |
+| k32 paper | 8192 | 220 s | 1.86 s | 118× |
+| k32 a2a50s | 162505 | 337 s | 1.69 s | 199× |
+| k32 incast16 | 160 | 16.3 s | 0.115 s | 142× |
 
 **Parameter sweeps.** `bench/sweep.py` runs a grid as batches of worlds;
 `bench/sweep_report.py` tabulates short-flow p99 and long-flow mean FCT per configuration.
@@ -193,10 +207,11 @@ The k=16 grid (1,024 hosts) has 48 configurations: K ∈ {10, 20, 40, 80} × que
 
 | sweep | ns-3, sum of runs | ns-3 on 32 cores | TwiNS, one at a time | TwiNS, batched |
 |---|---|---|---|---|
-| k=8, 138 configurations | 11,142 s | 455.7 s | 76 s | 4.4 s (69 worlds; 104×) |
-| k=16, 48 configurations | 39,641 s | 1,953.5 s | 48.7 s | 10.4 s (16 worlds; 188×) |
+| k=8, 138 configurations | 11,142 s | 455.7 s | 137 s | 9.2 s (69 worlds; 50×) |
+| k=16, 48 configurations | 39,641 s | 1,953.5 s | 118 s | 24.2 s (16 worlds; 81×) |
 
-The speedups in parentheses are against ns-3 on 32 cores.
+The speedups in parentheses are against ns-3 on 32 cores. The batched times include rerunning
+the worlds with undecided ties with `twins128` (3 at k=8, 8 at k=16).
 
 Short-flow tails are far from smooth in K. For example, with DCTCP at k=8, 30% load and a
 100-packet queue, p99 goes 118, 114, 91, 175, 127, 1120 and 523 µs for K = 5 to 80. The cause is
@@ -235,7 +250,12 @@ them, see `validation/README.md`.
   per link and slot. This caps the topology at k=32 on a 16 GB GPU, and switch blocks assume at
   most 32 ports.
 - **Batch size.** Batches are limited by GPU memory: a 16 GB GPU holds 69 k=8 worlds or 16 k=16
-  worlds.
+  worlds (`twins128`: about half).
+- **Speed.** The exact TcpTxBuffer (a ring of items with flags, merged and split as ns-3 does)
+  and the larger kernel cost 1.4–1.8× against the first version; a performance pass is pending.
+- **Event-order ties.** When two simultaneous events have equal histories beyond what a frame
+  records, the order is a guess; TwiNS reports these (`undecided-ties`) and `twins128` reaches
+  further back.
 - **Topology files.** Links all run at 100 Gbps with 1 µs delay (the slot is the propagation
   delay; mixed rates are not modelled yet); hosts have one link.
 - **Protocols.** Not yet modelled: RDMA with PFC (DCQCN, HPCC).

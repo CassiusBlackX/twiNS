@@ -14,12 +14,26 @@ __device__ inline void frame_copy(Frame *d, const Frame *s)
 {
     const uint4 *a = reinterpret_cast<const uint4 *>(s);
     uint4 *b = reinterpret_cast<uint4 *>(d);
-    constexpr int N = sizeof(Frame) / 16;
-    uint4 v[N];
-    for (int i = 0; i < N; i++)
-        v[i] = a[i];
-    for (int i = 0; i < N; i++)
-        b[i] = v[i];
+    // (all loads first, then the stores: s and d may overlap)
+    if constexpr (sizeof(Frame) == 64)
+    {
+        uint4 x = a[0], y = a[1], z = a[2], w = a[3];
+        b[0] = x;
+        b[1] = y;
+        b[2] = z;
+        b[3] = w;
+    }
+    else
+    {
+        constexpr int N = sizeof(Frame) / 16;
+        uint4 v[N];
+#pragma unroll
+        for (int i = 0; i < N; i++)
+            v[i] = a[i];
+#pragma unroll
+        for (int i = 0; i < N; i++)
+            b[i] = v[i];
+    }
 }
 
 // ------------------------------------------------------------------ ns-3 event order
@@ -1578,59 +1592,74 @@ __device__ inline bool rx_add(const Sim &s, int f, uint32_t seq, uint32_t end)
     if (head >= end)
         return false;
     uint32_t *bs = F.oo_s + F.oo_off[f], *be = F.oo_e + F.oo_off[f];
+    const uint32_t cap = F.oo_cap[f], h0 = F.ooo_h[f];
     uint32_t n = F.ooo_n[f];
-    uint32_t i = 0;
-    while (i < n && be[i] < head)
-        i++;
-    if (i < n && bs[i] <= head && be[i] >= end)
+    auto at = [&](uint32_t i) { uint32_t x = h0 + i; return x >= cap ? x - cap : x; };
+    // the first block ending at or after head (blocks are disjoint and sorted, so their ends are)
+    uint32_t i;
+    if (n == 0 || be[at(n - 1)] < head)
+        i = n; // beyond every block (the common case)
+    else
+    {
+        uint32_t lo = 0, hi = n - 1;
+        while (lo < hi)
+        {
+            uint32_t m = (lo + hi) / 2;
+            if (be[at(m)] < head)
+                lo = m + 1;
+            else
+                hi = m;
+        }
+        i = lo;
+    }
+    if (i < n && bs[at(i)] <= head && be[at(i)] >= end)
         return false; // all held already
     // the union with the blocks it overlaps or touches
     uint32_t us = head, ue = end, j = i;
-    while (j < n && bs[j] <= ue)
+    while (j < n && bs[at(j)] <= ue)
     {
-        if (bs[j] < us)
-            us = bs[j];
-        if (be[j] > ue)
-            ue = be[j];
+        if (bs[at(j)] < us)
+            us = bs[at(j)];
+        if (be[at(j)] > ue)
+            ue = be[at(j)];
         j++;
     }
     if (j == i)
     {
-        if (n >= F.oo_cap[f])
+        if (n >= cap)
         {
             atomicAdd(&s.ev[6], 1ull); // too many out-of-order blocks
             return false;
         }
         for (uint32_t k = n; k > i; k--)
         {
-            bs[k] = bs[k - 1];
-            be[k] = be[k - 1];
+            bs[at(k)] = bs[at(k - 1)];
+            be[at(k)] = be[at(k - 1)];
         }
         n++;
     }
     else
     {
         uint32_t gone = j - i - 1;
-        for (uint32_t k = j; k < n; k++)
-        {
-            bs[k - gone] = bs[k];
-            be[k - gone] = be[k];
-        }
+        if (gone)
+            for (uint32_t k = j; k < n; k++)
+            {
+                bs[at(k - gone)] = bs[at(k)];
+                be[at(k - gone)] = be[at(k)];
+            }
         n -= gone;
     }
-    bs[i] = us;
-    be[i] = ue;
+    bs[at(i)] = us;
+    be[at(i)] = ue;
+    uint32_t h = h0;
     if (head == F.rcv_nxt[f])
     {
         // in sequence: the block at i (= 0) is now in order
-        F.rcv_nxt[f] = be[0];
-        for (uint32_t k = 1; k < n; k++)
-        {
-            bs[k - 1] = bs[k];
-            be[k - 1] = be[k];
-        }
+        F.rcv_nxt[f] = be[at(0)];
+        h = at(1);
         n--;
     }
+    F.ooo_h[f] = n ? h : 0;
     F.ooo_n[f] = n;
     if (F.r_fin[f] >= 0 && F.rcv_nxt[f] == (uint32_t)F.r_fin[f])
         F.rcv_nxt[f]++; // the FIN
@@ -1943,7 +1972,10 @@ __device__ __noinline__ bool timer_before_arrival(const Sim &s, const FlowSoA &F
     chain_push(arr, chain_arrival(p.len), p.chain);
     int r = chain_cmp(due_chain(F, d), arr);
     if (r == 0)
+    {
         atomicAdd(&s.ev[25], 1ull);
+        atomicAdd(&s.ties_w[(p.dst_node % s.H) / s.H1], 1ull);
+    }
     return r <= 0; // (undecided: the timer)
 }
 
@@ -2383,7 +2415,10 @@ __device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b
         return a.len > b.len;
     int c = chain_cmp(a.chain, b.chain);
     if (c == 0)
+    {
         atomicAdd(&s.ev[25], 1ull); // the recorded histories do not tell: a guess
+        atomicAdd(&s.ties_w[(a.dst_node % s.H) / s.H1], 1ull);
+    }
     return c != 0 ? c < 0 : a.flow < b.flow;
 }
 
