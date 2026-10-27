@@ -85,9 +85,10 @@ struct Pkt
     uint8_t ecn;    // the IP header's ECN bits are CE (3), else 0
     uint8_t cnp;    // ACK/NACK: the CNP flag
     uint8_t q;      // PFC: the queue index
-    uint16_t inport; // queued at a switch: the ingress port (FlowIdTag)
+    uint8_t inport; // queued at a switch: the ingress port (FlowIdTag)
     uint8_t ord;    // on a link: the arrival's ordinal in the event that started it
-    uint8_t pad[5];
+    uint16_t sport; // the flow's source port, source and destination hosts (data and ACKs)
+    uint16_t src, dst;
 };
 static_assert(sizeof(Pkt) == 64, "Pkt");
 
@@ -135,6 +136,14 @@ struct RcvQP
     uint32_t expected;  // ReceiverNextExpectedSeq
     uint32_t last_nack; // m_lastNACK
     int64_t nack_timer; // m_nackTimer
+};
+
+// a switch's equal-cost ports (in table order) towards a host
+constexpr int RT_PORTS = 15;
+struct Route
+{
+    uint8_t n;
+    uint8_t port[RT_PORTS];
 };
 
 struct FlowInfo
@@ -220,10 +229,8 @@ struct Sim
     // topology: node n's port p (device p + 1) sends on link out_link[n K + p], receives on
     // in_link[n K + p]; a link's receiving node and port
     int *deg, *out_link, *in_link, *link_dst, *link_dport;
-    // routes: switch x towards host h, the ports rt_ports[rt_off[x H + h] ..], rt_n of them
-    uint32_t *rt_off;
-    uint8_t *rt_n;
-    uint16_t *rt_ports;
+    // routes: switch x towards host h, rt[x H + h]
+    struct Route *rt;
     FlowInfo *fi;
     SndQP *qp;
     QPChains *qc;

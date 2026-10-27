@@ -322,16 +322,20 @@ int main(int argc, char **argv)
         for (int n = 0; n < N; n++)
             hop_n[n][h] = dis[n];
     }
-    vector<uint32_t> rt_off((size_t)S * H);
-    vector<uint8_t> rt_n((size_t)S * H);
-    vector<uint16_t> rt_ports;
+    vector<Route> rt((size_t)S * H);
     for (int x = 0; x < S; x++)
         for (int h = 0; h < H; h++)
         {
-            rt_off[(size_t)x * H + h] = rt_ports.size();
-            rt_n[(size_t)x * H + h] = next_hop[x][h].size();
-            for (int nx : next_hop[x][h])
-                rt_ports.push_back(nbr[H + x][nx]);
+            Route &r = rt[(size_t)x * H + h];
+            r = Route{};
+            if (next_hop[x][h].size() > (size_t)RT_PORTS)
+            {
+                fprintf(stderr, "switch %d has %zu equal-cost ports towards host %d (at most %d)\n", H + x, next_hop[x][h].size(), h, RT_PORTS);
+                return 1;
+            }
+            r.n = next_hop[x][h].size();
+            for (int i = 0; i < r.n; i++)
+                r.port[i] = nbr[H + x][next_hop[x][h][i]];
         }
     // maxRtt, maxBdp: delay * 2 + txDelay over host pairs (uniform links)
     uint64_t max_rtt = 0, max_bdp = 0;
@@ -445,9 +449,7 @@ int main(int argc, char **argv)
     s.in_link = dev_copy(in_link);
     s.link_dst = dev_copy(link_dst);
     s.link_dport = dev_copy(link_dport);
-    s.rt_off = dev_copy(rt_off);
-    s.rt_n = dev_copy(rt_n);
-    s.rt_ports = dev_copy(rt_ports);
+    s.rt = dev_copy(rt);
     s.fi = dev_copy(fi);
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
@@ -531,7 +533,7 @@ int main(int argc, char **argv)
         s.tx_from = tx_from;
         s.tx_until = tx_until;
     }
-    s.ev = dev_alloc<unsigned long long>(24);
+    s.ev = dev_alloc<unsigned long long>(32);
     {
         TailPool tp;
         uint64_t cap = 1ull << tail_log2;
@@ -539,6 +541,12 @@ int main(int argc, char **argv)
         tp.cnt = dev_alloc<unsigned long long>(1);
         tp.mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
+    }
+    {
+        vector<int32_t> txt(TXT_N);
+        for (int b = 0; b < TXT_N; b++)
+            txt[b] = (int32_t)tx_ns(P.bps, b);
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(c_txt), txt.data(), sizeof(int32_t) * TXT_N));
     }
     // one thread per host or switch; a switch thread keeps its ports in LDS
     int BS = 64;
@@ -568,7 +576,7 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(&done, s.flows_done, sizeof(unsigned), cudaMemcpyDeviceToHost));
     vector<int64_t> fct(F);
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
-    unsigned long long ev[24];
+    unsigned long long ev[32];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
     FILE *fo = fopen(out_file.c_str(), "w");
     for (int i = 0; i < F; i++)
@@ -604,6 +612,9 @@ int main(int argc, char **argv)
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);
+    printf("prof: switch cycles per event: select %.0f, arrival chain %.0f, tc events %.0f, arrival handling %.0f\n", (double)ev[24] / ev[20],
+           (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
+    printf("prof: switch ties %llu, undecided by the prefixes %llu\n", ev[28], ev[29]);
 #endif
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12];
     if (bad)
