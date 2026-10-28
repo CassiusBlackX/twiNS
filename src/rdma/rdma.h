@@ -24,6 +24,80 @@
 namespace rdma
 {
 
+// Unsigned 64-bit division by a divisor fixed at setup (libdivide's round-up method, exact for
+// every numerator): one multiply-high instead of the GPU's division routine (about 100
+// instructions, and ~370 cycles, at every use)
+struct FDiv
+{
+    uint64_t m;      // the magic number (0: d is a power of two)
+    uint64_t d;
+    uint32_t sh, add;
+};
+inline FDiv fdiv_make(uint64_t d)
+{
+    FDiv f = {0, d, 0, 0};
+    int l = 63 - __builtin_clzll(d);
+    if ((d & (d - 1)) == 0)
+    {
+        f.sh = l;
+        return f;
+    }
+    unsigned __int128 num = (unsigned __int128)1 << (64 + l);
+    uint64_t pm = (uint64_t)(num / d), rem = (uint64_t)(num % d);
+    if (d - rem < (1ull << l))
+        f.sh = l;
+    else
+    {
+        pm += pm;
+        uint64_t tr = rem + rem;
+        if (tr >= d || tr < rem)
+            pm += 1;
+        f.sh = l;
+        f.add = 1;
+    }
+    f.m = pm + 1;
+    return f;
+}
+__host__ __device__ __forceinline__ uint64_t fdiv(uint64_t m, uint32_t sh, uint32_t add, uint64_t n)
+{
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+    uint64_t q = m ? __umul64hi(n, m) : n;
+#else
+    uint64_t q = m ? (uint64_t)(((unsigned __int128)n * m) >> 64) : n;
+#endif
+    if (add)
+        q = ((n - q) >> 1) + q;
+    return q >> sh;
+}
+__host__ __device__ __forceinline__ uint64_t fdiv(const FDiv &f, uint64_t n) { return fdiv(f.m, f.sh, f.add, n); }
+__host__ __device__ __forceinline__ uint64_t fmod(const FDiv &f, uint64_t n) { return n - fdiv(f, n) * f.d; }
+// n / d for a divisor known only at run time: a double estimate, then exact integer steps (one or
+// two for a divisor of 2^11 or more, as rates are)
+__host__ __device__ __forceinline__ uint64_t udiv64(uint64_t n, uint64_t d)
+{
+    double e = (double)n / (double)d;
+    uint64_t q = e >= 18446744073709551615.0 ? ~0ull : (uint64_t)e;
+    // r = n - q d: the steps while it is negative or at least d (as a 128-bit value: q d may wrap)
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+    uint64_t hi = __umul64hi(q, d);
+#else
+    uint64_t hi = (uint64_t)(((unsigned __int128)q * d) >> 64);
+#endif
+    uint64_t lo = q * d;
+    while (hi || lo > n) // q d > n
+    {
+        q--;
+        hi -= lo < d;
+        lo -= d;
+    }
+    while (n - lo >= d)
+    {
+        q++;
+        lo += d;
+    }
+    return q;
+}
+
 #ifndef TWINS_RDMA_RUNS
 #define TWINS_RDMA_RUNS 6
 #endif
@@ -231,6 +305,7 @@ struct PortStatic
     uint32_t kmin, kmax;
     uint32_t in_coff, in_moff;
     uint16_t in_nb, in_cap;
+    FDiv in_fnb;          // in_nb
 };
 
 // A directed link. Its frames are filed by the slot they arrive in: bucket a % nb of its ring
@@ -245,6 +320,7 @@ struct LinkInfo
     uint32_t coff;
     uint16_t nb, cap;
     uint32_t rc;    // its rate's tx table
+    FDiv fnb;       // nb
 };
 
 struct Params
@@ -357,6 +433,7 @@ struct Sim
     int R;
     unsigned int *pend; // [pend_n] a frame arrives in slot a: pend[a % pend_n] != 0 (idle skipping)
     int pend_n;
+    FDiv fpend, fD, fnbi; // pend_n, the slot (P.delay), nbi
     // run control
     int64_t *slot;
     unsigned int *done_blocks;
@@ -468,7 +545,7 @@ struct TxRec
 __host__ __device__ inline int bucket(const Sim &s, int link, int64_t slot, uint32_t *base)
 {
     const LinkInfo &l = s.li[link];
-    int b = (int)(slot % l.nb);
+    int b = (int)fmod(l.fnb, slot);
     long long v = s.msg_cnt[l.coff + b];
     *base = (uint32_t)(l.moff + (uint64_t)b * l.cap);
     return (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;

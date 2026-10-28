@@ -24,7 +24,7 @@ __host__ __device__ __forceinline__ int64_t ns_seconds(double x)
 // Seconds(DataRate(bps).CalculateTxTime(bytes)): bytes * 8 / bps in double
 __host__ __device__ __forceinline__ int64_t tx_ns(uint64_t bps, uint32_t bytes) { return ns_seconds((double)bytes * 8 / (double)bps); }
 // ns-3.36's DataRate::CalculateBytesTxTime: Seconds(bytes * 8) / bps, an integer division
-__host__ __device__ __forceinline__ int64_t tx_ns36(uint64_t bps, uint32_t bytes) { return (int64_t)((uint64_t)bytes * 8000000000ull / bps); }
+__host__ __device__ __forceinline__ int64_t tx_ns36(uint64_t bps, uint32_t bytes) { return (int64_t)udiv64((uint64_t)bytes * 8000000000ull, bps); }
 __host__ __device__ __forceinline__ int64_t tx_ns(int simai, uint64_t bps, uint32_t bytes) { return simai ? tx_ns36(bps, bytes) : tx_ns(bps, bytes); }
 
 // tx_ns(a link's rate, bytes) for frames below TXT_N bytes: c_txt for rate class 0 (the only one
@@ -56,6 +56,8 @@ struct OutBucket
     int link;
     uint32_t coff, rc;
     uint16_t nb;
+    uint8_t nb_sh, nb_add; // nb's FDiv, packed (a larger OutBucket put the frames in scratch)
+    uint64_t nb_m;
     uint64_t moff, bps;
     long long last;
     uint32_t txs[2];
@@ -68,6 +70,9 @@ __device__ __forceinline__ void link_open(OutBucket &o, int link, const LinkInfo
     o.coff = l.coff;
     o.rc = l.rc;
     o.nb = l.nb;
+    o.nb_m = l.fnb.m;
+    o.nb_sh = (uint8_t)l.fnb.sh;
+    o.nb_add = (uint8_t)l.fnb.add;
     o.cap = l.cap;
     o.moff = l.moff;
     o.bps = l.bps;
@@ -94,7 +99,7 @@ __device__ __forceinline__ void link_flush(const Sim &s, OutBucket &o)
 {
     if (o.hi == 0)
         return;
-    o.last = (long long)(o.lo / s.P.delay) << 16 | o.n;
+    o.last = (long long)fdiv(s.fD, o.lo) << 16 | o.n;
     s.msg_cnt[o.cnt] = o.last;
     o.hi = 0;
 }
@@ -105,14 +110,14 @@ __device__ __forceinline__ LFrame *link_push(const Sim &s, int64_t ts, OutBucket
     if (ts >= o.hi)
     {
         link_flush(s, o);
-        int64_t a = ts / s.P.delay;
-        int b = (int)(a % o.nb);
+        int64_t a = (int64_t)fdiv(s.fD, ts);
+        int b = (int)(a - fdiv(o.nb_m, o.nb_sh, o.nb_add, a) * o.nb);
         o.cnt = o.coff + b;
         o.lo = a * s.P.delay;
         o.hi = o.lo + s.P.delay;
         o.base = (uint32_t)(o.moff + (uint64_t)b * o.cap);
         o.n = (o.last >> 16) == a ? (uint16_t)(o.last & 0xFFFF) : 0;
-        s.pend[a % s.pend_n] = 1;
+        s.pend[fmod(s.fpend, a)] = 1;
 #ifdef RDMA_PROF
         if (s.any_win && s.hz[s.link_dst[o.link]] > a)
             atomicAdd(&s.ev[33], 1ull); // its receiver has run the slot (a bug: reported; profiling builds)
@@ -124,6 +129,14 @@ __device__ __forceinline__ LFrame *link_push(const Sim &s, int64_t ts, OutBucket
         return nullptr;
     }
     return s.msg + o.base + o.n++;
+}
+
+// (a + b) % n for a ring's index a and an offset b, both nonnegative (a division's routine
+// otherwise; a ring's head is below n and its count at most n: one step)
+__device__ __forceinline__ int ring_add(int a, int b, int n)
+{
+    int x = a + b;
+    return x >= n ? x - n : x;
 }
 
 // DataRate(d) from a double (DataRate(uint64_t), truncation)
@@ -212,7 +225,7 @@ struct RunCursor
     uint32_t left;  // repetitions left of the current run
     bool lost;      // the tail was overwritten
     // the runs of the chain cpush(code, ch) would give (code 0: of ch itself)
-    __device__ void init(const Chain &ch, uint32_t code0 = 0)
+    __device__ __forceinline__ void init(const Chain &ch, uint32_t code0 = 0)
     {
         c = &ch;
         i = 0;
@@ -232,7 +245,7 @@ struct RunCursor
         }
         load();
     }
-    __device__ void load()
+    __device__ __forceinline__ void load()
     {
         if (i < RUNS)
         {
@@ -262,7 +275,7 @@ struct RunCursor
         code = n.code;
         left = n.cnt;
     }
-    __device__ void next()
+    __device__ __forceinline__ void next()
     {
         if (i < RUNS)
         {
@@ -604,8 +617,8 @@ __host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip,
 __device__ __forceinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
 {
     int64_t ts = tI + s.send_lat;
-    int64_t a = (tE + s.send_lat) / s.P.delay;
-    int b = (int)(a % s.nbi);
+    int64_t a = (int64_t)fdiv(s.fD, tE + s.send_lat);
+    int b = (int)fmod(s.fnbi, a);
     unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
     if (n >= (unsigned)s.dcap)
     {
@@ -624,7 +637,7 @@ __device__ __forceinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t
         atomicAdd(&s.srv_fpend[s.h_srv[cf.src]], 1); // (no quiet windows in its server until it starts)
     if (s.any_win && s.hz[cf.src] > a)
         atomicAdd(&s.ev[33], 1ull);
-    s.pend[a % s.pend_n] = 1;
+    s.pend[fmod(s.fpend, a)] = 1;
 }
 
 // Flow g's dependency of kind k (0 received: its QpComplete; 1 sent: its first SendComplete) fired
@@ -711,7 +724,7 @@ __device__ __forceinline__ uint64_t hop_rate(uint64_t h)
 __device__ __forceinline__ uint64_t hop_make(uint64_t time, uint64_t bytes, uint32_t qlen, uint64_t rate, uint32_t multi)
 {
     uint64_t lr = rate == 25000000000ull ? 0 : rate == 50000000000ull ? 1 : rate == 100000000000ull ? 2 : rate == 200000000000ull ? 3 : 4;
-    uint64_t b = bytes / (128ull * multi), q = qlen / (80u * multi);
+    uint64_t b = multi == 1 ? bytes >> 7 : udiv64(bytes, 128ull * multi), q = multi == 1 ? qlen / 80u : qlen / (80u * multi);
     return lr | (time & 0xFFFFFF) << 3 | (b & 0xFFFFF) << 27 | (q & 0x1FFFF) << 47;
 }
 __device__ __forceinline__ uint64_t hop_bytes_delta(uint64_t a, uint64_t b, uint32_t multi)
@@ -782,15 +795,15 @@ struct Arrivals
 {
     const LFrame *a;
     int na, i;
-    __device__ void init(const Sim &s, int link, int64_t slot)
+    __device__ __forceinline__ void init(const Sim &s, int link, int64_t slot) // (a call would put it in scratch)
     {
         uint32_t base;
         na = bucket(s, link, slot, &base);
         a = s.msg + base;
         i = 0;
     }
-    __device__ const LFrame *peek() const { return i < na ? &a[i] : nullptr; }
-    __device__ void pop() { i++; }
+    __device__ __forceinline__ const LFrame *peek() const { return i < na ? &a[i] : nullptr; }
+    __device__ __forceinline__ void pop() { i++; }
 };
 
 // a frame's arrival over a link of the given delay: [lead tx + delay, its ordinal] + the chain of
@@ -881,7 +894,7 @@ __device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
     uint64_t w = q.win;
     if (P.var_win)
     {
-        w = (uint64_t)q.win * q.rate / q.max_rate;
+        w = udiv64((uint64_t)q.win * q.rate, q.max_rate);
         if (w == 0)
             w = 1;
     }
@@ -944,9 +957,10 @@ __device__ __forceinline__ int next_qindex(HCtx<ND> &c)
         return -1;
     int *list = s.qps + (size_t)c.nic() * s.qps_cap;
     int res = -1024, fcount = c.st().qp_n, min_finish = INT_MAX;
+    int idx = fcount ? c.st().rr % fcount : 0;
     for (int qi = 1; qi <= fcount; qi++)
     {
-        int idx = (qi + c.st().rr) % fcount;
+        idx = idx + 1 == fcount ? 0 : idx + 1; // (qi + m_rrlast) % fcount
         const SndQP &q = s.qp[list[idx]];
         if (!(c.st().paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
         {
@@ -984,7 +998,7 @@ __device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
     if (idx == -1)
     {
         Pkt p = s.ackq[(size_t)c.nic() * s.ackq_cap + c.st().ackq_head];
-        c.st().ackq_head = (c.st().ackq_head + 1) % s.ackq_cap;
+        c.st().ackq_head = ring_add(c.st().ackq_head, 1, s.ackq_cap);
         c.st().ackq_n--;
         h_transmit(c, p);
         return;
@@ -1319,7 +1333,7 @@ __device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
         atomicAdd(&s.ev[6], 1ull);
         return;
     }
-    s.ackq[(size_t)c.nic() * s.ackq_cap + (c.st().ackq_head + c.st().ackq_n) % s.ackq_cap] = a;
+    s.ackq[(size_t)c.nic() * s.ackq_cap + ring_add(c.st().ackq_head, c.st().ackq_n, s.ackq_cap)] = a;
     c.st().ackq_n++;
     h_dequeue(c);
 }
@@ -1438,7 +1452,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         hints[0] = total;
         // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
         // the host has no event in it
-        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + slot % s.nbi]) && s.hs[s.nic_off[h]].wake >= t1;
+        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)]) && s.hs[s.nic_off[h]].wake >= t1;
     }
     __syncthreads();
     if (hints[HHINTS])
@@ -1567,9 +1581,9 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     // one this is becomes ready, to start at the latest of them (in ns-3's order)
     int *dyn = s.dag ? s.dyn + (size_t)h * s.dyn_cap : nullptr;
     int ndyn = s.dag ? s.dyn_n[h] : 0;
-    if (s.dag && s.hhead[(size_t)h * s.nbi + slot % s.nbi])
+    if (s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)])
     {
-        int b = (int)(slot % s.nbi);
+        int b = (int)fmod(s.fnbi, slot);
         unsigned int nx = s.hhead[(size_t)h * s.nbi + b];
         s.hhead[(size_t)h * s.nbi + b] = 0;
         for (; nx; nx = s.dmsg[(size_t)b * s.dcap + nx - 1].next)
@@ -1945,7 +1959,7 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
             atomicAdd(&s.ev[5], 1ull);
             return;
         }
-        s.q0[pi * s.q0_cap + (pt.q0_head + pt.q0_n) % s.q0_cap] = p;
+        s.q0[pi * s.q0_cap + ring_add(pt.q0_head, pt.q0_n, s.q0_cap)] = p;
         pt.q0_n++;
     }
     else
@@ -1955,7 +1969,7 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
             atomicAdd(&s.ev[5], 1ull);
             return;
         }
-        s.q3[pi * s.q3_cap + (pt.q3_head + pt.q3_n) % s.q3_cap] = p;
+        s.q3[pi * s.q3_cap + ring_add(pt.q3_head, pt.q3_n, s.q3_cap)] = p;
         pt.q3_n++;
     }
     pt.bytes_total += p.size;
@@ -1971,7 +1985,7 @@ __device__ __forceinline__ void s_start_q0(SCtx &c, int port)
         return;
     size_t pi = (size_t)s.pbase[c.x] + port;
     Pkt p = s.q0[pi * s.q0_cap + pt.q0_head];
-    pt.q0_head = (pt.q0_head + 1) % s.q0_cap;
+    pt.q0_head = ring_add(pt.q0_head, 1, s.q0_cap);
     pt.q0_n--;
     pt.bytes_total -= p.size;
     pt.tx_bytes += p.size;
@@ -2009,7 +2023,7 @@ __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
     if ((pt.paused >> PG & 1) || pt.q3_n == 0)
         return;
     Pkt p = s.q3[((size_t)s.pbase[c.x] + port) * s.q3_cap + pt.q3_head];
-    pt.q3_head = (pt.q3_head + 1) % s.q3_cap;
+    pt.q3_head = ring_add(pt.q3_head, 1, s.q3_cap);
     pt.q3_n--;
     pt.bytes_total -= p.size;
     s_start_q3(c, port, p);
@@ -2270,7 +2284,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         link_open(q.ob, ps.link_out, s.li[ps.link_out], q.pt.ob_last);
         {
             // bucket(), from the port's copy of its link's ring
-            int b = (int)(slot % ps.in_nb);
+            int b = (int)fmod(ps.in_fnb, slot);
             long long v = s.msg_cnt[ps.in_coff + b];
             q.abase = ps.in_moff + (uint32_t)b * ps.in_cap;
             q.an = (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;
@@ -2951,15 +2965,15 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     // host event or arrival (this slot's arrivals are read: its pending flag is cleared)
     unsigned int cur = atomicAdd(&s.activity[0], 0u);
     unsigned long long nw = atomicAdd(s.next_wake, 0ull);
-    s.pend[slot % s.pend_n] = 0;
+    s.pend[fmod(s.fpend, slot)] = 0;
     if (s.dag)
-        s.dmsg_n[slot % s.nbi] = 0; // this slot's dependency messages are read
+        s.dmsg_n[fmod(s.fnbi, slot)] = 0; // this slot's dependency messages are read
     int64_t next = slot + 1;
     if (cur == 0)
     {
-        int64_t ws = nw != ~0ull ? (int64_t)nw / s.P.delay : INT64_MAX;
+        int64_t ws = nw != ~0ull ? (int64_t)fdiv(s.fD, nw) : INT64_MAX;
         for (int i = 1; i < s.pend_n; i++)
-            if (s.pend[(slot + i) % s.pend_n])
+            if (s.pend[fmod(s.fpend, slot + i)])
             {
                 ws = slot + i < ws ? slot + i : ws;
                 break;
@@ -3114,7 +3128,7 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
             for (int p = lane; p < deg; p += lanes)
             {
                 const PortStatic &ps = s.pst[s.pbase[x] + p];
-                long long v = s.msg_cnt[ps.in_coff + (int)(sl % ps.in_nb)];
+                long long v = s.msg_cnt[ps.in_coff + (int)fmod(ps.in_fnb, sl)];
                 any |= (v >> 16) == sl && (v & 0xFFFF) > 0;
             }
             run = __syncthreads_or(any);

@@ -1214,6 +1214,7 @@ int main(int argc, char **argv)
     Sim s = {};
     s.H = H, s.S = S, s.N = N, s.L = L, s.K = K, s.F = F;
     s.P = P;
+    s.fD = fdiv_make(P.delay);
     s.W = W;
     s.Pw = dev_copy(Pw);
     s.h_world = dev_copy(h_world);
@@ -1463,6 +1464,7 @@ int main(int argc, char **argv)
                 txmax = std::max(txmax, tx_ns(P.simai, r, w.P.mtu + 128));
         nbi = (int)((s.send_lat + txmax) / D) + 3 + kw; // (a host's window runs ahead by up to kw - 1 slots)
         s.nbi = nbi;
+        s.fnbi = fdiv_make(nbi);
         s.dcap = 4096;
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
         s.dmsg_n = dev_alloc<unsigned int>(nbi);
@@ -1605,6 +1607,7 @@ int main(int argc, char **argv)
                     return 1;
                 }
                 x.nb = (uint16_t)nb;
+                x.fnb = fdiv_make(nb);
                 x.cap = (uint16_t)cap;
                 x.moff = nframes;
                 x.coff = (uint32_t)ncnt;
@@ -1633,6 +1636,7 @@ int main(int argc, char **argv)
                 q.in_coff = li[li_in].coff;
                 q.in_moff = (uint32_t)li[li_in].moff;
                 q.in_nb = li[li_in].nb;
+                q.in_fnb = fdiv_make(q.in_nb);
                 q.in_cap = li[li_in].cap;
             }
         s.pst = dev_copy(pst);
@@ -1647,6 +1651,7 @@ int main(int argc, char **argv)
     }
     pend_n = std::max(pend_n, nbi); // (a DAG message arrives send_lat after its event)
     s.pend_n = pend_n;
+    s.fpend = fdiv_make(pend_n);
     s.pend = dev_alloc<unsigned int>(pend_n);
     if (W == 1 && rates.size() > 1)
         printf("slot %lld ns, %zu link rates, %.1f MB of link buffers\n", (long long)D, rates.size(), nframes * sizeof(LFrame) / 1e6);
