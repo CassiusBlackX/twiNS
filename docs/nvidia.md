@@ -34,7 +34,8 @@ A block is 32 lanes, one wave on RDNA and one warp on NVIDIA. Lanes share data o
 | RDMA (HPCC fork): `jobs1`, `jobs2`, `jobs3`, and the k=8 sweep as one batch (32 worlds) | 47 + 32 | all |
 | SimAI: `jobs_net1`, `net2`, `gpu1`, `dag1`, `scale` | 60 | all |
 | SimAI end to end: `jobs_e2e` (microAllReduce up to 128 GPUs, AICB Megatron/MoE) | 16 | 16 |
-| SimAI, new scale: Spectrum-X, 2048 GPUs, rail rings (1,044,480 messages) | 1 | 1 |
+| SimAI, new scale: Spectrum-X, 2048 and 4096 GPUs, rail rings (1,044,480 and 4,186,112 messages) | 2 | 2 |
+| RDMA, new scale: FatTree k=32 (8,192 hosts), HPCC-fork references | 2 so far | all |
 
 Notes:
 - The same undecided ties appear as on AMD: 3 worlds of the k=8 sweep and 8 of the k=16 sweep.
@@ -145,6 +146,24 @@ README.
 | k8 incast64, 1 MB buffers, DCQCN | 0.92 s | 0.90 s |
 | k8 sweep, 32 worlds in one batch | 3.2 s | 1.62 s |
 
+**New scale: k=32 (8,192 hosts).** These are new HPCC-fork references, run sequentially in their
+container on the 9950X with memory caps.
+
+| run | flows | identical | reference | twins-rdma (process / simulation) | speedup (process / simulation) |
+|---|---|---|---|---|---|
+| k32 a2a30, HPCC | 8,899 | 8,899 | 772.1 s (peak 49 GB) | 3.5 s / 1.29 s | 220× / 597× |
+| k32 incast16, DCQCN (853 marks) | 160 | 160 | 400.0 s (peak 49 GB) | 9.03 s* / 0.118 s | 44×* / 3400× |
+
+*Measured before the set-up fix of commit 596f432. That fix took k=32 set-up from about 8.6 s to
+about 2.2 s; with it, k32 a2a30 takes 3.5 s in total instead of 9.87 s. Its parts:
+- the routes' BFS runs over flat adjacency lists;
+- the per-pair tables are flat, with one row per BFS;
+- the per-pair next hops are kept only for hosts with several links;
+- switch next hops go straight into ports;
+- the MRG32k3a jump matrices are computed once rather than per port.
+
+Every validation set is identical with it.
+
 Single RDMA runs are no faster on the 5090.
 - In small runs the process overhead dominates. The k8 permutation's simulation loop takes
   0.062 s, and the rest of its 0.26 s is set-up (CUDA context, graph capture).
@@ -161,9 +180,11 @@ Single RDMA runs are no faster on the 5090.
 | Spectrum-X 512, rails | 64,512 | 16.3 s | 2.8 s | 2.00 s |
 | Spectrum-X 1024, rails | 260,096 | 39.4 s | 10.0 s | 10.24 s |
 | Spectrum-X 2048, rails | 1,044,480 | 150 s | | 15.96 s |
-| Spectrum-X 4096, rails | 4,186,112 | (pending) | does not fit | 38.9 s simulation, 14 GB of GPU memory |
+| Spectrum-X 4096, rails | 4,186,112 | 184.8 s (one 9950X core, about 33 GB) | does not fit | 38.9 s simulation (43.8 s process), 14 GB of GPU memory; all identical |
 
-The 2048-GPU reference ran on a loaded a87, so its 150 s is an upper bound.
+The 2048-GPU reference ran on a loaded a87, so its 150 s is an upper bound. The 4096-GPU
+reference ran on a 9950X core, which is much faster per core. Against it TwiNS gains only 4.2×:
+these ring runs are latency-bound on the GPU (80,064 slot launches).
 
 End to end (`jobs_e2e`, all identical):
 - microAllReduce at 128 GPUs: 4.6–5.9 s, against 5.7–8.0 s on the 9060 XT and 53–63 s for
@@ -176,5 +197,5 @@ These dense 16-GPU runs remain latency-bound: about 20 entities per 25 ns slot.
 
 - Sequential ns-3 references at k=32 (8,192 hosts), never run before. They need more than 22 GB
   each, and set-up alone takes 2–2.6 h on a87. They run one at a time under memory caps.
-- HPCC-fork references at k=32, run on the 9950X in a memory-capped container.
-- The SimAI reference at 4096 GPUs.
+- HPCC-fork references at k=32, run on the 9950X in a memory-capped container. Still to come:
+  a2a30 with DCQCN (reference done), and a2a50s with HPCC (162,505 flows).
