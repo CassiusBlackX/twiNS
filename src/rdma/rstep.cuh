@@ -113,8 +113,10 @@ __device__ __forceinline__ LFrame *link_push(const Sim &s, int64_t ts, OutBucket
         o.base = (uint32_t)(o.moff + (uint64_t)b * o.cap);
         o.n = (o.last >> 16) == a ? (uint16_t)(o.last & 0xFFFF) : 0;
         s.pend[a % s.pend_n] = 1;
+#ifdef RDMA_PROF
         if (s.any_win && s.hz[s.link_dst[o.link]] > a)
-            atomicAdd(&s.ev[33], 1ull); // its receiver has run the slot (a bug: reported)
+            atomicAdd(&s.ev[33], 1ull); // its receiver has run the slot (a bug: reported; profiling builds)
+#endif
     }
     if (o.n >= o.cap)
     {
@@ -799,11 +801,29 @@ __device__ __forceinline__ uint32_t arrival_code(const Sim &s, int link, int64_t
 }
 
 // ------------------------------------------------------------------ host: the NICs
+// A chain's quick form for ties (qcmp): its first runs, lead hash and root
+struct QPre
+{
+    Run r[PRE];
+    uint64_t h;
+    uint32_t root;
+};
+__device__ __forceinline__ void qpre_of(QPre &q, uint32_t code0, const Chain &ch)
+{
+    cprefix(q.r, code0, ch);
+    q.h = code0 ? chash(ch.hash, code0) : ch.hash;
+    q.root = ch.root;
+}
+
 // A host has a device per link (a GPU: an NVLink port and one or two NICs). Each has its own
 // QbbNetDevice and RdmaEgressQueue state (Host, its TransmitComplete and m_nextSend chains, its ACK
 // queue and queue-pair group: the per-NIC arrays, at s.nic_off[h] + device); RdmaHw (queue pairs)
 // is shared. The host's flow starts live in its first device's Host.
 constexpr int MAXD = 4;
+// a host's devices' TransmitComplete, m_nextSend and next arrival's chains in quick form (lane 0's,
+// made when a tie needs them; hq_ok bits: d, MAXD + d, 2 MAXD + d)
+__shared__ QPre hq_tc[MAXD], hq_ns[MAXD], hq_ar[MAXD];
+__shared__ unsigned hq_ok;
 template <int ND>
 struct HCtx
 {
@@ -892,6 +912,7 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
         }
     }
     cpush(&s.h_tc[c.nic()], ccode(tx, c.ord++), c.cur);
+    hq_ok &= ~(1u << c.d);
     p.ord = (uint8_t)(c.ord < 255 ? c.ord : 255);
     c.ord++;
     c.nout++;
@@ -910,6 +931,7 @@ __device__ __forceinline__ void h_schedule_ns(HCtx<ND> &c, int64_t at)
 {
     c.st().ns_at = at;
     cpush(&c.s->h_ns[c.nic()], ccode(at - c.now, c.ord++), c.cur);
+    hq_ok &= ~(1u << (MAXD + c.d));
 }
 
 // RdmaEgressQueue::GetNextQindex: -1 the ACK queue, -1024 none, else the QP's index in the group
@@ -1482,6 +1504,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             in[d].init(s, lin[d], slot);
     }
     hsel(c, 0);
+    hq_ok = 0;
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
     // (due: in LDS, not scratch; MAX_DUE of them)
     int ndue = 0;
@@ -1614,13 +1637,34 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                 return sf_t < t1 ? sf_t : INT64_MAX;
             return di_dyn >= 0 && s.dep_t[dyn[di_dyn]] < t1 ? s.dep_t[dyn[di_dyn]] : INT64_MAX;
         };
+        auto quick = [&](int k, int d) -> const QPre * {
+            if (k > 2)
+                return nullptr;
+            unsigned bit = 1u << (k == 1 ? d : k == 2 ? MAXD + d : 2 * MAXD + d);
+            QPre &q = k == 1 ? hq_tc[d] : k == 2 ? hq_ns[d] : hq_ar[d];
+            if (!(hq_ok & bit))
+            {
+                qpre_of(q, code(k, d), chain(k, d));
+                hq_ok |= bit;
+            }
+            return &q;
+        };
         int bk = -1, bd = 0;
         int64_t bt = INT64_MAX;
         for (int k = 0; k < 6; k++)
             for (int d = 0; d < (k < 3 ? nd : 1); d++)
             {
                 int64_t t = ctime(k, d);
-                if (t != INT64_MAX && (bk < 0 || before(s, t, code(k, d), chain(k, d), bt, code(bk, bd), chain(bk, bd))))
+                if (t == INT64_MAX)
+                    continue;
+                bool b4 = bk < 0 || t < bt;
+                if (bk >= 0 && t == bt)
+                {
+                    const QPre *qa = quick(k, d), *qb = quick(bk, bd);
+                    int r = qa && qb ? qcmp(s, qa->r, qa->h, qa->root, qb->r, qb->h, qb->root) : 0;
+                    b4 = r ? r < 0 : before(s, t, code(k, d), chain(k, d), bt, code(bk, bd), chain(bk, bd));
+                }
+                if (b4)
                 {
                     bk = k;
                     bd = d;
@@ -1660,6 +1704,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             else
                 in[bd].pop();
             af[bd] = nullptr;
+            hq_ok &= ~(1u << (2 * MAXD + bd));
             if (p.kind == K_DATA)
                 h_data(c, p);
             else if (p.kind == K_ACK || p.kind == K_NACK)
