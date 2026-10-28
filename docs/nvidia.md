@@ -197,7 +197,20 @@ End to end (`jobs_e2e`, all identical):
 
 These dense 16-GPU runs remain latency-bound: about 20 entities per 25 ns slot.
 
-## Pending
+## Sequential ns-3 at k=32 does not fit
 
-- Sequential ns-3 references at k=32 (8,192 hosts), never run before. They need more than 22 GB
-  each, and set-up alone takes 2–2.6 h on a87. They run one at a time under memory caps.
+Sequential ns-3 cannot produce a k=32 (8,192-host) reference on the machines here. Its set-up is
+global routing, and its memory grows with nodes × hosts:
+
+| k | hosts | nodes | peak RSS (9950X) |
+|---|---|---|---|
+| 8 | 128 | 208 | 0.17 GB |
+| 16 | 1,024 | 1,344 | 2.55 GB |
+| 32 | 8,192 | 9,472 | about 137 GB, extrapolated |
+
+A k=32 paper run on a87 (125 GB) under a 105 GB cap was still in set-up after 2.5 h. It held
+98.4 GB and was growing 0.3 GB/min, so I stopped it before it reached the cap. On the 9950X
+(91 GB) it hit an 80 GB cap after 30 min.
+
+At k=32, TCP exactness therefore rests on k≤16 plus the k=32 RDMA runs above. The RDMA runs were
+checked against the HPCC fork and are identical.
