@@ -94,6 +94,28 @@ TwiNS on the same workloads takes 0.141, 0.329 and 0.861 s. So on NVIDIA:
 On AMD, GeDES took 1.65, 2.51 and 15.9 s. GeDES's model remains 15–92% off ns-3 in mean FCT
 either way.
 
+**Beyond k=32.** A FatTree stops at k=32 because a switch's ports fill one 32-lane block. A
+topology file can still hold many more hosts with switches of at most 32 ports.
+
+The runs below use Jellyfish graphs, random regular, with 16 network ports per switch (generator:
+random stub matching, as `topo.py jellyfish` is quadratic). The traffic is websearch all-to-all at
+30% load over 0.5 ms (`gen.py --pattern alltoall --load 0.3 --duration_ns 500000`), as in the
+a2a30 workloads.
+
+These sizes have no reference: ns-3's set-up alone is hours at 8,192 hosts. So they show scale
+and speed only. GPU memory is the peak during the run.
+
+| switches × hosts each | hosts | flows | DCTCP | NewReno | GPU memory |
+|---|---|---|---|---|---|
+| 512 × 16 | 8,192 | 8,978 | 0.61 s | 0.95 s | 3.3 GB |
+| 1024 × 16 | 16,384 | 17,793 | 0.71 s | 1.13 s | 5.8 GB |
+| 2048 × 16 | 32,768 | 35,783 | 0.97 s | 1.37 s | 10.8 GB |
+| 4096 × 15 | 61,440 | 67,473 | 1.37 s | 2.01 s | 19.9 GB |
+
+Notes:
+- 61,440 hosts is close to the 16-bit host-id limit.
+- The NewReno run at 32,768 hosts reports 3 undecided ties, so twins128 should be used there.
+
 ### Parameter sweeps (batches of worlds)
 
 All outputs are identical to ns-3. The times include process start and the twins128 reruns.
