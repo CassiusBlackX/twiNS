@@ -305,7 +305,7 @@ __device__ __forceinline__ uint64_t memo_key(uint64_t ha, uint64_t hb)
     return k ? k : 4;
 }
 // 0: unknown, else -1 or 1 (a runs first)
-__device__ __forceinline__ int memo_get(uint64_t ha, uint64_t hb)
+__device__ __noinline__ int memo_get(uint64_t ha, uint64_t hb)
 {
     uint64_t k = memo_key(ha, hb);
     for (int i = 0; i < 4; i++)
@@ -614,7 +614,7 @@ __host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip,
 // ordinal ord, so its StartApplication at tI + send_lat with chain E (0, ord) (send_lat, 0). It is
 // filed in the slot send_lat after the firing event (at tE: the host learns of it before it can
 // start; a traced DAG's timers can put tI later).
-__device__ __forceinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
+__device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
 {
     int64_t ts = tI + s.send_lat;
     int64_t a = (int64_t)fdiv(s.fD, tE + s.send_lat);
@@ -646,7 +646,7 @@ __device__ __forceinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t
 // children of that kind, in id order). A traced DAG's cause has actions instead: flows installed
 // and timers scheduled, by their ordinals; a timer fires its own (timers are expanded here: they
 // touch nothing else). Returns the ordinals used (the event's later ones follow them).
-__device__ __forceinline__ int dag_fire(const Sim &s, int g, int k, int64_t tE, const Chain &E, int base)
+__device__ __noinline__ int dag_fire(const Sim &s, int g, int k, int64_t tE, const Chain &E, int base)
 {
     int i = 0;
     for (int j = s.ch_off[g]; j < s.ch_off[g + 1]; j++)
