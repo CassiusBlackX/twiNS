@@ -55,37 +55,41 @@ the first differing decision in both binaries:
 
 | run | GPUs | topology | workload | messages | identical | last event identical | SimAI (s) | TwiNS (s) |
 |---|---|---|---|---|---|---|---|---|
-| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 1.0 |
-| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 2.0 |
-| tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 3.4 |
-| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 1.9 |
-| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 7.9 |
-| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 9.8 |
-| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 10.0 |
-| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 100.2 |
-| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 126.5 |
-| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 84.7 |
-| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 95.8 |
-| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 138.6 |
-| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 76.6 |
-| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 66.8 |
-| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 118.7 |
-| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 41.7 |
+| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.9 |
+| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.4 |
+| tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 2.5 |
+| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 1.5 |
+| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 5.7 |
+| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 8.0 |
+| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 6.9 |
+| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 91.3 |
+| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 112.2 |
+| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 56.9 |
+| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 84.3 |
+| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 122.0 |
+| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 53.5 |
+| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 54.8 |
+| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 90.7 |
+| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 31.9 |
 
 SimAI is the single-threaded sequential build on a87 (Xeon Gold 5218; up to 9 runs side by side).
 TwiNS runs on an RX 9060 XT. "Last event" is the run's end: the last timer firing or completion,
 from SimAI's trace and TwiNS's report.
-- **Large runs** (128 GPUs, many entities): TwiNS is 5–8× faster than SimAI.
+- **Large runs** (128 GPUs, many entities): TwiNS is 8–11× faster than SimAI.
 - **Small dense runs** (16 GPUs, NVLink saturated for tens of ms):
-  - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound.
-  - TwiNS is about as fast as SimAI: from 2.2× slower (MoE on AlibabaHPN, whose 2 NICs per GPU
-    make 3 link rates) to 1.4× faster.
+  - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound. The slowest block of a
+    slot, often a GPU host with ~150k cycles of dependent global accesses, sets the pace.
+  - TwiNS goes from 1.7× slower (MoE on AlibabaHPN, whose 2 NICs per GPU make 3 link rates) to
+    2.1× faster (DCN+, few enough blocks for persistent launches).
   - Batching recovers the throughput. The 9 AICB runs (2363520 messages) as one batch
-    (`--batch`, 9 worlds) take 272 s, every message identical. Run one at a time, they take
-    852 s in TwiNS and 791 s in SimAI. (The batch decided one tie on an overwritten chain tail,
-    which changed nothing; a batch this size wants `--tail=25`.)
-  - Server entities (an NVSwitch with its GPUs in one block, with a 500 ns slot) would address
-    this.
+    (`--batch`, 9 worlds, `--tail=25`) take 283 s, every message identical. One at a time,
+    SimAI's runs take 791 s.
+- **Since `ai-p3`** (these timings):
+  - GPUs share the small switches' kernel (2 kernels per slot, not 3);
+  - the streams are made so that the two kernels get different hardware queues;
+  - persistent launches for small topologies;
+  - `__launch_bounds__(32)`, and GPU hosts dispatched first.
+  - The 128-GPU runs went 7.9–10.0 → 5.7–8.0 s.
 
 ## Bugs found on the way (TwiNS)
 

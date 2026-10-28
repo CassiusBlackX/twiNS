@@ -3065,20 +3065,33 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
 // the slot kernel: blocks 0 .. H - 1 are the hosts, then the switches
 // A block is one wave (BLOCK lanes, --spread at most): the compiler may give it all the registers
 constexpr int BLOCK = 32;
-// (MULTI: and then the hosts with several devices, GPUs; their path's scratch, which limits the
-// waves in flight, stays out of the kernel without them)
+// (MULTI: the hosts with several devices, GPUs, first: blocks start in order, and they are often
+// a slot's last to finish; their path's scratch, which limits the waves in flight, stays out of
+// the kernel without them)
+template <bool MULTI>
+__device__ __forceinline__ void slot_entity(const Sim &s, int b, char *smem)
+{
+    if (MULTI)
+    {
+        if (b < s.nm)
+        {
+            host_block<MAXD>(s, s.hlistm[b], smem);
+            return;
+        }
+        b -= s.nm;
+    }
+    if (b < s.n1)
+        host_block<1>(s, s.hlist1[b], smem);
+    else
+        switch_block<false>(s, s.slist_s[b - s.n1], smem, s.ks);
+}
 template <bool MULTI>
 __global__ void __launch_bounds__(BLOCK) rdma_slot(Sim s)
 {
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
-    if ((int)blockIdx.x < s.n1)
-        host_block<1>(s, s.hlist1[blockIdx.x], smem);
-    else if (!MULTI || (int)blockIdx.x < s.n1 + s.ns_s)
-        switch_block<false>(s, s.slist_s[blockIdx.x - s.n1], smem, s.ks);
-    else
-        host_block<MAXD>(s, s.hlistm[blockIdx.x - s.n1 - s.ns_s], smem);
+    slot_entity<MULTI>(s, blockIdx.x, smem);
 }
 
 // the switches with many ports (spines), alongside rdma_slot
@@ -3218,12 +3231,7 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(Sim s, int slots)
         int64_t slot = *(volatile int64_t *)s.slot;
         if (*(volatile int *)s.finished)
             return;
-        if (b < s.n1)
-            host_block<1>(s, s.hlist1[b], smem);
-        else if (!MULTI || b < s.n1 + s.ns_s)
-            switch_block<false>(s, s.slist_s[b - s.n1], smem, s.ks);
-        else
-            host_block<MAXD>(s, s.hlistm[b - s.n1 - s.ns_s], smem);
+        slot_entity<MULTI>(s, b, smem);
         if (threadIdx.x == 0)
         {
             // until the slot's last block has moved on (a block that never runs would stop it all:
