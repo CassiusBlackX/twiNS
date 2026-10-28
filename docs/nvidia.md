@@ -35,7 +35,7 @@ A block is 32 lanes, one wave on RDNA and one warp on NVIDIA. Lanes share data o
 | SimAI: `jobs_net1`, `net2`, `gpu1`, `dag1`, `scale` | 60 | all |
 | SimAI end to end: `jobs_e2e` (microAllReduce up to 128 GPUs, AICB Megatron/MoE) | 16 | 16 |
 | SimAI, new scale: Spectrum-X, 2048 and 4096 GPUs, rail rings (1,044,480 and 4,186,112 messages) | 2 | 2 |
-| RDMA, new scale: FatTree k=32 (8,192 hosts), HPCC-fork references (180,463 flows) | 4 | 4 |
+| RDMA, new scale: FatTree k=32 (8,192 hosts), HPCC-fork references (342,968 flows) | 5 | 5 |
 
 Notes:
 - The same undecided ties appear as on AMD: 3 worlds of the k=8 sweep and 8 of the k=16 sweep.
@@ -155,6 +155,7 @@ container on the 9950X with memory caps.
 | k32 a2a30, HPCC | 8,899 | 8,899 | 772.1 s | 3.47 s / 1.29 s | 222× / 598× |
 | k32 incast16, DCQCN (853 marks) | 160 | 160 | 400.0 s | 2.29 s / 0.118 s | 175× / 3400× |
 | k32 a2a50s, HPCC (4404 marks) | 162,505 | 162,505 | 764.6 s (peak 50.5 GB) | 3.99 s / 1.63 s | 191× / 469× |
+| k32 a2a50s, DCQCN (2838 marks) | 162,505 | 162,505 | 716.1 s (peak 50.2 GB) | 4.15 s / 1.76 s | 173× / 407× |
 
 Notes:
 - Each reference peaked at about 49 GB of RAM.
