@@ -308,6 +308,13 @@ struct PortStatic
     FDiv in_fnb;          // in_nb
 };
 
+// a block's entity (BlockInfo): a host (base: nic_off[h], link0: its first in-link) or a switch
+// (base: pbase[x])
+struct BlockInfo
+{
+    int e, deg, base, link0;
+};
+
 // A directed link. Its frames are filed by the slot they arrive in: bucket a % nb of its ring
 // holds those arriving in slot a (s.msg[moff + bucket * cap ..], s.msg_cnt[coff + bucket] = a << 16
 // | frames). Its sender writes bucket a during slots before a, its receiver reads it in slot a; nb
@@ -406,6 +413,9 @@ struct Sim
     // the ports each kernel's LDS has room for
     const int *slist_s, *slist_b;
     int ns_s, ns_b, ks, kb;
+    // per block, its entity's static data in one load: rdma_slot's blocks (hostsm, hosts1,
+    // switches_s) and rdma_slot_big's
+    const struct BlockInfo *bi_s, *bi_b;
     Host *hs;
     Chain *h_tc, *h_ns; // [NICs] chains of the pending TransmitComplete and m_nextSend
     Pkt *ackq;          // [NICs][ackq_cap]

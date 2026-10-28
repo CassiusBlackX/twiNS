@@ -1431,12 +1431,13 @@ __device__ __forceinline__ void h_start_dyn(HCtx<ND> &c, int f)
 constexpr int HHINTS = 1 + 2 * MAXD;
 // ND: the most devices a host of this kind has (1: one NIC, its state stays in registers)
 template <int ND>
-__device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints,
+__device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints,
                                           struct Due *due)
 {
+    const int h = bi.e;
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const Params &WP = s.Pw[s.h_world[h]];
-    const int nd = ND == 1 ? 1 : s.deg[h];
+    const int nd = ND == 1 ? 1 : bi.deg;
     (void)t0;
     if (lane == 0)
     {
@@ -1444,7 +1445,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         for (int d = 0; d < nd; d++)
         {
             uint32_t base;
-            int n = bucket(s, s.in_link[(size_t)h * s.K + d], slot, &base);
+            int n = bucket(s, d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d], slot, &base);
             hints[1 + 2 * d] = (int)base;
             hints[2 + 2 * d] = n;
             total += n;
@@ -1452,12 +1453,12 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         hints[0] = total;
         // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
         // the host has no event in it
-        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)]) && s.hs[s.nic_off[h]].wake >= t1;
+        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)]) && s.hs[bi.base].wake >= t1;
     }
     __syncthreads();
     if (hints[HHINTS])
     {
-        *wake = s.hs[s.nic_off[h]].wake;
+        *wake = s.hs[bi.base].wake;
         return false;
     }
     const int total = hints[0];
@@ -1468,7 +1469,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             int d = 0, k = j;
             while (k >= hints[2 + 2 * d])
                 k -= hints[2 + 2 * d++];
-            int link_in = s.in_link[(size_t)h * s.K + d];
+            int link_in = d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d];
             uint32_t fi = (uint32_t)hints[1 + 2 * d] + k;
             const LFrame &f = s.msg[fi];
             HArr &a = pool[j];
@@ -1509,7 +1510,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     c.nout = 0;
     c.pre_ok = false;
     c.nd = nd;
-    c.nic0 = s.nic_off[h];
+    c.nic0 = bi.base;
     // per device: its state, out link, arrivals (a range of the pool, or a cursor in its bucket)
     Arrivals in[ND];
     int ai[ND], aend[ND], lin[ND];
@@ -1521,7 +1522,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         const LinkInfo li = s.li[c.lk[d]];
         c.ldl[d] = li.delay;
         link_open(c.obv[d], c.lk[d], li, c.stv[d].ob_last);
-        lin[d] = s.in_link[(size_t)h * s.K + d];
+        lin[d] = d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d];
         indl[d] = s.li[lin[d]].delay;
         if (pooled)
         {
@@ -2249,14 +2250,15 @@ __host__ __device__ inline size_t sw_ints(int K)
 // WIDE: the switches of rdma_slot_big (more than SAFE_LANES ports); the narrow ones' code (in
 // rdma_slot) leaves out their path, whose registers would otherwise spill the safe slots'
 template <bool WIDE>
-__device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
+__device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
                                             int *shared_int, int K)
 {
-    Chain *tcs = s.p_tc + s.pbase[x];
+    const int x = bi.e;
+    Chain *tcs = s.p_tc + bi.base;
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
-    const int node = s.H + x, deg = s.deg[node];
+    const int node = s.H + x, deg = bi.deg;
     const Params &WP = s.Pw[s.s_world[x]];
-    Port *gp = s.ps + s.pbase[x];
+    Port *gp = s.ps + bi.base;
     // ports, and the bounds of their arrivals: at most the last frame of slot s - 2 (a frame
     // arrives within one transmission of the link's delay), and the frames of slot s - 1 but
     // perhaps the last
@@ -2279,7 +2281,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         abytes[p] = 0;
         ocnt[p] = 0;
         ing0[p] = q.pt.ing;
-        const PortStatic ps = s.pst[s.pbase[x] + p];
+        const PortStatic ps = s.pst[bi.base + p];
         q.link_in = ps.link_in;
         link_open(q.ob, ps.link_out, s.li[ps.link_out], q.pt.ob_last);
         {
@@ -3035,9 +3037,9 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
 }
 
 template <int ND>
-__device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
+__device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem)
 {
-    int64_t slot = *s.slot;
+    const int h = bi.e;
     int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
@@ -3060,7 +3062,7 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
         // launches may skip past its window
         if (lane == 0)
         {
-            int64_t wk = s.hs[s.nic_off[h]].wake;
+            int64_t wk = s.hs[bi.base].wake;
             slot_end(s, slot, 0, wk != INT64_MAX ? (unsigned long long)wk : ~0ull);
         }
         return;
@@ -3069,7 +3071,7 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
     for (int j = 0; j < k; j++)
     {
         w = INT64_MAX;
-        act |= host_step<ND>(s, h, slot + j, &w, lane, lanes, pool, hints, due);
+        act |= host_step<ND>(s, bi, slot + j, &w, lane, lanes, pool, hints, due);
     }
 #ifdef RDMA_PROF
     if (lane == 0)
@@ -3084,9 +3086,9 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
 }
 
 template <bool WIDE>
-__device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, int kl)
+__device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int kl)
 {
-    int64_t slot = *s.slot;
+    const int x = bi.e;
     int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
@@ -3123,17 +3125,17 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
         bool run = s.sw_busy[x];
         if (!run)
         {
-            const int node = s.H + x, deg = s.deg[node];
+            const int deg = bi.deg;
             int any = 0;
             for (int p = lane; p < deg; p += lanes)
             {
-                const PortStatic &ps = s.pst[s.pbase[x] + p];
+                const PortStatic &ps = s.pst[bi.base + p];
                 long long v = s.msg_cnt[ps.in_coff + (int)fmod(ps.in_fnb, sl)];
                 any |= (v >> 16) == sl && (v & 0xFFFF) > 0;
             }
             run = __syncthreads_or(any);
         }
-        if (run && switch_step<WIDE>(s, x, sl, w, pool, pidx, lane, lanes, ints, kl))
+        if (run && switch_step<WIDE>(s, bi, sl, w, pool, pidx, lane, lanes, ints, kl))
             blk_act = 1; // (any lane: the ports are spread over them)
         __syncthreads();
         if (lane == 0)
@@ -3166,30 +3168,36 @@ constexpr int BLOCK = 32;
 // a slot's last to finish; their path's scratch, which limits the waves in flight, stays out of
 // the kernel without them)
 template <bool MULTI>
-__device__ __forceinline__ void slot_entity(const Sim &s, int b, char *smem)
+__device__ __forceinline__ void slot_entity(const Sim &s, int b, const BlockInfo &bi, int64_t slot, char *smem)
 {
-    if (MULTI)
-    {
-        if (b < s.nm)
-        {
-            host_block<MAXD>(s, s.hlistm[b], smem);
-            return;
-        }
-        b -= s.nm;
-    }
-    if (b < s.n1)
-        host_block<1>(s, s.hlist1[b], smem);
+    if (MULTI && b < s.nm)
+        host_block<MAXD>(s, bi, slot, smem);
+    else if (b < (MULTI ? s.nm : 0) + s.n1)
+        host_block<1>(s, bi, slot, smem);
     else
-        switch_block<false>(s, s.slist_s[b - s.n1], smem, s.ks);
+        switch_block<false>(s, bi, slot, smem, s.ks);
+}
+// A block's entry: its entity, the slot and the finish flag, loaded together (they were a chain
+// of dependent loads: the flag, the entity's list, its static data)
+__device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, BlockInfo *bi, int64_t *slot)
+{
+    *bi = tab[blockIdx.x];
+    *slot = *s.slot;
+    int fin = *s.finished;
+    // (keeps the loads above the branch: issued together, not one after the other)
+    asm volatile("" ::"v"(bi->e), "v"(bi->deg), "v"(bi->base), "v"(bi->link0), "v"((int)*slot), "v"((int)(*slot >> 32)));
+    return !fin;
 }
 template <bool MULTI>
 __global__ void __launch_bounds__(BLOCK) rdma_slot()
 {
     const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
-    if (*s.finished)
+    BlockInfo bi;
+    int64_t slot;
+    if (!block_entry(s, s.bi_s, &bi, &slot))
         return;
-    slot_entity<MULTI>(s, blockIdx.x, smem);
+    slot_entity<MULTI>(s, blockIdx.x, bi, slot, smem);
 }
 
 // the switches with many ports (spines), alongside rdma_slot
@@ -3197,9 +3205,11 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot_big()
 {
     const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
-    if (*s.finished)
+    BlockInfo bi;
+    int64_t slot;
+    if (!block_entry(s, s.bi_b, &bi, &slot))
         return;
-    switch_block<true>(s, s.slist_b[blockIdx.x], smem, s.kb);
+    switch_block<true>(s, bi, slot, smem, s.kb);
 }
 
 // Ranks ahead, alongside a launch's kernels every rank_every launches (a block per wide switch and
@@ -3327,12 +3337,13 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
     const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
     const int b = blockIdx.x;
+    const BlockInfo bi = s.bi_s[b];
     for (int it = 0; it < slots; it++)
     {
         int64_t slot = *(volatile int64_t *)s.slot;
         if (*(volatile int *)s.finished)
             return;
-        slot_entity<MULTI>(s, b, smem);
+        slot_entity<MULTI>(s, b, bi, slot, smem);
         if (threadIdx.x == 0)
         {
             // until the slot's last block has moved on (a block that never runs would stop it all:

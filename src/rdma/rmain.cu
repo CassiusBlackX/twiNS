@@ -1502,6 +1502,17 @@ int main(int argc, char **argv)
         s.ns_s = ls.size(), s.ns_b = lb.size();
         s.slist_s = dev_copy(ls);
         s.slist_b = dev_copy(lb);
+        vector<BlockInfo> bs, bb;
+        for (int h : lm)
+            bs.push_back({h, deg[h], nic_off[h], in_link[(size_t)h * K]});
+        for (int h : l1)
+            bs.push_back({h, deg[h], nic_off[h], in_link[(size_t)h * K]});
+        for (int x : ls)
+            bs.push_back({x, deg[H + x], pbase[x], -1});
+        for (int x : lb)
+            bb.push_back({x, deg[H + x], pbase[x], -1});
+        s.bi_s = dev_copy(bs);
+        s.bi_b = bb.empty() ? nullptr : dev_copy(bb);
     }
     {
         vector<Host> hs(NICS);
