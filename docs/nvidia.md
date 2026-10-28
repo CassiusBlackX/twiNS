@@ -35,7 +35,7 @@ A block is 32 lanes, one wave on RDNA and one warp on NVIDIA. Lanes share data o
 | SimAI: `jobs_net1`, `net2`, `gpu1`, `dag1`, `scale` | 60 | all |
 | SimAI end to end: `jobs_e2e` (microAllReduce up to 128 GPUs, AICB Megatron/MoE) | 16 | 16 |
 | SimAI, new scale: Spectrum-X, 2048 and 4096 GPUs, rail rings (1,044,480 and 4,186,112 messages) | 2 | 2 |
-| RDMA, new scale: FatTree k=32 (8,192 hosts), HPCC-fork references | 3 | 3 |
+| RDMA, new scale: FatTree k=32 (8,192 hosts), HPCC-fork references (180,463 flows) | 4 | 4 |
 
 Notes:
 - The same undecided ties appear as on AMD: 3 worlds of the k=8 sweep and 8 of the k=16 sweep.
@@ -154,6 +154,7 @@ container on the 9950X with memory caps.
 | k32 a2a30, DCQCN (68 marks) | 8,899 | 8,899 | 810.4 s | 3.26 s / 1.10 s | 249× / 737× |
 | k32 a2a30, HPCC | 8,899 | 8,899 | 772.1 s | 3.47 s / 1.29 s | 222× / 598× |
 | k32 incast16, DCQCN (853 marks) | 160 | 160 | 400.0 s | 2.29 s / 0.118 s | 175× / 3400× |
+| k32 a2a50s, HPCC (4404 marks) | 162,505 | 162,505 | 764.6 s (peak 50.5 GB) | 3.99 s / 1.63 s | 191× / 469× |
 
 Notes:
 - Each reference peaked at about 49 GB of RAM.
@@ -199,5 +200,3 @@ These dense 16-GPU runs remain latency-bound: about 20 entities per 25 ns slot.
 
 - Sequential ns-3 references at k=32 (8,192 hosts), never run before. They need more than 22 GB
   each, and set-up alone takes 2–2.6 h on a87. They run one at a time under memory caps.
-- The HPCC-fork reference for k32 a2a50s with HPCC (162,505 flows), running on the 9950X in a
-  memory-capped container.
