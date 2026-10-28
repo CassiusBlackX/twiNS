@@ -1,0 +1,4 @@
+# scaling: a ring all-reduce per rail (8 MB) over all servers, Spectrum-X 128/512/1024 GPUs
+s_sx128_rails sx128.topo d128_rails.dag
+s_sx512_rails sx512.topo d512_rails.dag
+s_sx1024_rails sx1024.topo d1024_rails.dag

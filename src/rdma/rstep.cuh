@@ -405,6 +405,9 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 
 // the first three runs of the chain cpush(code0, ch) (code0 0: of ch itself)
 constexpr int PRE = 3;
+#ifndef RANK_SORT
+#define RANK_SORT 0
+#endif
 __device__ __forceinline__ void cprefix(Run *out, uint32_t code0, const Chain &ch)
 {
     if (!code0)
@@ -583,6 +586,7 @@ __device__ __forceinline__ void dag_fire(const Sim &s, int g, int k, int64_t tE,
         cpush(&m.c, ccode(s.send_lat, 0), x);
         m.ts = ts;
         m.flow = v >> 1;
+        atomicAdd(&s.hmsg_n[(size_t)s.fi[v >> 1].src * s.nbi + b], 1u);
         s.pend[a % s.pend_n] = 1;
         i++;
     }
@@ -1277,7 +1281,8 @@ __device__ __forceinline__ void h_start_dyn(HCtx<ND> &c, int f)
 constexpr int HHINTS = 1 + 2 * MAXD;
 // ND: the most devices a host of this kind has (1: one NIC, its state stays in registers)
 template <int ND>
-__device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints)
+__device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints,
+                                          struct Due *due)
 {
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
     const Params &WP = s.Pw[s.h_world[h]];
@@ -1295,8 +1300,16 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             total += n;
         }
         hints[0] = total;
+        // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
+        // the host has no event in it
+        hints[HHINTS] = total == 0 && !(s.dag && s.hmsg_n[(size_t)h * s.nbi + slot % s.nbi]) && s.hs[s.nic_off[h]].wake >= t1;
     }
     __syncthreads();
+    if (hints[HHINTS])
+    {
+        *wake = s.hs[s.nic_off[h]].wake;
+        return false;
+    }
     const int total = hints[0];
     const bool pooled = total <= HPOOL;
     if (pooled)
@@ -1335,7 +1348,11 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     __syncthreads();
     if (lane != 0)
         return false;
-    HCtx<ND> c;
+    // the context: in registers for one device; for several, in LDS (lane 0's alone): its arrays
+    // are indexed by the current device, which would put it in scratch
+    __shared__ HCtx<MAXD> hc_lds;
+    HCtx<ND> c_reg;
+    HCtx<ND> &c = ND > 1 ? *reinterpret_cast<HCtx<ND> *>(&hc_lds) : c_reg;
     c.s = &s;
     c.P = &WP;
     c.h = h;
@@ -1366,7 +1383,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     }
     hsel(c, 0);
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
-    Due due[MAX_DUE];
+    // (due: in LDS, not scratch; MAX_DUE of them)
     int ndue = 0;
     if (WP.cc == 1)
         for (int d = 0; d < nd; d++)
@@ -1407,9 +1424,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     // one this is becomes ready, to start at the latest of them (in ns-3's order)
     int *dyn = s.dag ? s.dyn + (size_t)h * s.dyn_cap : nullptr;
     int ndyn = s.dag ? s.dyn_n[h] : 0;
-    if (s.dag)
+    if (s.dag && s.hmsg_n[(size_t)h * s.nbi + slot % s.nbi])
     {
         int b = (int)(slot % s.nbi);
+        s.hmsg_n[(size_t)h * s.nbi + b] = 0;
         unsigned int n = s.dmsg_n[b];
         if (n > (unsigned)s.dcap)
             n = s.dcap;
@@ -1614,15 +1632,18 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                         w = t[k];
             }
         }
+        if (st.tc_at >= 0 && st.tc_at < w)
+            w = st.tc_at;
         s.hs[c.nic0 + d] = st;
     }
+    s.hs[c.nic0].wake = w; // (with its TransmitCompletes: when it must run again without input)
     *wake = w;
     return act;
 }
 
 // ------------------------------------------------------------------ switch
 constexpr int KMAX = 192;  // ports of a switch (LDS: see switch_block)
-constexpr int KSMALL = 64; // switches with more ports run in rdma_slot_big
+constexpr int KSMALL = 32; // switches with more ports (wide: no safe slots) run in rdma_slot_big
 
 // A switch's slot workspace in LDS, per port: its Port, its arrivals of this slot (a range of the
 // pool, or, when the pool overflows, a cursor in the frames of slots s - 2 then s - 1), and the
@@ -1653,6 +1674,7 @@ struct ArrLds
     Run ap[PRE];
     uint64_t ah;    // its chain's lead hash and root (qcmp)
     uint32_t ar;
+    int32_t rank;   // wide switches: its place among the slot's arrivals in event order
     uint32_t acode;
     uint32_t frame; // index in s.msg
     int16_t out;    // the egress port (-1: a PFC frame, or no route)
@@ -1680,6 +1702,10 @@ struct SCtx
     // counters are summed with LDS atomics, and shared_used is recomputed at the end
     bool safe;
     bool nvs; // an NVSwitch
+    // wide switches: the ports whose candidates the running event changed (its transmissions), in
+    // LDS (an array here would keep SCtx out of registers); null for the others
+    int ndirty;
+    int *dirty;
 };
 
 __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
@@ -1710,6 +1736,13 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     int link = s.out_link[(size_t)c.node * s.K + port];
     int64_t tx = link_tx(s, link, p.size);
     c.w[port].pt.tc_at = c.now + tx;
+    c.w[port].pt.tc_key = c.sw.evseq * 64 + (c.ord < 63 ? c.ord : 63);
+    if (c.dirty)
+    {
+        if (c.ndirty < 6)
+            c.dirty[c.ndirty] = port;
+        c.ndirty++;
+    }
     const Chain &cur = sc_cur(c);
     Chain tcc;
     cpush(&tcc, ccode(tx, c.ord++), cur);
@@ -2010,7 +2043,22 @@ constexpr int SAFE_LANES = 32; // safe slots need a lane per port
 // two index lists (uint16, uint8, 2 x uint16)
 constexpr int LK = 512;
 __host__ __device__ inline int sw_ks(int K) { return K < SAFE_LANES ? K : SAFE_LANES; }
-__host__ __device__ inline size_t sw_ints(int K) { return 6 * (size_t)K + (size_t)sw_ks(K) * sw_ks(K) + (LK * 7 + 3) / 4; }
+// (wide switches, more than SAFE_LANES ports: then a tournament tree of 2 KP ints, KP the power of
+// two from the ports)
+__host__ __device__ inline int sw_kp(int K)
+{
+    int k = 1;
+    while (k < K)
+        k <<= 1;
+    return k;
+}
+__host__ __device__ inline size_t sw_ints(int K)
+{
+    return 6 * (size_t)K + (size_t)sw_ks(K) * sw_ks(K) + (LK * 7 + 3) / 4 + (K > SAFE_LANES ? 2 * (size_t)sw_kp(K) : 0);
+}
+// WIDE: the switches of rdma_slot_big (more than SAFE_LANES ports); the narrow ones' code (in
+// rdma_slot) leaves out their path, whose registers would otherwise spill the safe slots'
+template <bool WIDE>
 __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
                                             int *shared_int, int K)
 {
@@ -2041,12 +2089,19 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         abytes[p] = 0;
         ocnt[p] = 0;
         ing0[p] = q.pt.ing;
-        q.link_in = s.in_link[(size_t)node * s.K + p];
-        q.an = bucket(s, q.link_in, slot, &q.abase);
-        q.in_delay = (int32_t)s.li[q.link_in].delay;
-        q.out_delay = (int32_t)s.li[s.out_link[(size_t)node * s.K + p]].delay;
-        q.kmin = s.pc[s.pbase[x] + p].kmin;
-        q.kmax = s.pc[s.pbase[x] + p].kmax;
+        const PortStatic ps = s.pst[s.pbase[x] + p];
+        q.link_in = ps.link_in;
+        {
+            // bucket(), from the port's copy of its link's ring
+            int b = (int)(slot % ps.in_nb);
+            long long v = s.msg_cnt[ps.in_coff + b];
+            q.abase = ps.in_moff + (uint32_t)b * ps.in_cap;
+            q.an = (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;
+        }
+        q.in_delay = ps.in_delay;
+        q.out_delay = ps.out_delay;
+        q.kmin = ps.kmin;
+        q.kmax = ps.kmax;
         q.ob.hi = 0;
         q.nout = 0;
         first[p] = 0;
@@ -2100,7 +2155,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = pooled && total <= LK && D <= 65535 && deg <= lanes && deg <= SAFE_LANES && !s.serial;
+    bool safe = !WIDE && pooled && total <= LK && D <= 65535 && deg <= lanes && deg <= SAFE_LANES && !s.serial;
     if (safe)
     {
         const Switch &sw = s.sw[x];
@@ -2200,6 +2255,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             c.pool = pool;
             c.safe = true;
             c.nvs = s.si[x].nvs;
+            c.ndirty = 0;
+            c.dirty = nullptr;
             c.P = &WP;
             int oi = obase[o], oe = obase[o] + ocnt[o];
             SwPortLds &me = w[o];
@@ -2271,7 +2328,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
 #endif
         }
     }
-    else if (deg <= SAFE_LANES)
+    else if (!WIDE)
     {
         // all events in order, by lane 0 (a few ports: a scan is cheaper than the lanes' barriers)
         if (lane == 0)
@@ -2287,6 +2344,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             c.pool = pooled ? pool : nullptr;
             c.safe = false;
             c.nvs = s.si[x].nvs;
+            c.ndirty = 0;
+            c.dirty = nullptr;
             c.P = &WP;
             int base = 0;
             for (int p = 0; p < deg; p++)
@@ -2428,10 +2487,10 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     #endif
         }
     }
-    else
+    else if constexpr (WIDE)
     {
-        // all events in order, many ports: the lanes choose the next one together (each the best of
-        // its ports, then a reduction); lane 0 runs it
+        // all events in order, many ports: a tournament tree over the ports' candidates (built by the
+        // lanes; lane 0 replays the paths of the ports each event changes) chooses the next one
         SCtx c;
         c.s = &s;
         c.x = x;
@@ -2443,6 +2502,9 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         c.pool = pooled ? pool : nullptr;
         c.safe = false;
         c.nvs = s.si[x].nvs;
+        __shared__ int dirty_lds[6];
+        c.ndirty = 0;
+        c.dirty = dirty_lds;
         c.P = &WP;
         for (int p = lane; p < deg; p += lanes)
         {
@@ -2471,6 +2533,10 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         auto first = [&](int i, int j, int64_t t) -> bool {
             const SwPortLds &a = w[i >> 1], &b = w[j >> 1];
             int ki = i & 1, kj = j & 1;
+            if (ki && kj) // two TransmitCompletes: their keys
+                return a.pt.tc_key < b.pt.tc_key;
+            if (RANK_SORT && !ki && !kj && c.pool) // two arrivals: their ranks
+                return pool[a.ai].rank < pool[b.ai].rank;
             int r = qcmp(s, ki ? a.tp : a.ap, ki ? a.th : a.ah, ki ? a.tr : a.ar, kj ? b.tp : b.ap, kj ? b.th : b.ah, kj ? b.tr : b.ar);
 #ifdef RDMA_PROF
             atomicAdd(&s.ev[28], 1ull);
@@ -2493,46 +2559,113 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             }
             return r < 0;
         };
-        __shared__ int sel_best;
-#ifdef RDMA_PROF
-        unsigned long long nev = 0;
-#endif
-        for (;;)
+        // the slot's arrivals in event order, once (a bitonic sort of their pool indices in pidx):
+        // simultaneous arrivals, as in lockstep collectives, would otherwise be compared again at
+        // every event
+        if (RANK_SORT && pooled && total > 1)
         {
-            int best = -1;
-            int64_t bt = INT64_MAX;
-            for (int p = lane; p < deg; p += lanes)
-                for (int k = 0; k < 2; k++)
-                {
-                    int i = 2 * p + k;
-                    int64_t t = ctime(i);
-                    if (t == INT64_MAX || t > bt)
-                        continue;
-                    if (t < bt || best < 0 || first(i, best, t))
-                        best = i, bt = t;
-                }
-            for (int off = 1; off < lanes; off <<= 1)
-            {
-                int ob = __shfl_xor(best, off);
-                int lo = __shfl_xor((int)(uint32_t)bt, off), hi = __shfl_xor((int)(bt >> 32), off);
-                int64_t ot = (int64_t)(((uint64_t)(uint32_t)hi << 32) | (uint32_t)lo);
-                if (ob < 0)
-                    continue;
-                if (best < 0 || ot < bt || (ot == bt && ob != best && first(ob, best, ot)))
-                    best = ob, bt = ot;
-            }
-            if (lane == 0)
-                sel_best = best;
+            int n2 = 1;
+            while (n2 < total)
+                n2 <<= 1;
+            for (int i = lane; i < n2; i += lanes)
+                pidx[i] = i < total ? i : -1;
             __syncthreads();
-            best = sel_best;
-            if (best < 0)
-                break;
-            if (lane == 0)
+            // does pool arrival u run before v (-1: past the end)? Undecided: the smaller index
+            auto arr_first = [&](int u, int v) -> bool {
+                if (u < 0 || v < 0)
+                    return v < 0 && u >= 0;
+                const ArrLds &A = pool[u], &B = pool[v];
+                if (A.ts != B.ts)
+                    return A.ts < B.ts;
+                int r = qcmp(s, A.ap, A.ah, A.ar, B.ap, B.ah, B.ar);
+                if (r == 0)
+                {
+                    bool inexact;
+                    r = ccmp(s, A.acode, s.msg[A.frame].c, B.acode, s.msg[B.frame].c, &inexact);
+                    if (inexact)
+                        atomicAdd(&s.ev[9], 1ull);
+                    if (r == 0)
+                    {
+                        atomicAdd(&s.ev[8], 1ull);
+                        return u < v;
+                    }
+                }
+                return r < 0;
+            };
+            for (int k = 2; k <= n2; k <<= 1)
+                for (int j = k >> 1; j > 0; j >>= 1)
+                {
+                    for (int i = lane; i < n2; i += lanes)
+                    {
+                        int l = i ^ j;
+                        if (l > i)
+                        {
+                            int u = pidx[i], v = pidx[l];
+                            bool up = (i & k) == 0;
+                            if (up ? arr_first(v, u) : arr_first(u, v))
+                            {
+                                pidx[i] = v;
+                                pidx[l] = u;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
+            for (int i = lane; i < total; i += lanes)
+                pool[pidx[i]].rank = i;
+            __syncthreads();
+        }
+        // the tree: leaf KP + p holds port p's earlier candidate, node n the better of 2n and 2n + 1
+        const int KP = sw_kp(deg);
+        int *tree = shared_int + 6 * K + KS * KS + (LK * 7 + 3) / 4;
+        auto better = [&](int i, int j) -> int {
+            if (i < 0)
+                return j;
+            if (j < 0)
+                return i;
+            int64_t ti = ctime(i), tj = ctime(j);
+            if (ti != tj)
+                return ti < tj ? i : j;
+            return first(i, j, ti) ? i : j;
+        };
+        auto leaf = [&](int p) -> int {
+            if (p >= deg)
+                return -1;
+            int a = ctime(2 * p) != INT64_MAX ? 2 * p : -1, b = ctime(2 * p + 1) != INT64_MAX ? 2 * p + 1 : -1;
+            return better(a, b);
+        };
+        for (int p = lane; p < KP; p += lanes)
+            tree[KP + p] = leaf(p);
+        __syncthreads();
+        for (int n = KP >> 1; n >= 1; n >>= 1)
+        {
+            for (int i = lane; i < n; i += lanes)
+                tree[n + i] = better(tree[2 * (n + i)], tree[2 * (n + i) + 1]);
+            __syncthreads();
+        }
+        if (lane == 0)
+        {
+            auto fix = [&](int p) {
+                int n = KP + p;
+                tree[n] = leaf(p);
+                for (n >>= 1; n >= 1; n >>= 1)
+                    tree[n] = better(tree[2 * n], tree[2 * n + 1]);
+            };
+#ifdef RDMA_PROF
+            unsigned long long nev = 0;
+#endif
+            for (;;)
             {
+                int best = tree[1];
+                if (best < 0)
+                    break;
+                int64_t bt = ctime(best);
                 int p = best >> 1;
                 c.now = bt;
                 c.ord = 0;
                 c.cur_ok = false;
+                c.ndirty = 0;
+                c.sw.evseq++;
 #ifdef RDMA_PROF
                 nev++;
 #endif
@@ -2583,17 +2716,20 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
                     else
                         s_forward(c, p, pk, out, q);
                 }
+                // the changed candidates: this port's, and those of the ports it transmitted on
+                fix(p);
+                if (c.ndirty > 6)
+                    for (int r = 0; r < deg; r++)
+                        fix(r);
+                else
+                    for (int i = 0; i < c.ndirty; i++)
+                        if (c.dirty[i] != p)
+                            fix(c.dirty[i]);
             }
-            __syncthreads();
-        }
-        if (lane == 0)
-        {
             s.sw[x] = c.sw;
 #ifdef RDMA_PROF
             atomicAdd(&s.ev[20], nev);
             atomicMax(&s.ev[22], nev);
-            if (!pooled)
-                atomicAdd(&s.ev[30], 1ull);
 #endif
         }
     }
@@ -2675,7 +2811,8 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
     int64_t w = INT64_MAX;
     HArr *pool = reinterpret_cast<HArr *>(smem);
     int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
-    bool act = host_step<ND>(s, h, slot, &w, lane, lanes, pool, hints);
+    Due *due = reinterpret_cast<Due *>(smem + HPOOL * sizeof(HArr) + (HHINTS + 1) * sizeof(int) + 8);
+    bool act = host_step<ND>(s, h, slot, &w, lane, lanes, pool, hints, due);
 #ifdef RDMA_PROF
     if (lane == 0)
         atomicMax(&s.ev[16], (unsigned long long)(clock64() - p0));
@@ -2684,6 +2821,7 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
         slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
 }
 
+template <bool WIDE>
 __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, int kl)
 {
     int64_t slot = *s.slot;
@@ -2701,9 +2839,25 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
     if (lane == 0)
         blk_act = 0;
     __syncthreads();
-    if (switch_step(s, x, slot, w, pool, pidx, lane, lanes, ints, kl))
+    // an idle switch (nothing queued or in transmission) without arrivals has no events: skip it
+    bool run = s.sw_busy[x];
+    if (!run)
+    {
+        const int node = s.H + x, deg = s.deg[node];
+        int any = 0;
+        for (int p = lane; p < deg; p += lanes)
+        {
+            const PortStatic &ps = s.pst[s.pbase[x] + p];
+            long long v = s.msg_cnt[ps.in_coff + (int)(slot % ps.in_nb)];
+            any |= (v >> 16) == slot && (v & 0xFFFF) > 0;
+        }
+        run = __syncthreads_or(any);
+    }
+    if (run && switch_step<WIDE>(s, x, slot, w, pool, pidx, lane, lanes, ints, kl))
         blk_act = 1; // (any lane: the ports are spread over them)
     __syncthreads();
+    if (lane == 0)
+        s.sw_busy[x] = blk_act;
 #ifdef RDMA_PROF
     if (lane == 0)
         atomicMax(&s.ev[17], (unsigned long long)(clock64() - p0));
@@ -2721,7 +2875,7 @@ __global__ void rdma_slot(Sim s)
     if ((int)blockIdx.x < s.n1)
         host_block<1>(s, s.hlist1[blockIdx.x], smem);
     else
-        switch_block(s, s.slist_s[blockIdx.x - s.n1], smem, s.ks);
+        switch_block<false>(s, s.slist_s[blockIdx.x - s.n1], smem, s.ks);
 }
 
 // the switches with many ports (spines), alongside rdma_slot
@@ -2730,7 +2884,7 @@ __global__ void rdma_slot_big(Sim s)
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
-    switch_block(s, s.slist_b[blockIdx.x], smem, s.kb);
+    switch_block<true>(s, s.slist_b[blockIdx.x], smem, s.kb);
 }
 
 // the hosts with several devices (GPUs), alongside rdma_slot

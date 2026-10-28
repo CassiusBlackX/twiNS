@@ -193,6 +193,7 @@ struct Port
     uint32_t ing, hdrm, egr;
     uint32_t mmu_paused;
     nsm_rng::State rng;   // its ECN marking stream
+    uint64_t tc_key;      // wide switches: its TransmitComplete's place (see Switch::evseq)
 };
 
 struct Switch
@@ -200,6 +201,10 @@ struct Switch
     uint32_t shared_used; // SwitchMmu::shared_used_bytes
     uint32_t total_hdrm, total_rsrv;
     uint32_t max_shift;   // the largest pfc_a_shift of its ports (the lowest PFC threshold)
+    // wide switches (no safe slots: every event in order) number their events; a TransmitComplete's
+    // key is its event's number and its ordinal there, and simultaneous TransmitCompletes run in key
+    // order (their chains differ first at the scheduling events, whose order is that number's)
+    uint64_t evseq;
 };
 
 // a switch port's configuration: its link's rate, SwitchMmu's headroom, pfc_a_shift and ECN
@@ -210,6 +215,17 @@ struct PortCfg
     uint32_t hdrm_cap, shift;
     uint32_t kmin, kmax;  // bytes
     double pmax;
+};
+
+// what a switch port's slot needs of its static setup, in one load: its in link and that link's
+// ring (see LinkInfo), the delays of both its links, its ECN thresholds
+struct PortStatic
+{
+    int32_t link_in;
+    int32_t in_delay, out_delay;
+    uint32_t kmin, kmax;
+    uint32_t in_coff, in_moff;
+    uint16_t in_nb, in_cap;
 };
 
 // A directed link. Its frames are filed by the slot they arrive in: bucket a % nb of its ring
@@ -318,6 +334,8 @@ struct Sim
     // switches
     Switch *sw;
     const PortCfg *pc;  // [ports]
+    const struct PortStatic *pst; // [ports]
+    int *sw_busy;       // [S] it ended its last slot with frames queued or in transmission
     // switch x's ports are pbase[x] .. pbase[x] + deg - 1 of the per-port arrays
     const int *pbase;
     Port *ps;           // [ports]
@@ -358,6 +376,7 @@ struct Sim
     int64_t *dep_t;
     Chain *dep_c;
     struct DMsg *dmsg;
+    unsigned int *hmsg_n; // [H][nbi] the messages for a host's flows in each bucket
     unsigned int *dmsg_n;
     int nbi, dcap;
     int *dyn, *dyn_n;

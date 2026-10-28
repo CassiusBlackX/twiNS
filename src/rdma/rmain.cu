@@ -1141,6 +1141,7 @@ int main(int argc, char **argv)
         s.dcap = 4096;
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
         s.dmsg_n = dev_alloc<unsigned int>(nbi);
+        s.hmsg_n = dev_alloc<unsigned int>((size_t)H * nbi);
         s.dyn_cap = 256;
         s.dyn = dev_alloc<int>((size_t)H * s.dyn_cap);
         s.dyn_n = dev_alloc<int>(H);
@@ -1275,7 +1276,30 @@ int main(int argc, char **argv)
             }
     }
     s.li = dev_copy(li);
-
+    {
+        vector<PortStatic> pst(nports);
+        vector<PortCfg> pcv;
+        for (auto &w : worlds)
+            pcv.insert(pcv.end(), w.pcfg.begin(), w.pcfg.end());
+        for (int x = 0; x < S; x++)
+            for (int p = 0; p < deg[H + x]; p++)
+            {
+                PortStatic &q = pst[pbase[x] + p];
+                int li_in = in_link[(size_t)(H + x) * K + p], li_out = out_link[(size_t)(H + x) * K + p];
+                q.link_in = li_in;
+                q.in_delay = (int32_t)li[li_in].delay;
+                q.out_delay = (int32_t)li[li_out].delay;
+                q.kmin = pcv[pbase[x] + p].kmin;
+                q.kmax = pcv[pbase[x] + p].kmax;
+                q.in_coff = li[li_in].coff;
+                q.in_moff = (uint32_t)li[li_in].moff;
+                q.in_nb = li[li_in].nb;
+                q.in_cap = li[li_in].cap;
+            }
+        s.pst = dev_copy(pst);
+        vector<int> busy(S, 1); // (every switch runs its first slot)
+        s.sw_busy = dev_copy(busy);
+    }
     s.msg = dev_alloc<LFrame>(nframes);
     {
         vector<long long> mc(ncnt, -(1ll << 16));
@@ -1341,7 +1365,7 @@ int main(int argc, char **argv)
     auto per_sw = [&](int k) { return (size_t)k * sizeof(SwPortLds) + sw_ints(k) * sizeof(int); };
     s.apool = dev_alloc<ArrLds>((size_t)S * POOL);
     s.aidx = dev_alloc<int>((size_t)S * 2 * POOL);
-    size_t per_h = HPOOL * sizeof(HArr) + HHINTS * sizeof(int);
+    size_t per_h = HPOOL * sizeof(HArr) + (HHINTS + 1) * sizeof(int) + 8 + MAX_DUE * sizeof(Due);
     if (per_sw(s.kb) > 64 * 1024)
     {
         fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw(s.kb), s.kb);
