@@ -4031,7 +4031,11 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
             // after about a second, give up and report)
             for (long long n = 0; *(volatile int64_t *)s.slot == slot && !*(volatile int *)s.finished; n++)
             {
+#if defined(TWINS_USE_HIP)
                 __builtin_amdgcn_s_sleep(1);
+#else
+                __nanosleep(64);
+#endif
                 if (n > (1ll << 24))
                 {
                     atomicAdd(&s.ev[36], 1ull);
