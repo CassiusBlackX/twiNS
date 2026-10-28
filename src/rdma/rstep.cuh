@@ -76,6 +76,8 @@ __device__ __forceinline__ LFrame *link_push(const Sim &s, int link, int64_t ts,
         o.cap = l.cap;
         o.n = (v >> 16) == a ? (uint16_t)(v & 0xFFFF) : 0;
         s.pend[a % s.pend_n] = 1;
+        if (s.any_win && s.hz[s.link_dst[link]] > a)
+            atomicAdd(&s.ev[33], 1ull); // its receiver has run the slot (a bug: reported)
     }
     if (o.n >= o.cap)
     {
@@ -238,68 +240,6 @@ struct RunCursor
     }
 };
 
-// < 0: a runs first, > 0: b first, 0: the chains do not tell; *inexact: the decision rests on a
-// chain whose tail was overwritten. Going back from the events, the first differing lead decides
-// (the larger: an earlier ancestor). If every lead is equal, the ancestors are the same event from
-// the deepest level at which the ordinals differ, and there the smaller ordinal (the sibling
-// scheduled first) decides; distinct roots (flows' StartApplications) decide in start order.
-// (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
-// (inline_only: give up, returning 2, where either chain goes on into its tail)
-__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr,
-                                         bool inline_only = false)
-{
-    *inexact = false;
-    if (by_lead)
-        *by_lead = false;
-    int ord = 0;
-    RunCursor A, B;
-    A.init(a, pa);
-    B.init(b, pb);
-    for (;;)
-    {
-        if (inline_only && (A.i > RUNS || B.i > RUNS))
-            return 2;
-        uint32_t ca = A.code, cb = B.code;
-        if (ca == 0 || cb == 0)
-        {
-            *inexact = (ca == 0 && A.lost) || (cb == 0 && B.lost);
-            if (ca == 0 && cb == 0)
-            {
-                // distinct roots: the lineages never meet, so the ordinals compared above were not
-                // siblings'; the flows' starts decide
-                if (a.root && b.root && a.root != b.root)
-                    return a.root < b.root ? -1 : 1;
-                return ord;
-            }
-            // a complete chain ends at an event scheduled before everything after it
-            if (by_lead)
-                *by_lead = !(ca == 0 ? A.lost : B.lost);
-            if (ca == 0)
-                return A.lost ? ord : -1;
-            return B.lost ? ord : 1;
-        }
-        if (ca >> 3 != cb >> 3)
-        {
-            if (by_lead)
-                *by_lead = true;
-            return ca > cb ? -1 : 1;
-        }
-        if (ca != cb)
-            ord = (ca & 7) > (cb & 7) ? -1 : 1;
-        // at the same tail node, at the same place in it: the rest is one lineage (the chains met at
-        // a common ancestor), so the deepest ordinal difference is one seen above
-        if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
-            return ord;
-        uint32_t m = A.left < B.left ? A.left : B.left;
-        A.left -= m;
-        B.left -= m;
-        if (A.left == 0)
-            A.next();
-        if (B.left == 0)
-            B.next();
-    }
-}
-
 // Comparisons decided by the leads (a first differing lead, or one chain ending first) depend only
 // on the two chains' leads, so they are remembered by their lead hashes. In lockstep traffic (as
 // in collectives) two ports see the same pair of lineages slot after slot, each extended by the
@@ -336,6 +276,67 @@ __device__ __forceinline__ void memo_put(uint64_t ha, uint64_t hb, int r)
         unsigned long long old = atomicCAS(p, 0ull, v);
         if (old == 0 || (old & ~3ull) == k)
             return;
+    }
+}
+
+// < 0: a runs first, > 0: b first, 0: the chains do not tell; *inexact: the decision rests on a
+// chain whose tail was overwritten. Going back from the events, the first differing lead decides
+// (the larger: an earlier ancestor). If every lead is equal, the ancestors are the same event from
+// the deepest level at which the ordinals differ, and there the smaller ordinal (the sibling
+// scheduled first) decides; distinct roots (flows' StartApplications) decide in start order.
+// (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
+// (inline_only: give up, returning 2, where either chain goes on into its tail)
+__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr,
+                                         bool inline_only = false)
+{
+    *inexact = false;
+    if (by_lead)
+        *by_lead = false;
+    int ord = 0;
+    RunCursor A, B;
+    A.init(a, pa);
+    B.init(b, pb);
+    auto by_leads = [&](int r) {
+        if (by_lead)
+            *by_lead = true;
+        return r;
+    };
+    for (;;)
+    {
+        if (inline_only && (A.i > RUNS || B.i > RUNS))
+            return 2;
+        uint32_t ca = A.code, cb = B.code;
+        if (ca == 0 || cb == 0)
+        {
+            *inexact = (ca == 0 && A.lost) || (cb == 0 && B.lost);
+            if (ca == 0 && cb == 0)
+            {
+                // distinct roots: the lineages never meet, so the ordinals compared above were not
+                // siblings'; the flows' starts decide
+                if (a.root && b.root && a.root != b.root)
+                    return a.root < b.root ? -1 : 1;
+                return ord;
+            }
+            // a complete chain ends at an event scheduled before everything after it
+            if (ca == 0)
+                return A.lost ? ord : by_leads(-1);
+            return B.lost ? ord : by_leads(1);
+        }
+        if (ca >> 3 != cb >> 3)
+            return by_leads(ca > cb ? -1 : 1);
+        if (ca != cb)
+            ord = (ca & 7) > (cb & 7) ? -1 : 1;
+        // at the same tail node, at the same place in it: the rest is one lineage (the chains met at
+        // a common ancestor), so the deepest ordinal difference is one seen above
+        if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
+            return ord;
+        uint32_t m = A.left < B.left ? A.left : B.left;
+        A.left -= m;
+        B.left -= m;
+        if (A.left == 0)
+            A.next();
+        if (B.left == 0)
+            B.next();
     }
 }
 
@@ -586,7 +587,12 @@ __device__ __forceinline__ void dag_fire(const Sim &s, int g, int k, int64_t tE,
         cpush(&m.c, ccode(s.send_lat, 0), x);
         m.ts = ts;
         m.flow = v >> 1;
-        atomicAdd(&s.hmsg_n[(size_t)s.fi[v >> 1].src * s.nbi + b], 1u);
+        const FlowInfo &cf = s.fi[v >> 1];
+        m.next = atomicExch(&s.hhead[(size_t)cf.src * s.nbi + b], n + 1);
+        if (cf.fast)
+            s.srv_fs[(size_t)s.h_srv[cf.src] * s.nbi + b] = a; // (ends the server's quiet windows before it)
+        if (s.any_win && s.hz[cf.src] > a)
+            atomicAdd(&s.ev[33], 1ull);
         s.pend[a % s.pend_n] = 1;
         i++;
     }
@@ -1117,6 +1123,8 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         q.done = 1;
         s.fct[f] = c.now - s.fi[f].start;
         atomicAdd(s.flows_done, 1u);
+        if (s.fi[f].fast)
+            atomicSub(&s.srv_fact[s.h_srv[c.h]], 1);
         if (s.dag)
             dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event has scheduled nothing yet)
     }
@@ -1201,6 +1209,8 @@ __device__ __forceinline__ void h_start(HCtx<ND> &c, int f)
     SndQP &q = s.qp[f];
     q = SndQP{};
     q.size = fi.size;
+    if (fi.fast)
+        atomicAdd(&s.srv_fact[s.h_srv[c.h]], 1); // (its server's GPUs run single slots until it completes)
     hsel(c, fi.snic); // GetNicIdxOfQp
     q.nic = fi.snic;
     const uint64_t nic = s.li[c.link()].bps;
@@ -1302,7 +1312,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
         hints[0] = total;
         // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
         // the host has no event in it
-        hints[HHINTS] = total == 0 && !(s.dag && s.hmsg_n[(size_t)h * s.nbi + slot % s.nbi]) && s.hs[s.nic_off[h]].wake >= t1;
+        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + slot % s.nbi]) && s.hs[s.nic_off[h]].wake >= t1;
     }
     __syncthreads();
     if (hints[HHINTS])
@@ -1424,19 +1434,15 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     // one this is becomes ready, to start at the latest of them (in ns-3's order)
     int *dyn = s.dag ? s.dyn + (size_t)h * s.dyn_cap : nullptr;
     int ndyn = s.dag ? s.dyn_n[h] : 0;
-    if (s.dag && s.hmsg_n[(size_t)h * s.nbi + slot % s.nbi])
+    if (s.dag && s.hhead[(size_t)h * s.nbi + slot % s.nbi])
     {
         int b = (int)(slot % s.nbi);
-        s.hmsg_n[(size_t)h * s.nbi + b] = 0;
-        unsigned int n = s.dmsg_n[b];
-        if (n > (unsigned)s.dcap)
-            n = s.dcap;
-        for (unsigned int i = 0; i < n; i++)
+        unsigned int nx = s.hhead[(size_t)h * s.nbi + b];
+        s.hhead[(size_t)h * s.nbi + b] = 0;
+        for (; nx; nx = s.dmsg[(size_t)b * s.dcap + nx - 1].next)
         {
-            const DMsg &m = s.dmsg[(size_t)b * s.dcap + i];
+            const DMsg &m = s.dmsg[(size_t)b * s.dcap + nx - 1];
             int f = m.flow;
-            if (s.fi[f].src != h)
-                continue;
             if (s.dep_t[f] < 0 || before(s, s.dep_t[f], 0, s.dep_c[f], m.ts, 0, m.c))
             {
                 s.dep_t[f] = m.ts;
@@ -2136,6 +2142,13 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             a.ah = chash(f.c.hash, a.acode);
             a.ar = f.c.root;
             a.frame = fi;
+            a.rank = -1;
+            if (WIDE && s.rank_ahead)
+            {
+                int64_t rk = s.frank[fi];
+                if ((rk >> 20) == slot)
+                    a.rank = (int32_t)(rk & 0xFFFFF);
+            }
             int q = 0;
             a.out = (int16_t)(f.p.kind == K_PAUSE || f.p.kind == K_RESUME ? -1 : s_route(s, WP, x, f.p, &q));
             a.q = (uint8_t)q;
@@ -2535,7 +2548,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
             int ki = i & 1, kj = j & 1;
             if (ki && kj) // two TransmitCompletes: their keys
                 return a.pt.tc_key < b.pt.tc_key;
-            if (RANK_SORT && !ki && !kj && c.pool) // two arrivals: their ranks
+            if (!ki && !kj && c.pool && pool[a.ai].rank >= 0 && pool[b.ai].rank >= 0) // two arrivals: their ranks
                 return pool[a.ai].rank < pool[b.ai].rank;
             int r = qcmp(s, ki ? a.tp : a.ap, ki ? a.th : a.ah, ki ? a.tr : a.ar, kj ? b.tp : b.ap, kj ? b.th : b.ah, kj ? b.tr : b.ar);
 #ifdef RDMA_PROF
@@ -2545,6 +2558,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
 #endif
             if (r == 0)
             {
+                if (!ki && !kj)
+                    atomicAdd(&s.ev[34], 1ull); // (see rdma_rank)
                 const Chain &xa = ki ? tcs[i >> 1] : sw_arr_chain(c, a);
                 const Chain &xb = kj ? tcs[j >> 1] : sw_arr_chain(c, b);
                 bool inexact;
@@ -2800,6 +2815,44 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
 // A block (one wave) per host and per switch. A block's lanes load its slot's inputs together,
 // then the first lane runs its events (entities sharing a wave would diverge and run in turn).
 // Their LDS is kept small: it bounds how many blocks a CU holds.
+// An entity's window at the launch's slot (Sim::hz): 0 when it has run it already, else the slots
+// it runs. A quiet server's GPU (no NVLink queue pair running) runs up to the slot of the
+// server's next NVLink flow start: its frames reach the server's GPUs a slot later at the earliest.
+__device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
+{
+    if (!s.any_win)
+        return 1;
+    if (s.hz[e] > slot)
+        return 0;
+    int k = s.wk[e];
+    if (e < s.H && s.wq[e] > k && s.srv_fact[s.h_srv[e]] == 0)
+    {
+        int srv = s.h_srv[e], q = s.wq[e];
+        int lo = s.srv_rs_off[srv], hi = s.srv_rs_off[srv + 1], end = hi;
+        while (lo < hi)
+        {
+            int m = (lo + hi) / 2;
+            if (s.srv_rs[m] < slot)
+                lo = m + 1;
+            else
+                hi = m;
+        }
+        if (lo < end && s.srv_rs[lo] < slot + q)
+            q = (int)(s.srv_rs[lo] - slot);
+        if (s.dag)
+            for (int j = 0; j < q; j++)
+                if (s.srv_fs[(size_t)srv * s.nbi + (slot + j) % s.nbi] == slot + j)
+                {
+                    q = j;
+                    break;
+                }
+        k = q > k ? q : k;
+    }
+    if (slot + k > s.max_slots)
+        k = s.max_slots - slot > 1 ? (int)(s.max_slots - slot) : 1;
+    return k;
+}
+
 template <int ND>
 __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
 {
@@ -2812,13 +2865,37 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
     HArr *pool = reinterpret_cast<HArr *>(smem);
     int *hints = reinterpret_cast<int *>(smem + HPOOL * sizeof(HArr));
     Due *due = reinterpret_cast<Due *>(smem + HPOOL * sizeof(HArr) + (HHINTS + 1) * sizeof(int) + 8);
-    bool act = host_step<ND>(s, h, slot, &w, lane, lanes, pool, hints, due);
+    __shared__ int win;
+    if (s.any_win)
+    {
+        if (lane == 0)
+            win = entity_window(s, h, slot);
+        __syncthreads();
+    }
+    const int k = s.any_win ? win : 1;
+    if (k == 0)
+    {
+        // ahead: the launches may not skip past its window's end
+        if (lane == 0)
+            slot_end(s, slot, 0, (unsigned long long)(s.hz[h] * s.P.delay));
+        return;
+    }
+    bool act = false;
+    for (int j = 0; j < k; j++)
+    {
+        w = INT64_MAX;
+        act |= host_step<ND>(s, h, slot + j, &w, lane, lanes, pool, hints, due);
+    }
 #ifdef RDMA_PROF
     if (lane == 0)
         atomicMax(&s.ev[16], (unsigned long long)(clock64() - p0));
 #endif
     if (lane == 0)
+    {
+        if (k > 1)
+            s.hz[h] = slot + k;
         slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
+    }
 }
 
 template <bool WIDE>
@@ -2835,35 +2912,60 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
     int *ints = reinterpret_cast<int *>(smem + (size_t)kl * sizeof(SwPortLds));
     ArrLds *pool = s.apool + (size_t)x * POOL;
     int *pidx = s.aidx + (size_t)x * 2 * POOL;
-    __shared__ int blk_act;
-    if (lane == 0)
-        blk_act = 0;
-    __syncthreads();
-    // an idle switch (nothing queued or in transmission) without arrivals has no events: skip it
-    bool run = s.sw_busy[x];
-    if (!run)
+    __shared__ int blk_act, win;
+    if (s.any_win)
     {
-        const int node = s.H + x, deg = s.deg[node];
-        int any = 0;
-        for (int p = lane; p < deg; p += lanes)
-        {
-            const PortStatic &ps = s.pst[s.pbase[x] + p];
-            long long v = s.msg_cnt[ps.in_coff + (int)(slot % ps.in_nb)];
-            any |= (v >> 16) == slot && (v & 0xFFFF) > 0;
-        }
-        run = __syncthreads_or(any);
+        if (lane == 0)
+            win = entity_window(s, s.H + x, slot);
+        __syncthreads();
     }
-    if (run && switch_step<WIDE>(s, x, slot, w, pool, pidx, lane, lanes, ints, kl))
-        blk_act = 1; // (any lane: the ports are spread over them)
-    __syncthreads();
-    if (lane == 0)
-        s.sw_busy[x] = blk_act;
+    const int k = s.any_win ? win : 1;
+    if (k == 0)
+    {
+        if (lane == 0)
+            slot_end(s, slot, 0, (unsigned long long)(s.hz[s.H + x] * s.P.delay));
+        return;
+    }
+    int any_act = 0;
+    for (int j = 0; j < k; j++)
+    {
+        const int64_t sl = slot + j;
+        if (lane == 0)
+            blk_act = 0;
+        __syncthreads();
+        // an idle switch (nothing queued or in transmission) without arrivals has no events: skip it
+        bool run = s.sw_busy[x];
+        if (!run)
+        {
+            const int node = s.H + x, deg = s.deg[node];
+            int any = 0;
+            for (int p = lane; p < deg; p += lanes)
+            {
+                const PortStatic &ps = s.pst[s.pbase[x] + p];
+                long long v = s.msg_cnt[ps.in_coff + (int)(sl % ps.in_nb)];
+                any |= (v >> 16) == sl && (v & 0xFFFF) > 0;
+            }
+            run = __syncthreads_or(any);
+        }
+        if (run && switch_step<WIDE>(s, x, sl, w, pool, pidx, lane, lanes, ints, kl))
+            blk_act = 1; // (any lane: the ports are spread over them)
+        __syncthreads();
+        if (lane == 0)
+            s.sw_busy[x] = blk_act;
+        any_act |= blk_act;
+        if (k > 1)
+            __syncthreads(); // (blk_act is reset for the next slot)
+    }
 #ifdef RDMA_PROF
     if (lane == 0)
         atomicMax(&s.ev[17], (unsigned long long)(clock64() - p0));
 #endif
     if (lane == 0)
-        slot_end(s, slot, blk_act, ~0ull);
+    {
+        if (k > 1)
+            s.hz[s.H + x] = slot + k;
+        slot_end(s, slot, any_act, ~0ull);
+    }
 }
 
 // the slot kernel: blocks 0 .. H - 1 are the hosts, then the switches
@@ -2885,6 +2987,121 @@ __global__ void rdma_slot_big(Sim s)
     if (*s.finished)
         return;
     switch_block<true>(s, s.slist_b[blockIdx.x], smem, s.kb);
+}
+
+// Ranks ahead, alongside a launch's kernels every rank_every launches (a block per wide switch and
+// slot): the arrivals of slot + rank_ahead + i (i < rank_every) are all filed when the in-links
+// are at least rank_ahead + rank_every + 1 slots long. Their ties
+// (same time) are decided as first() would, a pair per lane, so the switch's events need not walk
+// chains (lockstep lineages: ~150 tail nodes per comparison) on the launch's critical path.
+struct RankArr
+{
+    int64_t ts;
+    Run ap[PRE];
+    uint64_t ah;
+    uint32_t ar, acode, frame;
+    int port, rank, hard;
+};
+constexpr int RPOOL = 256, RPAIRS = 2048;
+__global__ void rdma_rank(Sim s)
+{
+    if (*s.finished)
+        return;
+    const int x = s.slist_b[blockIdx.x % s.ns_b];
+    if (!s.rk_ok[x])
+        return;
+    const int64_t a = *s.slot + s.rank_ahead + blockIdx.x / s.ns_b;
+    const int lane = threadIdx.x, lanes = blockDim.x, node = s.H + x, deg = s.deg[node];
+    __shared__ RankArr ra[RPOOL];
+    __shared__ int pr[RPAIRS][3];
+    __shared__ int n, np, cnt[256], off[257];
+    __shared__ uint32_t base[256];
+    for (int p = lane; p < deg; p += lanes)
+        cnt[p] = bucket(s, s.in_link[(size_t)node * s.K + p], a, &base[p]);
+    __syncthreads();
+    if (lane == 0)
+    {
+        off[0] = 0;
+        for (int p = 0; p < deg; p++)
+            off[p + 1] = off[p] + cnt[p];
+        n = off[deg];
+        np = 0;
+    }
+    __syncthreads();
+    if (n > RPOOL || n < 2)
+        return; // (none to rank, or too many: the switch compares as before)
+    for (int j = lane; j < n; j += lanes)
+    {
+        int p = 0;
+        while (j >= off[p + 1])
+            p++;
+        uint32_t fi = base[p] + (j - off[p]);
+        const LFrame &f = s.msg[fi];
+        int link = s.in_link[(size_t)node * s.K + p];
+        RankArr &e = ra[j];
+        e.ts = f.ts;
+        e.acode = arrival_code(s, link, s.li[link].delay, f);
+        cprefix(e.ap, e.acode, f.c);
+        e.ah = chash(f.c.hash, e.acode);
+        e.ar = f.c.root;
+        e.frame = fi;
+        e.port = p;
+        e.rank = 0;
+        e.hard = 0;
+    }
+    __syncthreads();
+    for (int i = lane; i < n; i += lanes)
+        for (int j = i + 1; j < n; j++)
+            if (ra[j].ts == ra[i].ts)
+            {
+                int k = atomicAdd(&np, 1);
+                if (k < RPAIRS)
+                {
+                    pr[k][0] = i;
+                    pr[k][1] = j;
+                }
+            }
+    __syncthreads();
+    if (np > RPAIRS)
+        return;
+    // only arrivals in a pair the prefixes leave open are ranked (against all of their time): the
+    // switch decides the others' ties by the prefixes as cheaply as by ranks
+    for (int k = lane; k < np; k += lanes)
+    {
+        const RankArr &A = ra[pr[k][0]], &B = ra[pr[k][1]];
+        int r = qcmp(s, A.ap, A.ah, A.ar, B.ap, B.ah, B.ar);
+        pr[k][2] = r;
+        if (r == 0)
+        {
+            ra[pr[k][0]].hard = ra[pr[k][1]].hard = 1;
+            atomicAdd(&s.ev[34], 1ull);
+        }
+    }
+    __syncthreads();
+    for (int k = lane; k < np; k += lanes)
+    {
+        const RankArr &A = ra[pr[k][0]], &B = ra[pr[k][1]];
+        if (!A.hard && !B.hard)
+            continue;
+        int r = pr[k][2];
+        if (r == 0)
+        {
+            bool inexact;
+            r = ccmp(s, A.acode, s.msg[A.frame].c, B.acode, s.msg[B.frame].c, &inexact);
+            if (inexact)
+                atomicAdd(&s.ev[9], 1ull);
+            if (r == 0)
+            {
+                atomicAdd(&s.ev[8], 1ull);
+                r = A.port < B.port ? -1 : 1; // (undecided: in port order, as first())
+            }
+        }
+        atomicAdd(&ra[r < 0 ? pr[k][1] : pr[k][0]].rank, 1);
+    }
+    __syncthreads();
+    for (int j = lane; j < n; j += lanes)
+        if (ra[j].hard)
+            s.frank[ra[j].frame] = a << 20 | ra[j].rank;
 }
 
 // the hosts with several devices (GPUs), alongside rdma_slot

@@ -9,6 +9,10 @@
 // (its overrides on top of CONFIG's and the command line's), run side by side with the others;
 // world name's results go to DIR/name.fct. The worlds share the slot (the shortest link delay).
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
+// --win: the most slots a block runs in one launch (default 32; 1: one slot per launch)
+// --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
+// (--rank-every=G: one ranking every G launches, of G slots, default 8; --rank-join=M: it joins M
+// launches later, default 1; --rank-bs: its block size, default 512)
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
 // overwritten tail are reported as "on lost tails"
@@ -792,7 +796,7 @@ int main(int argc, char **argv)
         return 1;
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0;
+    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 32, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -830,6 +834,16 @@ int main(int argc, char **argv)
             spread = atoi(v.c_str());
         else if (k == "--serial")
             serial = 1;
+        else if (k == "--win")
+            kw = std::max(1, std::min(255, atoi(v.c_str())));
+        else if (k == "--rank")
+            rank_ahead = std::max(0, atoi(v.c_str()));
+        else if (k == "--rank-join")
+            rank_join = std::max(1, atoi(v.c_str()));
+        else if (k == "--rank-bs")
+            rank_bs = std::max(32, atoi(v.c_str()));
+        else if (k == "--rank-every")
+            rank_every = std::max(1, atoi(v.c_str()));
         else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
             set_override(base, k, v);
         else
@@ -1048,6 +1062,89 @@ int main(int argc, char **argv)
     s.link_dport = dev_copy(link_dport);
     s.rt = dev_copy(rt);
     s.rtp = dev_copy(rtp);
+    // windows (Sim::hz): an entity's is its in-links' shortest delay in slots, without a GPU's
+    // NVLink while its server is quiet; under send_lat with DAGs (their messages must not reach a
+    // window already run)
+    vector<uint8_t> kb(H + S, 1), kq(H + S, 1);
+    vector<int> h_srv(H, -1);
+    vector<int64_t> ldelay_g(L);
+    for (int wi = 0; wi < W; wi++)
+        for (int l = 0; l < worlds[wi].L; l++)
+            ldelay_g[lbase[wi] + l] = worlds[wi].ldelay[l];
+    {
+        int64_t cap = kw;
+        bool dag = false;
+        for (auto &w : worlds)
+            dag |= w.dag;
+        if (dag)
+            cap = std::min<int64_t>(cap, ((int64_t)Cfg{base}.num("SEND_LAT_NS", 3000) - 1) / D);
+        cap = std::max<int64_t>(cap, 1);
+        for (int g = 0; g < H + S; g++)
+        {
+            int64_t a = cap, q = cap;
+            int nv = 0, srv = -1;
+            for (int p = 0; p < deg[g]; p++)
+            {
+                int l = in_link[(size_t)g * K + p];
+                int from = link_dst[l ^ 1];
+                int64_t k = std::max<int64_t>(1, ldelay_g[l] / D);
+                a = std::min(a, k);
+                if (g < H && from >= H && si[from - H].nvs)
+                    nv++, srv = from - H;
+                else
+                    q = std::min(q, k);
+            }
+            kb[g] = (uint8_t)a;
+            kq[g] = (uint8_t)(g < H && nv == 1 ? q : a);
+            if (g < H && nv == 1)
+                h_srv[g] = srv;
+        }
+    }
+    vector<int> srv_rs_off(S + 1, 0);
+    vector<int64_t> srv_rs;
+    {
+        vector<vector<int64_t>> rs(S);
+        for (int f = 0; f < F; f++)
+        {
+            FlowInfo &x = fi[f];
+            x.fast = h_srv[x.src] >= 0 && h_srv[x.src] == h_srv[x.dst];
+            if (x.fast && !x.dyn)
+                rs[h_srv[x.src]].push_back(x.start / D);
+        }
+        for (int x = 0; x < S; x++)
+        {
+            std::sort(rs[x].begin(), rs[x].end());
+            srv_rs_off[x + 1] = srv_rs_off[x] + (int)rs[x].size();
+            srv_rs.insert(srv_rs.end(), rs[x].begin(), rs[x].end());
+        }
+    }
+    // ranks ahead (rdma_rank): wide switches whose in-links are all long enough; they run single
+    // slots (a window would run slots not ranked yet)
+    vector<uint8_t> rk_ok(S, 0);
+    if (rank_ahead > 0)
+        for (int x = 0; x < S; x++)
+        {
+            if (deg[H + x] <= KSMALL)
+                continue;
+            bool ok = true;
+            for (int p = 0; p < deg[H + x]; p++)
+                ok &= ldelay_g[in_link[(size_t)(H + x) * K + p]] >= (rank_ahead + rank_every + 1) * D;
+            rk_ok[x] = ok;
+            if (ok)
+                kb[H + x] = kq[H + x] = 1;
+        }
+    s.rk_ok = dev_copy(rk_ok);
+    s.rank_ahead = rank_ahead;
+    s.rank_every = rank_every;
+    for (int g = 0; g < H + S; g++)
+        s.any_win |= kb[g] > 1 || kq[g] > 1;
+    s.wk = dev_copy(kb);
+    s.wq = dev_copy(kq);
+    s.h_srv = dev_copy(h_srv);
+    s.srv_rs_off = dev_copy(srv_rs_off);
+    s.srv_rs = dev_copy(srv_rs);
+    s.srv_fact = dev_alloc<int>(S);
+    s.hz = dev_alloc<int64_t>(H + S);
     s.fi = dev_copy(fi);
     s.root_chain = dev_copy(root_chain);
     {
@@ -1136,12 +1233,13 @@ int main(int argc, char **argv)
         for (auto &w : worlds)
             for (uint64_t r : w.lbps)
                 txmax = std::max(txmax, tx_ns(P.simai, r, w.P.mtu + 128));
-        nbi = (int)((s.send_lat + txmax) / D) + 3;
+        nbi = (int)((s.send_lat + txmax) / D) + 3 + kw; // (a host's window runs ahead by up to kw - 1 slots)
         s.nbi = nbi;
         s.dcap = 4096;
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
         s.dmsg_n = dev_alloc<unsigned int>(nbi);
-        s.hmsg_n = dev_alloc<unsigned int>((size_t)H * nbi);
+        s.hhead = dev_alloc<unsigned int>((size_t)H * nbi);
+        s.srv_fs = dev_copy(vector<int64_t>((size_t)S * nbi, -1));
         s.dyn_cap = 256;
         s.dyn = dev_alloc<int>((size_t)H * s.dyn_cap);
         s.dyn_n = dev_alloc<int>(H);
@@ -1243,6 +1341,10 @@ int main(int argc, char **argv)
     vector<uint64_t> rates;
     vector<LinkInfo> li(L);
     size_t nframes = 0, ncnt = 0;
+    vector<int> lsend(L, 0);
+    for (int g = 0; g < N; g++)
+        for (int p = 0; p < deg[g]; p++)
+            lsend[out_link[(size_t)g * K + p]] = g;
     int pend_n = 2;
     {
         uint32_t mtu = 0;
@@ -1259,7 +1361,11 @@ int main(int argc, char **argv)
                     rates.push_back(x.bps);
                 x.rc = (uint32_t)r;
                 int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = std::max<int64_t>(1, tx_ns(P.simai, x.bps, 60));
-                int64_t nb = 2 + (txmax + x.delay - 1) / D;
+                // (its sender runs ahead by up to its window - 1 slots; a GPU sends over NVLink only
+                // in single slots)
+                int snd = lsend[lbase[wi] + l], to = link_dst[lbase[wi] + l];
+                int ksnd = snd < H && to >= H && si[to - H].nvs ? kb[snd] : std::max(kb[snd], kq[snd]);
+                int64_t nb = 2 + (txmax + x.delay - 1) / D + (ksnd - 1);
                 int64_t cap = std::min<int64_t>(MAXF, D / txmin + 2); // (back to back: ACKs, 60 bytes; overflows are reported)
                 if (nb > 4096)
                 {
@@ -1301,6 +1407,7 @@ int main(int argc, char **argv)
         s.sw_busy = dev_copy(busy);
     }
     s.msg = dev_alloc<LFrame>(nframes);
+    s.frank = dev_copy(vector<int64_t>(nframes, -1));
     {
         vector<long long> mc(ncnt, -(1ll << 16));
         s.msg_cnt = dev_copy(mc);
@@ -1382,17 +1489,34 @@ int main(int argc, char **argv)
     CK(hipStreamCreate(&sa));
     CK(hipStreamCreate(&sb));
     CK(hipStreamCreate(&sc));
+    // ranks ahead: each launch's rdma_rank joins RM launches later (a late one only leaves ties to
+    // the switch), round robin over RM streams (1: joins its own launch)
+    const int RM = rank_join;
+    vector<hipStream_t> sd(RM);
+    vector<hipEvent_t> ejd(RM);
+    for (int i = 0; i < RM; i++)
+    {
+        CK(hipStreamCreate(&sd[i]));
+        CK(hipEventCreateWithFlags(&ejd[i], hipEventDisableTiming));
+    }
+    bool ranks = false;
+    for (int x = 0; x < S; x++)
+        ranks |= rk_ok[x] != 0;
     const int GS = 64;
     const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = per_sw(s.kb);
     CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
     CK(hipFuncSetAttribute((const void *)rdma_slot_m, hipFuncAttributeMaxDynamicSharedMemorySize, (int)per_h));
     CK(hipFuncSetAttribute((const void *)rdma_slot_big, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds_b));
-    hipGraph_t graph;
-    hipGraphExec_t gexec;
     hipEvent_t ef, ejb, ejc;
     CK(hipEventCreateWithFlags(&ef, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&ejb, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&ejc, hipEventDisableTiming));
+    // two graphs when wide switches may rank ahead: with rdma_rank, and without (its kernels and
+    // joins cost launches tens of us); the next 64 slots run with it while the last ones' wide
+    // switches met ties their prefixes left open (ev[34]: about a chain walk each, on the slot's
+    // critical path) at more than one in 4 slots
+    auto capture = [&](bool ranks, hipGraphExec_t *ge) {
+    hipGraph_t graph;
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
     for (int i = 0; i < GS; i++)
     {
@@ -1401,6 +1525,8 @@ int main(int argc, char **argv)
             CK(hipEventRecord(ef, sa));
             CK(hipStreamWaitEvent(sb, ef, 0));
             CK(hipStreamWaitEvent(sc, ef, 0));
+            if (ranks && i % rank_every == 0)
+                CK(hipStreamWaitEvent(sd[i / rank_every % RM], ef, 0));
         }
         if (s.n1 + s.ns_s > 0)
             rdma_slot<<<s.n1 + s.ns_s, BS, lds, sa>>>(s);
@@ -1416,16 +1542,38 @@ int main(int argc, char **argv)
             CK(hipEventRecord(ejc, sc));
             CK(hipStreamWaitEvent(sa, ejc, 0));
         }
+        if (ranks && i % rank_every == 0)
+        {
+            int r = i / rank_every;
+            rdma_rank<<<s.ns_b * rank_every, rank_bs, 0, sd[r % RM]>>>(s);
+            CK(hipEventRecord(ejd[r % RM], sd[r % RM]));
+            if (r >= RM - 1)
+                CK(hipStreamWaitEvent(sa, ejd[(r + 1) % RM], 0));
+        }
     }
+    if (ranks)
+        for (int i = 0; i < RM; i++)
+            CK(hipStreamWaitEvent(sa, ejd[i], 0));
     CK(hipStreamEndCapture(sa, &graph));
-    CK(hipGraphInstantiate(&gexec, graph, nullptr, nullptr, 0));
+    CK(hipGraphInstantiate(ge, graph, nullptr, nullptr, 0));
+    };
+    hipGraphExec_t g_plain, g_rank = nullptr;
+    capture(false, &g_plain);
+    if (ranks)
+        capture(true, &g_rank);
+    bool use_rank = false;
+    unsigned long long open_ties = 0;
     while (!fin)
     {
-        CK(hipGraphLaunch(gexec, sa));
+        CK(hipGraphLaunch(use_rank ? g_rank : g_plain, sa));
         launches += GS;
         CK(cudaGetLastError());
+        unsigned long long ot;
         CK(hipMemcpyAsync(&fin, s.finished, sizeof(int), hipMemcpyDeviceToHost, sa));
+        CK(hipMemcpyAsync(&ot, s.ev + 34, sizeof(ot), hipMemcpyDeviceToHost, sa));
         CK(hipStreamSynchronize(sa));
+        use_rank = g_rank && (ot - open_ties) * 4 > (unsigned long long)GS;
+        open_ties = ot;
     }
     CK(cudaDeviceSynchronize());
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -1520,9 +1668,9 @@ int main(int argc, char **argv)
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
     printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
 #endif
-    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32];
-    if (ev[14] || ev[15] || ev[32])
-        fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu\n", ev[14], ev[15], ev[32]);
+    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33];
+    if (ev[14] || ev[15] || ev[32] || ev[33])
+        fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu, inputs to a window already run %llu\n", ev[14], ev[15], ev[32], ev[33]);
     if (bad)
         fprintf(stderr, "warning: capacity overflow, results are not exact\n");
     if (ev[13])

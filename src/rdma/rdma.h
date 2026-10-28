@@ -166,6 +166,7 @@ struct FlowInfo
     uint64_t base_rtt;
     uint8_t snic, rnic; // its sender's device (GetNicIdxOfQp), its receiver's for ACKs (GetNicIdxOfRxQp)
     uint8_t dyn;        // DAG: it starts when its dependencies have fired (start, sport, devices then)
+    uint8_t fast;       // between GPUs of one server (over NVLink: see Sim::h_srv)
     Chain start_chain;  // the chain of its StartApplication
 };
 
@@ -375,8 +376,26 @@ struct Sim
     int *dep_left;
     int64_t *dep_t;
     Chain *dep_c;
+    // windows: a block runs k slots in a launch when nothing can reach its entity within them (the
+    // shortest delay of its in-links that can carry frames is at least k slots); an entity whose
+    // window is ahead of the launch's slot sits it out. A GPU's NVLink in-link counts only while
+    // its server has NVLink queue pairs running, or starting within the window.
+    int64_t *hz;                  // [H + S] an entity's first slot not run (when ahead)
+    // ranks ahead (rdma_rank): a wide switch's simultaneous arrivals in event order, rank_ahead
+    // slots before it runs them: [frames] slot << 20 | rank (among those of its time)
+    int64_t *frank;
+    const uint8_t *rk_ok;         // [S] its in-links are long enough (all of slot + rank_ahead filed)
+    int rank_ahead;               // (0: off)
+    int rank_every;               // a ranking every this many launches, of as many slots
+    const uint8_t *wk, *wq;       // [H + S] its window; a GPU's when its server is quiet
+    const int *h_srv;             // [H] a GPU's server: its NVSwitch's index (-1: not a GPU)
+    int *srv_fact;                // [S] a server's running NVLink queue pairs
+    int any_win;                  // some entity's window can exceed a slot
+    const int *srv_rs_off;        // [S + 1] a server's NVLink flows of fixed start, by start:
+    const int64_t *srv_rs;        //   their start slots
     struct DMsg *dmsg;
-    unsigned int *hmsg_n; // [H][nbi] the messages for a host's flows in each bucket
+    unsigned int *hhead;  // [H][nbi] a host's messages in each bucket: a list (index + 1; 0: none)
+    int64_t *srv_fs;      // [S][nbi] a server's NVLink flow starts: the bucket's slot when it has one
     unsigned int *dmsg_n;
     int nbi, dcap;
     int *dyn, *dyn_n;
@@ -406,6 +425,7 @@ struct DMsg
     int64_t ts;
     Chain c;
     uint32_t flow;
+    uint32_t next; // the host's next one in the bucket (index + 1; 0: none)
 };
 // a host pair's devices: towards b, those a queue pair of a picks from (GetNicIdxOfQp), and those
 // a's receiving queue pair from b picks from (GetNicIdxOfRxQp)
