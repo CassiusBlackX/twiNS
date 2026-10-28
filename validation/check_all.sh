@@ -23,5 +23,5 @@ K8="k8_paper k8_fullsync k8_fullexp k8_a2a30 k8_incast16 k8_a2a50s"
     G="$G ft8f_a2a30 ft8f_a2a50s jf32f_a2a50 torus6f_a2a30"
     validation/check_exact.sh "$G" "$T"
     validation/check_exact.sh "$G" "$T" spray
-} | awk '{split($4, a, "/"); if (a[1] != a[2]) print "MISMATCH", $0; else n++} END {print n " runs identical"}'
+} | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "flows") split($i, a, "/"); if (a[1] != a[2]) print "MISMATCH", $0; else n++} END {print n " runs identical"}'
 [ "$1" = --no-sweeps ] || validation/check_sweeps.sh
