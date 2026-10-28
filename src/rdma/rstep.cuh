@@ -2247,6 +2247,41 @@ __host__ __device__ inline size_t sw_ints(int K)
 {
     return 6 * (size_t)K + (size_t)sw_ks(K) * sw_ks(K) + (LK * 7 + 3) / 4 + (K > SAFE_LANES ? 2 * (size_t)sw_kp(K) : 0);
 }
+// out[i] = in[0] + .. + in[i - 1] for i < n, by the block's lanes (a scan in each wave by shuffles,
+// then the waves' sums; rounds of `lanes` entries); returns the sum of all. A walk over i per lane
+// cost ~280 cycles a step, and the block waited for its last ports' lanes.
+__device__ __forceinline__ int block_exscan(const int *in, int *out, int n, int lane, int lanes)
+{
+    __shared__ int wsum[32];
+    const int W = warpSize, nw = (lanes + W - 1) / W, wv = lane / W, wl = lane % W;
+    int carry = 0;
+    for (int r = 0; r < n; r += lanes)
+    {
+        int i = r + lane, v = i < n ? in[i] : 0, x = v;
+        for (int o = 1; o < W; o <<= 1)
+        {
+            int y = __shfl_up(x, o);
+            if (wl >= o)
+                x += y;
+        }
+        if (wl == W - 1 || lane == lanes - 1)
+            wsum[wv] = x;
+        __syncthreads();
+        int before = carry, all = carry;
+        for (int k = 0; k < nw; k++)
+        {
+            int t = wsum[k];
+            before += k < wv ? t : 0;
+            all += t;
+        }
+        if (i < n)
+            out[i] = before + x - v;
+        carry = all;
+        __syncthreads(); // (wsum is written again)
+    }
+    return carry;
+}
+
 // WIDE: the switches of rdma_slot_big (more than SAFE_LANES ports); the narrow ones' code (in
 // rdma_slot) leaves out their path, whose registers would otherwise spill the safe slots'
 template <bool WIDE>
@@ -2264,7 +2299,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
     // perhaps the last
     // (K: the ports its LDS workspace has room for)
     const int KS = sw_ks(K);
-    int *cnt = shared_int, *first = shared_int + K; // per port: arrivals, the first in slot s - 2's list
+    int *cnt = shared_int, *first = shared_int + K; // per port: arrivals; (wide) the arrivals of the ports before it
     uint32_t *abytes = (uint32_t *)(shared_int + 2 * K); // bytes arriving for queue PG
     uint32_t *ing0 = (uint32_t *)(shared_int + 3 * K);   // ing at the slot's start
     int *ocnt = shared_int + 4 * K, *obase = shared_int + 5 * K; // safe: arrivals per egress port
@@ -2296,7 +2331,6 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         q.kmin = ps.kmin;
         q.kmax = ps.kmax;
         q.nout = 0;
-        first[p] = 0;
         cnt[p] = q.an;
         if (q.pt.tc_at >= 0)
         {
@@ -2308,15 +2342,38 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
     __syncthreads();
     // the pool: ports' arrivals in order, if they fit
     int total = 0;
-    for (int p = 0; p < deg; p++)
-        total += cnt[p];
+    if (WIDE)
+    {
+        // (many ports: their arrivals' prefix sums, once, and a binary search per arrival, not a
+        // walk over the ports)
+        total = block_exscan(cnt, first, deg, lane, lanes);
+    }
+    else
+        for (int p = 0; p < deg; p++)
+            total += cnt[p];
     bool pooled = total <= POOL;
     if (pooled)
         for (int j = lane; j < total; j += lanes)
         {
             int p = 0, base = 0;
-            while (j - base >= cnt[p])
-                base += cnt[p++];
+            if (WIDE)
+            {
+                // the last port whose arrivals start at or before j (it has some)
+                int lo = 0, hi = deg - 1;
+                while (lo < hi)
+                {
+                    int m = (lo + hi + 1) >> 1;
+                    if (first[m] <= j)
+                        lo = m;
+                    else
+                        hi = m - 1;
+                }
+                p = lo;
+                base = first[p];
+            }
+            else
+                while (j - base >= cnt[p])
+                    base += cnt[p++];
             int k = j - base;
             uint32_t fi = w[p].abase + k;
             const LFrame &f = s.msg[fi];
@@ -2709,11 +2766,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         {
             if (pooled)
             {
-                int base = 0;
-                for (int q = 0; q < p; q++)
-                    base += cnt[q];
-                w[p].ai = base;
-                w[p].aend = base + cnt[p];
+                w[p].ai = first[p];
+                w[p].aend = first[p] + cnt[p];
             }
             else
                 w[p].ai = 0;
