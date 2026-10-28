@@ -1728,6 +1728,8 @@ int main(int argc, char **argv)
         return 1;
     }
     int BS = spread;
+    // (the wide switches: a lane per port, in whole waves)
+    const int BS_big = spread < BLOCK ? spread : std::min(BLOCK_BIG, (s.kb + BLOCK - 1) / BLOCK * BLOCK);
     s.host_blocks = H;
 
     auto t_start = std::chrono::steady_clock::now();
@@ -1785,7 +1787,7 @@ int main(int argc, char **argv)
             slot_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>();
         if (s.ns_b)
         {
-            rdma_slot_big<<<s.ns_b, BS, lds_b, sc>>>();
+            rdma_slot_big<<<s.ns_b, BS_big, lds_b, sc>>>();
             CK(hipEventRecord(ejc, sc));
             CK(hipStreamWaitEvent(sa, ejc, 0));
         }

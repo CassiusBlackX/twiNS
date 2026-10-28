@@ -3200,8 +3200,10 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot()
     slot_entity<MULTI>(s, blockIdx.x, bi, slot, smem);
 }
 
-// the switches with many ports (spines), alongside rdma_slot
-__global__ void __launch_bounds__(BLOCK) rdma_slot_big()
+// the switches with many ports (spines), alongside rdma_slot: a lane per port, up to BLOCK_BIG
+// lanes (their ports' loads and stores in one round, not one per BLOCK ports)
+constexpr int BLOCK_BIG = 256;
+__global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
 {
     const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
