@@ -1142,6 +1142,15 @@ __device__ __forceinline__ void hpcc_update(HCtx<ND> &c, SndQP &q, const Pkt &p,
         q.last_update_seq = next_seq;
 }
 
+// a DCQCN timer of q set for t: its device's lower bound (Host::due_min)
+template <int ND>
+__device__ __forceinline__ void due_note(HCtx<ND> &c, const SndQP &q, int64_t t)
+{
+    int64_t &m = c.stv[q.nic].due_min;
+    if (t < m)
+        m = t;
+}
+
 // RdmaHw::cnp_received_mlx
 template <int ND>
 __device__ __forceinline__ void dcqcn_cnp(HCtx<ND> &c, int f, SndQP &q)
@@ -1154,8 +1163,10 @@ __device__ __forceinline__ void dcqcn_cnp(HCtx<ND> &c, int f, SndQP &q)
         q.alpha = 1;
         q.alpha_cnp = 0;
         q.t_alpha = c.now + c.P->alpha_int;
+        due_note(c, q, q.t_alpha);
         cpush(&s.qc[f].alpha, ccode(c.P->alpha_int, c.ord++), c.cur);
         q.t_dec = c.now + c.P->dec_int + 1;
+        due_note(c, q, q.t_dec);
         cpush(&s.qc[f].dec, ccode(c.P->dec_int + 1, c.ord++), c.cur);
         q.target = q.rate = rate_of((double)q.rate * c.P->rate_first_cnp);
         q.first_cnp = 0;
@@ -1177,11 +1188,13 @@ __device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
             q.alpha = (1 - P.g) * q.alpha;
         q.alpha_cnp = 0;
         q.t_alpha = c.now + P.alpha_int;
+        due_note(c, q, q.t_alpha);
         cpush(&s.qc[f].alpha, ccode(P.alpha_int, c.ord++), c.cur);
     }
     else if (kind == 1)
     {
         q.t_dec = c.now + P.dec_int;
+        due_note(c, q, q.t_dec);
         cpush(&s.qc[f].dec, ccode(P.dec_int, c.ord++), c.cur);
         if (q.dec_cnp)
         {
@@ -1192,12 +1205,14 @@ __device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
             q.rp_stage = 0;
             q.dec_cnp = 0;
             q.t_rp = c.now + P.rp_int;
+            due_note(c, q, q.t_rp);
             cpush(&s.qc[f].rp, ccode(P.rp_int, c.ord++), c.cur);
         }
     }
     else
     {
         q.t_rp = c.now + P.rp_int;
+        due_note(c, q, q.t_rp);
         cpush(&s.qc[f].rp, ccode(P.rp_int, c.ord++), c.cur);
         if (q.rp_stage >= P.rpg_threshold)
         {
@@ -1469,11 +1484,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     __syncthreads();
     if (lane != 0)
         return false;
-    // the context: in registers for one device; for several, in LDS (lane 0's alone): its arrays
-    // are indexed by the current device, which would put it in scratch
+    // the context: in LDS (lane 0's alone). For several devices its arrays are indexed by the
+    // current device, which would put it in scratch; for one, the compiler kept it there too
     __shared__ HCtx<MAXD> hc_lds;
-    HCtx<ND> c_reg;
-    HCtx<ND> &c = ND > 1 ? *reinterpret_cast<HCtx<ND> *>(&hc_lds) : c_reg;
+    HCtx<ND> &c = *reinterpret_cast<HCtx<ND> *>(&hc_lds);
     c.s = &s;
     c.P = &WP;
     c.h = h;
@@ -1511,11 +1525,16 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     if (WP.cc == 1)
         for (int d = 0; d < nd; d++)
         {
+            if (c.stv[d].due_min >= t1)
+                continue; // (none due: no queue pair to read)
             const int *list = s.qps + (size_t)(c.nic0 + d) * s.qps_cap;
+            int64_t mn = INT64_MAX;
             for (int i = 0; i < c.stv[d].qp_n; i++)
             {
                 const SndQP &q = s.qp[list[i]];
                 int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
+                for (int k = 0; k < 3; k++)
+                    mn = t[k] >= 0 && t[k] < mn ? t[k] : mn;
                 for (int k = 0; k < 3; k++)
                     if (t[k] >= 0 && t[k] < t1)
                     {
@@ -1534,6 +1553,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                         due[j] = x;
                     }
             }
+            c.stv[d].due_min = mn;
         }
     int di = 0;
     uint32_t acode[ND];
@@ -1693,7 +1713,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             hsel(c, bd);
         if (bk == 0)
         {
-            Pkt p = af[bd]->p;
+            const Pkt &p = af[bd]->p; // (the frame is not written while it is read)
             if (pooled)
             {
                 c.pre_ok = pool[ai[bd]].pre;
@@ -1766,15 +1786,22 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
             w = st.ns_at;
         if (WP.cc == 1)
         {
-            const int *list = s.qps + (size_t)(c.nic0 + d) * s.qps_cap;
-            for (int i = 0; i < st.qp_n; i++)
+            // the bound, exact again if a timer this slot ran left it behind
+            if (c.stv[d].due_min < t1)
             {
-                const SndQP &q = s.qp[list[i]];
-                int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
-                for (int k = 0; k < 3; k++)
-                    if (t[k] >= 0 && t[k] < w)
-                        w = t[k];
+                const int *list = s.qps + (size_t)(c.nic0 + d) * s.qps_cap;
+                int64_t mn = INT64_MAX;
+                for (int i = 0; i < st.qp_n; i++)
+                {
+                    const SndQP &q = s.qp[list[i]];
+                    int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
+                    for (int k = 0; k < 3; k++)
+                        mn = t[k] >= 0 && t[k] < mn ? t[k] : mn;
+                }
+                c.stv[d].due_min = mn;
             }
+            if (st.due_min < w)
+                w = st.due_min;
         }
         if (st.tc_at >= 0 && st.tc_at < w)
             w = st.tc_at;
@@ -2048,7 +2075,13 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     }
     if (p.kind == K_DATA && P.cc == 3 && p.nhop < 0xFFFF && !c.nvs)
     {
-        p.hop[p.nhop % MAX_HOP] = hop_make((uint64_t)c.now, pt.tx_bytes, pt.bytes_total, pcfg(c, port).bps, P.int_multi);
+        // (constant indices: an index into p's array would put the frame in scratch)
+        uint64_t hv = hop_make((uint64_t)c.now, pt.tx_bytes, pt.bytes_total, pcfg(c, port).bps, P.int_multi);
+        const int hi = p.nhop % MAX_HOP;
+#pragma unroll
+        for (int i = 0; i < MAX_HOP; i++)
+            if (i == hi)
+                p.hop[i] = hv;
         p.nhop++;
     }
     pt.tx_bytes += p.size;
@@ -3108,6 +3141,11 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
 }
 
 // the slot kernel: blocks 0 .. H - 1 are the hosts, then the switches
+// The simulation's parameters and arrays, in constant memory (set once, before the launches): as a
+// kernel argument, its address (taken by the contexts) put a copy in every wave's scratch at its
+// start, and every field read went there
+__constant__ Sim c_sim;
+
 // A block is one wave (BLOCK lanes, --spread at most): the compiler may give it all the registers
 constexpr int BLOCK = 32;
 // (MULTI: the hosts with several devices, GPUs, first: blocks start in order, and they are often
@@ -3131,8 +3169,9 @@ __device__ __forceinline__ void slot_entity(const Sim &s, int b, char *smem)
         switch_block<false>(s, s.slist_s[b - s.n1], smem, s.ks);
 }
 template <bool MULTI>
-__global__ void __launch_bounds__(BLOCK) rdma_slot(Sim s)
+__global__ void __launch_bounds__(BLOCK) rdma_slot()
 {
+    const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
@@ -3140,8 +3179,9 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot(Sim s)
 }
 
 // the switches with many ports (spines), alongside rdma_slot
-__global__ void __launch_bounds__(BLOCK) rdma_slot_big(Sim s)
+__global__ void __launch_bounds__(BLOCK) rdma_slot_big()
 {
+    const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
@@ -3162,8 +3202,9 @@ struct RankArr
     int port, rank, hard;
 };
 constexpr int RPOOL = 256, RPAIRS = 2048;
-__global__ void rdma_rank(Sim s)
+__global__ void rdma_rank()
 {
+    const Sim &s = c_sim;
     if (*s.finished)
         return;
     const int x = s.slist_b[blockIdx.x % s.ns_b];
@@ -3267,8 +3308,9 @@ __global__ void rdma_rank(Sim s)
 // `slots` slots, rdma_slot's blocks waiting for the slot's last one (slot_end) instead of the next
 // launch.
 template <bool MULTI>
-__global__ void __launch_bounds__(BLOCK) rdma_persist(Sim s, int slots)
+__global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
 {
+    const Sim &s = c_sim;
     extern __shared__ __align__(16) char smem[];
     const int b = blockIdx.x;
     for (int it = 0; it < slots; it++)

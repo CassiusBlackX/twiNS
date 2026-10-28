@@ -9,7 +9,8 @@
 // (its overrides on top of CONFIG's and the command line's), run side by side with the others;
 // world name's results go to DIR/name.fct. The worlds share the slot (the shortest link delay).
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
-// --win: the most slots a block runs in one launch (default 32; 1: one slot per launch)
+// --win: the most slots a block runs in one launch (default 1: one slot per launch; windows rarely
+// run in busy networks, and checking for them cost more than they saved)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
 // --persist=0: always a graph of launches per slot (default: one persistent launch for many slots
 // when every block fits on the GPU at once)
@@ -956,7 +957,7 @@ int main(int argc, char **argv)
         return 1;
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 32, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
+    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -1507,6 +1508,7 @@ int main(int argc, char **argv)
             hs[i] = Host{};
             hs[i].tc_at = hs[i].ns_at = -1;
             hs[i].ob_last = -(1ll << 16); // (as s.msg_cnt starts: no slot)
+            hs[i].due_min = INT64_MAX;
         }
         for (int h = 0; h < H; h++)
         {
@@ -1764,17 +1766,17 @@ int main(int argc, char **argv)
         }
         // (GPUs with the small switches: a kernel per kind cost more in launches than it saved)
         if (s.n1 + s.ns_s + s.nm > 0)
-            slot_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(s);
+            slot_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>();
         if (s.ns_b)
         {
-            rdma_slot_big<<<s.ns_b, BS, lds_b, sc>>>(s);
+            rdma_slot_big<<<s.ns_b, BS, lds_b, sc>>>();
             CK(hipEventRecord(ejc, sc));
             CK(hipStreamWaitEvent(sa, ejc, 0));
         }
         if (ranks && i % rank_every == 0)
         {
             int r = i / rank_every;
-            rdma_rank<<<s.ns_b * rank_every, rank_bs, 0, sd[r % RM]>>>(s);
+            rdma_rank<<<s.ns_b * rank_every, rank_bs, 0, sd[r % RM]>>>();
             CK(hipEventRecord(ejd[r % RM], sd[r % RM]));
             if (r >= RM - 1)
                 CK(hipStreamWaitEvent(sa, ejd[(r + 1) % RM], 0));
@@ -1786,6 +1788,7 @@ int main(int argc, char **argv)
     CK(hipStreamEndCapture(sa, &graph));
     CK(hipGraphInstantiate(ge, graph, nullptr, nullptr, 0));
     };
+    CK(hipMemcpyToSymbol(HIP_SYMBOL(c_sim), &s, sizeof(Sim))); // (the kernels' Sim: it does not change from here)
     hipGraphExec_t g_plain, g_rank = nullptr;
     capture(false, &g_plain);
     if (ranks)
@@ -1817,7 +1820,7 @@ int main(int argc, char **argv)
     const int PS = 4096; // (slots per persistent launch)
     while (!fin && persist)
     {
-        persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(s, PS);
+        persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(PS);
         launches += PS;
         CK(cudaGetLastError());
         CK(hipMemcpyAsync(&fin, s.finished, sizeof(int), hipMemcpyDeviceToHost, sa));

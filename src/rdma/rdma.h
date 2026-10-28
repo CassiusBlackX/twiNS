@@ -181,6 +181,8 @@ struct Host
     int start_end;
     int64_t wake;       // the earliest time it must run without input (for idle skipping)
     long long ob_last;  // its out link's last bucket filled (OutBucket::last)
+    int64_t due_min;    // DCQCN: at most its queue pairs' earliest timer (INT64_MAX: none); a slot
+                        // before it scans none of them
 };
 
 struct Port
