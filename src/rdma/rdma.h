@@ -180,6 +180,7 @@ struct Host
     int next_start;     // next of its flows (in start order) to start
     int start_end;
     int64_t wake;       // the earliest time it must run without input (for idle skipping)
+    long long ob_last;  // its out link's last bucket filled (OutBucket::last)
 };
 
 struct Port
@@ -193,6 +194,7 @@ struct Port
     // SwitchMmu, priority PG, this port as ingress (ing, hdrm, mmu_paused) and egress (egr)
     uint32_t ing, hdrm, egr;
     uint32_t mmu_paused;
+    long long ob_last;    // its out link's last bucket filled (OutBucket::last)
     nsm_rng::State rng;   // its ECN marking stream
     uint64_t tc_key;      // wide switches: its TransmitComplete's place (see Switch::evseq)
 };
@@ -222,7 +224,7 @@ struct PortCfg
 // ring (see LinkInfo), the delays of both its links, its ECN thresholds
 struct PortStatic
 {
-    int32_t link_in;
+    int32_t link_in, link_out;
     int32_t in_delay, out_delay;
     uint32_t kmin, kmax;
     uint32_t in_coff, in_moff;

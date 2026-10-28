@@ -43,40 +43,77 @@ __device__ __forceinline__ int64_t link_tx(const Sim &s, int link, uint32_t byte
 
 // A sender's place in a link's ring: the bucket it fills (a link's frames arrive in order, so its
 // buckets follow one another) and the frames in it. The count goes to s.msg_cnt when the sender
-// moves on to the next bucket and at the end of its slot (flush).
+// moves on to the next bucket and at the end of its slot (flush). The link's ring and rate are
+// copied in when the sender's slot starts (link_open), and the sender, the bucket counts' only
+// writer, keeps the last it wrote (last: slot << 16 | frames, kept between slots in Host and Port
+// ob_last): a frame needs no global load to find its place. txs/txv: its last two tx times.
 struct OutBucket
 {
     int64_t lo, hi; // its slot's times (hi = 0: none)
     uint32_t base;  // its first frame in s.msg
     uint32_t cnt;   // its count in s.msg_cnt
     uint16_t n, cap;
+    int link;
+    uint32_t coff, rc;
+    uint16_t nb;
+    uint64_t moff, bps;
+    long long last;
+    uint32_t txs[2];
+    int32_t txv[2];
 };
+__device__ __forceinline__ void link_open(OutBucket &o, int link, const LinkInfo &l, long long last)
+{
+    o.hi = 0;
+    o.link = link;
+    o.coff = l.coff;
+    o.rc = l.rc;
+    o.nb = l.nb;
+    o.cap = l.cap;
+    o.moff = l.moff;
+    o.bps = l.bps;
+    o.last = last;
+    o.txs[0] = o.txs[1] = 0;
+}
+// link_tx for the sender's link
+__device__ __forceinline__ int64_t link_txo(const Sim &s, OutBucket &o, uint32_t bytes)
+{
+    if (s.R == 1 && bytes < TXT_N)
+        return c_txt[bytes];
+    if (bytes >= TXT_N)
+        return tx_ns(s.P.simai, o.bps, bytes);
+    if (o.txs[0] == bytes)
+        return o.txv[0];
+    if (o.txs[1] == bytes)
+        return o.txv[1];
+    int32_t t = s.txt[(size_t)o.rc * TXT_N + bytes];
+    o.txs[1] = o.txs[0], o.txv[1] = o.txv[0];
+    o.txs[0] = bytes, o.txv[0] = t;
+    return t;
+}
 __device__ __forceinline__ void link_flush(const Sim &s, OutBucket &o)
 {
     if (o.hi == 0)
         return;
-    s.msg_cnt[o.cnt] = (long long)(o.lo / s.P.delay) << 16 | o.n;
+    o.last = (long long)(o.lo / s.P.delay) << 16 | o.n;
+    s.msg_cnt[o.cnt] = o.last;
     o.hi = 0;
 }
-// a frame for a link, arriving at ts: a place in the bucket of its arrival slot (null: the bucket
-// is full, counted as an overflow)
-__device__ __forceinline__ LFrame *link_push(const Sim &s, int link, int64_t ts, OutBucket &o)
+// a frame for the link, arriving at ts: a place in the bucket of its arrival slot (null: the
+// bucket is full, counted as an overflow)
+__device__ __forceinline__ LFrame *link_push(const Sim &s, int64_t ts, OutBucket &o)
 {
     if (ts >= o.hi)
     {
         link_flush(s, o);
-        const LinkInfo &l = s.li[link];
         int64_t a = ts / s.P.delay;
-        int b = (int)(a % l.nb);
-        o.cnt = l.coff + b;
-        long long v = s.msg_cnt[o.cnt];
+        int b = (int)(a % o.nb);
+        o.cnt = o.coff + b;
         o.lo = a * s.P.delay;
         o.hi = o.lo + s.P.delay;
-        o.base = (uint32_t)(l.moff + (uint64_t)b * l.cap);
-        o.cap = l.cap;
-        o.n = (v >> 16) == a ? (uint16_t)(v & 0xFFFF) : 0;
+        o.base = (uint32_t)(o.moff + (uint64_t)b * o.cap);
+        o.n = (o.last >> 16) == a ? (uint16_t)(o.last & 0xFFFF) : 0;
         s.pend[a % s.pend_n] = 1;
-        if (s.any_win && s.hz[s.link_dst[link]] > a)
+        if (s.any_win && s.hz[s.link_dst[o.link]] > a)
             atomicAdd(&s.ev[33], 1ull); // its receiver has run the slot (a bug: reported)
     }
     if (o.n >= o.cap)
@@ -836,7 +873,7 @@ template <int ND>
 __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
 {
     const Sim &s = *c.s;
-    int64_t tx = link_tx(s, c.link(), p.size);
+    int64_t tx = link_txo(s, c.ob(), p.size);
     c.st().tc_at = c.now + tx;
     if (c.P->simai && p.size > 60 && p.size < 9000)
     {
@@ -859,7 +896,7 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
     c.ord++;
     c.nout++;
     int64_t ts = c.now + tx + c.ldelay();
-    LFrame *f = link_push(s, c.link(), ts, c.ob());
+    LFrame *f = link_push(s, ts, c.ob());
     if (!f)
         return;
     f->ts = ts;
@@ -1431,8 +1468,9 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     {
         c.stv[d] = s.hs[c.nic0 + d];
         c.lk[d] = s.out_link[(size_t)h * s.K + d];
-        c.ldl[d] = s.li[c.lk[d]].delay;
-        c.obv[d].hi = 0;
+        const LinkInfo li = s.li[c.lk[d]];
+        c.ldl[d] = li.delay;
+        link_open(c.obv[d], c.lk[d], li, c.stv[d].ob_last);
         lin[d] = s.in_link[(size_t)h * s.K + d];
         indl[d] = s.li[lin[d]].delay;
         if (pooled)
@@ -1675,6 +1713,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
     for (int d = 0; d < nd; d++)
     {
         link_flush(s, c.obv[d]);
+        c.stv[d].ob_last = c.obv[d].last;
         const Host &st = c.stv[d];
         if (st.ackq_n > 0 || st.tc_at >= 0)
             act = true;
@@ -1793,8 +1832,7 @@ __device__ __forceinline__ uint32_t shared_used(const Port &p) { return p.ing > 
 __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
 {
     const Sim &s = *c.s;
-    int link = s.out_link[(size_t)c.node * s.K + port];
-    int64_t tx = link_tx(s, link, p.size);
+    int64_t tx = link_txo(s, c.w[port].ob, p.size);
     c.w[port].pt.tc_at = c.now + tx;
     c.w[port].pt.tc_key = c.sw.evseq * 64 + (c.ord < 63 ? c.ord : 63);
     if (c.dirty)
@@ -1814,7 +1852,7 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     c.ord++;
     c.w[port].nout++;
     int64_t ts = c.now + tx + c.w[port].out_delay;
-    LFrame *f = link_push(s, link, ts, c.w[port].ob);
+    LFrame *f = link_push(s, ts, c.w[port].ob);
     if (!f)
         return;
     f->ts = ts;
@@ -2151,6 +2189,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         ing0[p] = q.pt.ing;
         const PortStatic ps = s.pst[s.pbase[x] + p];
         q.link_in = ps.link_in;
+        link_open(q.ob, ps.link_out, s.li[ps.link_out], q.pt.ob_last);
         {
             // bucket(), from the port's copy of its link's ring
             int b = (int)(slot % ps.in_nb);
@@ -2162,7 +2201,6 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
         q.out_delay = ps.out_delay;
         q.kmin = ps.kmin;
         q.kmax = ps.kmax;
-        q.ob.hi = 0;
         q.nout = 0;
         first[p] = 0;
         cnt[p] = q.an;
@@ -2806,6 +2844,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, int x, int64_t slot, S
     for (int p = lane; p < deg; p += lanes)
     {
         link_flush(s, w[p].ob);
+        w[p].pt.ob_last = w[p].ob.last;
         if (w[p].nout > 0 || w[p].pt.q0_n > 0 || w[p].pt.q3_n > 0 || w[p].pt.tc_at >= 0)
             act = true;
         gp[p] = w[p].pt;
@@ -2861,8 +2900,9 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     s.activity[1] = cur;
     s.activity[0] = 0;
     *s.next_wake = ~0ull;
-    *s.slot = next;
     *s.done_blocks = 0;
+    __threadfence(); // (the tickets are reset before the next slot shows: rdma_persist)
+    *s.slot = next;
     __threadfence();
 }
 
@@ -3023,19 +3063,26 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
 }
 
 // the slot kernel: blocks 0 .. H - 1 are the hosts, then the switches
-__global__ void rdma_slot(Sim s)
+// A block is one wave (BLOCK lanes, --spread at most): the compiler may give it all the registers
+constexpr int BLOCK = 32;
+// (MULTI: and then the hosts with several devices, GPUs; their path's scratch, which limits the
+// waves in flight, stays out of the kernel without them)
+template <bool MULTI>
+__global__ void __launch_bounds__(BLOCK) rdma_slot(Sim s)
 {
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
         return;
     if ((int)blockIdx.x < s.n1)
         host_block<1>(s, s.hlist1[blockIdx.x], smem);
-    else
+    else if (!MULTI || (int)blockIdx.x < s.n1 + s.ns_s)
         switch_block<false>(s, s.slist_s[blockIdx.x - s.n1], smem, s.ks);
+    else
+        host_block<MAXD>(s, s.hlistm[blockIdx.x - s.n1 - s.ns_s], smem);
 }
 
 // the switches with many ports (spines), alongside rdma_slot
-__global__ void rdma_slot_big(Sim s)
+__global__ void __launch_bounds__(BLOCK) rdma_slot_big(Sim s)
 {
     extern __shared__ __align__(16) char smem[];
     if (*s.finished)
@@ -3158,13 +3205,43 @@ __global__ void rdma_rank(Sim s)
             s.frank[ra[j].frame] = a << 20 | ra[j].rank;
 }
 
-// the hosts with several devices (GPUs), alongside rdma_slot
-__global__ void rdma_slot_m(Sim s)
+// Persistent (when every block fits on the GPU at once, and no switch is wide): a launch runs up to
+// `slots` slots, rdma_slot's blocks waiting for the slot's last one (slot_end) instead of the next
+// launch.
+template <bool MULTI>
+__global__ void __launch_bounds__(BLOCK) rdma_persist(Sim s, int slots)
 {
     extern __shared__ __align__(16) char smem[];
-    if (*s.finished)
-        return;
-    host_block<MAXD>(s, s.hlistm[blockIdx.x], smem);
+    const int b = blockIdx.x;
+    for (int it = 0; it < slots; it++)
+    {
+        int64_t slot = *(volatile int64_t *)s.slot;
+        if (*(volatile int *)s.finished)
+            return;
+        if (b < s.n1)
+            host_block<1>(s, s.hlist1[b], smem);
+        else if (!MULTI || b < s.n1 + s.ns_s)
+            switch_block<false>(s, s.slist_s[b - s.n1], smem, s.ks);
+        else
+            host_block<MAXD>(s, s.hlistm[b - s.n1 - s.ns_s], smem);
+        if (threadIdx.x == 0)
+        {
+            // until the slot's last block has moved on (a block that never runs would stop it all:
+            // after about a second, give up and report)
+            for (long long n = 0; *(volatile int64_t *)s.slot == slot && !*(volatile int *)s.finished; n++)
+            {
+                __builtin_amdgcn_s_sleep(1);
+                if (n > (1ll << 24))
+                {
+                    atomicAdd(&s.ev[36], 1ull);
+                    *(volatile int *)s.finished = 1;
+                    break;
+                }
+            }
+            __threadfence();
+        }
+        __syncthreads();
+    }
 }
 
 } // namespace rdma

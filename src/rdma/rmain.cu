@@ -11,6 +11,8 @@
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
 // --win: the most slots a block runs in one launch (default 32; 1: one slot per launch)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
+// --persist=0: always a graph of launches per slot (default: one persistent launch for many slots
+// when every block fits on the GPU at once)
 // (--rank-every=G: one ranking every G launches, of G slots, default 8; --rank-join=M: it joins M
 // launches later, default 1; --rank-bs: its block size, default 512)
 //
@@ -954,7 +956,7 @@ int main(int argc, char **argv)
         return 1;
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
-    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 32, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8;
+    int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 32, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -989,7 +991,7 @@ int main(int argc, char **argv)
         else if (k == "--tail")
             tail_log2 = atoi(v.c_str());
         else if (k == "--spread")
-            spread = atoi(v.c_str());
+            spread = std::max(1, std::min(BLOCK, atoi(v.c_str())));
         else if (k == "--serial")
             serial = 1;
         else if (k == "--win")
@@ -1000,6 +1002,8 @@ int main(int argc, char **argv)
             rank_join = std::max(1, atoi(v.c_str()));
         else if (k == "--rank-bs")
             rank_bs = std::max(32, atoi(v.c_str()));
+        else if (k == "--persist")
+            persist = atoi(v.c_str());
         else if (k == "--rank-every")
             rank_every = std::max(1, atoi(v.c_str()));
         else if (k.compare(0, 2, "--") != 0 && eq != string::npos)
@@ -1502,6 +1506,7 @@ int main(int argc, char **argv)
         {
             hs[i] = Host{};
             hs[i].tc_at = hs[i].ns_at = -1;
+            hs[i].ob_last = -(1ll << 16); // (as s.msg_cnt starts: no slot)
         }
         for (int h = 0; h < H; h++)
         {
@@ -1543,6 +1548,7 @@ int main(int argc, char **argv)
             {
                 Port &pt = ps[pbase[x] + p];
                 pt = Port{};
+                pt.ob_last = -(1ll << 16); // (as s.msg_cnt starts: no slot)
                 pt.tc_at = -1;
                 // ConfigEcnStream(port, node * SwitchMmu::pCnt + device)
                 pt.rng = nsm_rng::stream_state(1, (uint64_t)node * Pw[s_world[x]].ecn_pcnt + (p + 1), 1);
@@ -1617,6 +1623,7 @@ int main(int argc, char **argv)
                 PortStatic &q = pst[pbase[x] + p];
                 int li_in = in_link[(size_t)(H + x) * K + p], li_out = out_link[(size_t)(H + x) * K + p];
                 q.link_in = li_in;
+                q.link_out = li_out;
                 q.in_delay = (int32_t)li[li_in].delay;
                 q.out_delay = (int32_t)li[li_out].delay;
                 q.kmin = pcv[pbase[x] + p].kmin;
@@ -1709,10 +1716,14 @@ int main(int argc, char **argv)
     int fin = 0;
     long long launches = 0;
     // a graph of 64 slots (fewer launch costs); a slot's kernels run side by side (forked from sa)
+    // (sb is not used: HIP gives streams hardware queues in turn, and with the default 4 queues sa
+    // and sc made one after the other shared one, which ran rdma_slot and rdma_slot_big in turn,
+    // 1.5x slower)
     hipStream_t sa, sb, sc;
     CK(hipStreamCreate(&sa));
     CK(hipStreamCreate(&sb));
     CK(hipStreamCreate(&sc));
+    (void)sb;
     // ranks ahead: each launch's rdma_rank joins RM launches later (a late one only leaves ties to
     // the switch), round robin over RM streams (1: joins its own launch)
     const int RM = rank_join;
@@ -1728,12 +1739,12 @@ int main(int argc, char **argv)
         ranks |= rk_ok[x] != 0;
     const int GS = 64;
     const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = per_sw(s.kb);
-    CK(hipFuncSetAttribute((const void *)rdma_slot, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
-    CK(hipFuncSetAttribute((const void *)rdma_slot_m, hipFuncAttributeMaxDynamicSharedMemorySize, (int)per_h));
+    auto slot_k = s.nm ? rdma_slot<true> : rdma_slot<false>;
+    auto persist_k = s.nm ? rdma_persist<true> : rdma_persist<false>;
+    CK(hipFuncSetAttribute((const void *)slot_k, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
     CK(hipFuncSetAttribute((const void *)rdma_slot_big, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds_b));
-    hipEvent_t ef, ejb, ejc;
+    hipEvent_t ef, ejc;
     CK(hipEventCreateWithFlags(&ef, hipEventDisableTiming));
-    CK(hipEventCreateWithFlags(&ejb, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&ejc, hipEventDisableTiming));
     // two graphs when wide switches may rank ahead: with rdma_rank, and without (its kernels and
     // joins cost launches tens of us); the next 64 slots run with it while the last ones' wide
@@ -1744,22 +1755,16 @@ int main(int argc, char **argv)
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
     for (int i = 0; i < GS; i++)
     {
-        if (s.nm || s.ns_b)
+        if (s.ns_b)
         {
             CK(hipEventRecord(ef, sa));
-            CK(hipStreamWaitEvent(sb, ef, 0));
             CK(hipStreamWaitEvent(sc, ef, 0));
             if (ranks && i % rank_every == 0)
                 CK(hipStreamWaitEvent(sd[i / rank_every % RM], ef, 0));
         }
-        if (s.n1 + s.ns_s > 0)
-            rdma_slot<<<s.n1 + s.ns_s, BS, lds, sa>>>(s);
-        if (s.nm)
-        {
-            rdma_slot_m<<<s.nm, BS, per_h, sb>>>(s);
-            CK(hipEventRecord(ejb, sb));
-            CK(hipStreamWaitEvent(sa, ejb, 0));
-        }
+        // (GPUs with the small switches: a kernel per kind cost more in launches than it saved)
+        if (s.n1 + s.ns_s + s.nm > 0)
+            slot_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(s);
         if (s.ns_b)
         {
             rdma_slot_big<<<s.ns_b, BS, lds_b, sc>>>(s);
@@ -1787,6 +1792,37 @@ int main(int argc, char **argv)
         capture(true, &g_rank);
     bool use_rank = false;
     unsigned long long open_ties = 0;
+    // persistent: when all H + S blocks are resident at once (the barrier needs every one running).
+    // Each role's blocks take a share of the GPU (its blocks over those that fit a CU alone); the
+    // shares must leave a tenth free.
+    // persistent: rdma_slot's blocks, when all are resident at once (the barrier needs every one
+    // running) and there are no wide switches (a second kernel could share the first's hardware
+    // queue, and never start)
+    if (persist)
+    {
+        const int nb = s.n1 + s.ns_s + s.nm;
+        CK(hipFuncSetAttribute((const void *)persist_k, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
+        int dev = 0, per_cu = 0;
+        hipDeviceProp_t prop;
+        CK(hipGetDevice(&dev));
+        CK(hipGetDeviceProperties(&prop, dev));
+        CK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, (const void *)persist_k, BS, lds));
+        // (it pays with a few blocks per multiprocessor: with more, waiting on one barrier loses to
+        // launches; 2: forced, for tests)
+        bool fits = s.ns_b == 0 && (long long)per_cu * prop.multiProcessorCount >= nb;
+        persist = fits && (persist == 2 || nb <= 2 * prop.multiProcessorCount);
+        if (W == 1 && persist)
+            printf("persistent: %d blocks, %d per CU fit on %d CUs\n", nb, per_cu, prop.multiProcessorCount);
+    }
+    const int PS = 4096; // (slots per persistent launch)
+    while (!fin && persist)
+    {
+        persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(s, PS);
+        launches += PS;
+        CK(cudaGetLastError());
+        CK(hipMemcpyAsync(&fin, s.finished, sizeof(int), hipMemcpyDeviceToHost, sa));
+        CK(hipStreamSynchronize(sa));
+    }
     while (!fin)
     {
         CK(hipGraphLaunch(use_rank ? g_rank : g_plain, sa));
@@ -1906,7 +1942,9 @@ int main(int argc, char **argv)
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
     printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
 #endif
-    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33];
+    bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
+    if (ev[36])
+        fprintf(stderr, "error: a persistent launch's blocks did not all run (--persist=0)\n");
     if (ev[14] || ev[15] || ev[32] || ev[33])
         fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu, inputs to a window already run %llu\n", ev[14], ev[15], ev[32], ev[33]);
     if (bad)
