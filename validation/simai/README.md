@@ -74,9 +74,20 @@ cp .../simai-ref.cc astra-sim-alibabacloud/extern/network_backend/ns3-interface/
 SIMAI_DIR=~/netsim/simai-ref podman/simai.sh "cd /simai/astra-sim-alibabacloud/extern/network_backend/ns3-interface/simulation && ./ns3 configure -d optimized && ./ns3 build AstraSimNetwork simai-ref"
 ```
 
+**End to end** (phase 3: `simai-trace`, simai-ref's tree instrumented):
+```shell
+cp -a simai-ref simai-trace && python3 .../trace_patch.py simai-trace
+SIMAI_DIR=~/netsim/simai-trace podman/simai.sh "cd /simai/astra-sim-alibabacloud/extern/network_backend/ns3-interface/simulation && ./ns3 build AstraSimNetwork"
+V=trace ./run_simai.sh NAME TOPO WORKLOAD 1 TWINS_TRACE=/work/runs/NAME/trace.txt
+```
+`run_e2e.sh` (microAllReduce) and `run_e2e_aicb.sh` (AICB workloads from `gen_wl.sh 16`, made by
+AICB's `SimAI_training_workload_generator` in a venv with pandas and numpy; no torch: AICB's default
+compute times) run the traced cases of `jobs_e2e.txt`. Copy each `runs/NAME/trace.txt` and
+`fct.txt` to `out/simai/e2e/NAME.trace` and `NAME.fct`; `check_e2e.sh jobs_e2e.txt` does the rest.
+
 **Running.** `run_simai.sh NAME TOPO WORKLOAD THREADS [ENV=VALUE ...]` runs SimAI in its own
 container, with outputs in `~/netsim/aiwork/runs/NAME`.
-- `V=debug|mtp|seq|ref` selects the build.
+- `V=debug|mtp|seq|ref|trace` selects the build.
 - `AS_SEND_LAT=3` is always set.
 - NVLS (`AS_NVLS_ENABLE=1`) only works within one server: across servers SimCCL generates no
   flows at all.
@@ -87,7 +98,9 @@ A SimAI topology file switches twins-rdma to ns-3-alibabacloud's behaviour (`Par
 - header sizes;
 - tx times `floor(bytes * 8e9 / bps)`;
 - the host wake-up that counts queue pairs that have sent everything;
-- `GLOBAL_T 0`;
+- `global_t` forced to 1, as SimAI's `ReadConf` does whatever `GLOBAL_T` says (`GLOBAL_T_HONOR=1`:
+  as it says; `GLOBAL_T 0` gives per-pair windows and base RTTs). simai-ref and simai-dag-ref do the
+  same. The references were remade when this was found (phase 3): before, `GLOBAL_T 0` was honored;
 - ECN stream ids with `pCnt` 1025.
 
 `--sent=F` writes every flow's first `SendComplete`.
@@ -103,6 +116,7 @@ topologies to SimAI's format.
 | `jobs_gpu1.txt` | 17 | SimAI's own topologies (`gen_Topo_Template.py`): Spectrum-X, AlibabaHPN (dual ToR: two NICs per GPU) and DCN+ with 16 GPUs, Spectrum-X with 128; NVSwitches, NVLink at 2400–2880 Gb/s and 25 ns; rings, cross-server pairs, all-to-all within servers, incasts, a mix of 200 flows; MTU 9000 and 1000 | all |
 | `jobs_dag1.txt` | 12 | DAGs (`workloads/gen_dag.py`, `docs/ai/dag.md`) against `simai-dag-ref.cc`: ring all-reduce (1 and 4 channels, within a server, over 16 and 128 GPUs: up to 32512 messages), all-to-all phases, a pipeline; Spectrum-X, HPN, DCN+ | all |
 | `jobs_scale.txt` | 3 | a ring all-reduce per rail (8 MB) over all servers on Spectrum-X 128, 512 and 1024 GPUs: 3840, 64512 and 260096 messages. The two big DAGs are not in the repo: `gen_dag.py rails N 8 8388608 > data/simai/dN_rails.dag` | all |
+| `jobs_e2e.txt` | 7 | **End to end**: SimAI (astra-sim + ns-3, `simai-trace`) running microAllReduce on Spectrum-X 8, 16 and 128 GPUs, AlibabaHPN 16 and 128, DCN+ 16 and 128 (up to 520192 messages). The run's trace becomes a DAG with timers (`workloads/trace2dag.py`); `check_e2e.sh` compares every message with SimAI's own `fct.txt` | all |
 
 The 28 runs also give identical results as one batch (`check_batch.sh` with `REF=out/simai/ref
 CFG=validation/simai/SimAI.conf OUT=out/simai/batch DATA=data/simai:data/rdma:data/topo:data/flows`).

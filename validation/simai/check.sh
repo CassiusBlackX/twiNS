@@ -35,7 +35,8 @@ while read -r name topo flows rest; do
     ssame=$(join <(sort -k1,1 "$REF/$name.sent") <(sort -k1,1 $OUT/$name.sent) | awk '$2 == $3' | wc -l)
     info=$(grep -o "undecided ties [0-9]*, on lost tails [0-9]*\|pauses [0-9]*\|marks [0-9]*" $OUT/$name.log | tr '\n' ' ')
     printf "%-24s %6d flows, %6d identical, sent %6d/%-6d (%.2f s, rc %d) %s\n" "$name" "$total" "$same" "$ssame" "$stotal" "$(echo "$t1 - $t0" | bc)" $rc "$info"
-    [ "$same" = "$total" ] && [ "$ssame" = "$stotal" ] && [ $rc = 0 ] && ok=$((ok + 1))
+    # (rc 2: flows unfinished at the stop time, as the reference's when it finished as many)
+    [ "$same" = "$total" ] && [ "$ssame" = "$stotal" ] && { [ $rc = 0 ] || { [ $rc = 2 ] && [ "$(wc -l < $OUT/$name.fct)" = "$total" ]; }; } && ok=$((ok + 1))
     if [ "$2" = "--tx" ] && [ -f "$REF/$name.tx" ] && [ "$same" != "$total" ]; then
         python3 validation/hpcc/txdiff.py "$REF/$name.tx" $OUT/$name.tx | head -12
     fi

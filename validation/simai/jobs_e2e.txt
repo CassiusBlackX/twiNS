@@ -1,0 +1,21 @@
+# SimAI end to end (astra-sim + ns-3, simai-trace: seq, simai.patch, maps by node id), microAllReduce
+# workloads; runs/NAME on a87 by run_e2e.sh, fetched to out/simai/e2e
+tr_sx8 sx8.topo
+tr_sx16 sx16.topo
+tr_hpn16 hpn16.topo
+tr_dcn16 dcn16.topo
+tr_sx128 sx128.topo
+tr_hpn128 hpn128.topo
+tr_dcn128 dcn128.topo
+# AICB (workload_generator.SimAI_training_workload_generator, run_e2e_aicb.sh): Megatron, 8
+# layers, tp 8 (Llama-7B-like; GPT-13B-like with sequence parallelism); MoE: 4 layers, tp 2, ep 8,
+# 8 experts, top-2
+a_llama_sx16 sx16.topo
+a_llama_hpn16 hpn16.topo
+a_llama_dcn16 dcn16.topo
+a_gpt13_sx16 sx16.topo
+a_gpt13_hpn16 hpn16.topo
+a_gpt13_dcn16 dcn16.topo
+a_moe_sx16 sx16.topo
+a_moe_hpn16 hpn16.topo
+a_moe_dcn16 dcn16.topo

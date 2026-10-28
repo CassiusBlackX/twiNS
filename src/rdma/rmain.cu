@@ -18,6 +18,8 @@
 // overwritten tail are reported as "on lost tails"
 //
 // out: "id start_ns fct_ns" per flow, by id.
+// Exit status: 0 every flow done; 2 some unfinished at the stop time; 3 an error counter (an
+// overflow, a late event: the results are not exact).
 // --sent=F (SimAI topologies): "id ns" per flow at its first SendComplete, by id.
 //
 // Topologies: TwiNS's ("hosts H", "switches S", "link A B"; --rate and --delay for every link), or
@@ -32,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -191,8 +194,139 @@ struct World
     vector<uint32_t> ch_list;
     vector<PairNic> pnic;
     vector<uint16_t> pcnt;
+    // traced DAGs: timers' delays, each cause's actions (2 flow + kind, then 2 F + timer), the flows
+    // main's actions install (by themselves or through timers: ready at the start, with their start
+    // times and chains), and the roots' chains (main's actions in uid order)
+    bool traced = false;
+    vector<int64_t> tdelay;
+    vector<vector<DAct>> acts;
+    struct Pre
+    {
+        int flow;
+        int64_t ts;
+        Chain c;
+    };
+    vector<Pre> pre;
+    vector<Chain> troot;
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
+
+// a traced DAG (docs/ai/dag.md): its actions by cause; main's, and their timers', expanded here
+struct TracedOn
+{
+    string child, cause;
+    unsigned long long ord;
+};
+static bool traced_dag(World &w, const vector<TracedOn> &ons, bool deps, int64_t send_lat)
+{
+    const int F = w.fi.size(), T = w.tdelay.size();
+    bool roots = false;
+    for (auto &x : w.fi)
+        roots |= !x.dyn;
+    if (deps || roots)
+    {
+        fprintf(stderr, "%s: a traced DAG (\"on\") has no \"dep\" or \"root\"\n", w.name.c_str());
+        return false;
+    }
+    w.traced = true;
+    w.acts.assign(2 * F + T, {});
+    vector<std::pair<unsigned long long, uint32_t>> mains;
+    vector<char> seen(F + T, 0);
+    for (auto &o : ons)
+    {
+        int id = atoi(o.child.c_str() + 1), cid = atoi(o.cause.c_str() + 1);
+        bool tm = o.child[0] == 't';
+        if ((o.child[0] != 'f' && !tm) || id < 0 || id >= (tm ? T : F) || seen[tm ? F + id : id]++)
+        {
+            fprintf(stderr, "%s: bad action %s (each flow and timer has one cause)\n", w.name.c_str(), o.child.c_str());
+            return false;
+        }
+        uint32_t ch = tm ? DACT_TIMER | id : id;
+        char k = o.cause[0];
+        if (k == 'm')
+        {
+            mains.push_back({o.ord, ch});
+            continue;
+        }
+        int c = k == 'r' || k == 's' ? 2 * cid + (k == 's') : 2 * F + cid;
+        if ((k != 'r' && k != 's' && k != 't') || cid < 0 || cid >= (k == 't' ? T : F))
+        {
+            fprintf(stderr, "%s: bad cause %s\n", w.name.c_str(), o.cause.c_str());
+            return false;
+        }
+        w.acts[c].push_back(DAct{ch, (uint32_t)o.ord});
+        if (!tm)
+            w.ndeps[id] = 1;
+    }
+    for (int i = 0; i < F + T; i++)
+        if (!seen[i])
+        {
+            fprintf(stderr, "%s: %s %d has no cause\n", w.name.c_str(), i < F ? "flow" : "timer", i < F ? i : i - F);
+            return false;
+        }
+    for (auto &a : w.acts)
+        std::sort(a.begin(), a.end(), [](const DAct &x, const DAct &y) { return x.ord < y.ord; });
+    // main's actions, in uid order, are the roots (root i + 1: the chain of its event, a timer's or
+    // a flow's Initialize); what they and their timers install is known now (built here: short)
+    std::sort(mains.begin(), mains.end());
+    bool ok = true;
+    auto push = [&](Chain *c, int64_t lead, int ord) {
+        if (c->r[RUNS - 1].code)
+            ok = false; // (the host builds chains without tails)
+        cpush(c, ccode(lead, ord), Chain(*c));
+    };
+    std::function<void(uint32_t, int64_t, const Chain &, int)> act = [&](uint32_t ch, int64_t t, const Chain &c, int ord) {
+        Chain x = c;
+        if (ch & DACT_TIMER)
+        {
+            int tm = ch & ~DACT_TIMER;
+            push(&x, w.tdelay[tm], ord);
+            for (auto &a : w.acts[2 * F + tm])
+                act(a.child, t + w.tdelay[tm], x, a.ord);
+            w.acts[2 * F + tm].clear(); // (fired here, never on the device)
+            return;
+        }
+        push(&x, 0, ord);              // Initialize (SendFlow)
+        push(&x, send_lat, 0);         // StartApplication
+        w.pre.push_back({(int)ch, t + send_lat, x});
+    };
+    for (size_t i = 0; i < mains.size(); i++)
+    {
+        Chain c = {};
+        c.root = i + 1;
+        uint32_t ch = mains[i].second;
+        // the root's own event, from main: its chain's hash starts after it
+        push(&c, ch & DACT_TIMER ? w.tdelay[ch & ~DACT_TIMER] : 0, 0);
+        c.hash = 0;
+        for (int k = 0; k < NANC; k++)
+            c.anc[k] = 0;
+        w.troot.push_back(c);
+        if (ch & DACT_TIMER)
+        {
+            int tm = ch & ~DACT_TIMER;
+            for (auto &a : w.acts[2 * F + tm])
+                act(a.child, w.tdelay[tm], c, a.ord);
+            w.acts[2 * F + tm].clear();
+        }
+        else
+        {
+            Chain x = c;
+            push(&x, send_lat, 0);
+            w.pre.push_back({(int)ch, send_lat, x});
+        }
+    }
+    if (!ok)
+    {
+        fprintf(stderr, "%s: the actions of main nest too deep\n", w.name.c_str());
+        return false;
+    }
+    if ((int)mains.size() > F)
+    {
+        fprintf(stderr, "%s: more roots (main's actions) than flows\n", w.name.c_str());
+        return false;
+    }
+    return true;
+}
 
 static bool build_world(World &w, const Config &config, const string &topo_file, const string &flow_file, uint64_t bps, int64_t delay)
 {
@@ -265,7 +399,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             }
         return false;
     };
-    const int global_t = cfg.u32("GLOBAL_T", 1);
+    // (SimAI's ReadConf sets global_t = 1 whatever GLOBAL_T says; GLOBAL_T_HONOR 1: as it says)
+    int global_t = cfg.u32("GLOBAL_T", 1);
 
     // ---- topology
     int &H = w.H, &S = w.S;
@@ -347,6 +482,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.bps = link_rate.empty() ? bps : link_rate[0];
     P.seq_extra = P.simai ? 4 : 0;
     P.ecn_pcnt = P.simai ? 1025 : 257;
+    if (P.simai && !cfg.u32("GLOBAL_T_HONOR", 0))
+        global_t = 1;
     if (global_t != 1 && !P.simai)
     {
         fprintf(stderr, "%s: GLOBAL_T 0 is modelled for SimAI topologies only\n", w.name.c_str());
@@ -531,6 +668,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         }
         string x;
         vector<std::pair<int, int>> deps; // (child, parent << 1 | kind)
+        vector<TracedOn> ons;
         while (f >> x)
         {
             if (x == "flow")
@@ -572,6 +710,24 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 }
                 deps.push_back({(int)id, (int)(par << 1 | (k == "s"))});
             }
+            else if (x == "timer")
+            {
+                unsigned id;
+                long long d;
+                f >> id >> d;
+                if (id != w.tdelay.size() || d < 0)
+                {
+                    fprintf(stderr, "%s: timer ids must be 0, 1, ... in order (timer %u)\n", w.name.c_str(), id);
+                    return false;
+                }
+                w.tdelay.push_back(d);
+            }
+            else if (x == "on")
+            {
+                TracedOn o;
+                f >> o.child >> o.cause >> o.ord;
+                ons.push_back(o);
+            }
             else
                 std::getline(f, x);
         }
@@ -590,7 +746,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             w.ch_list.insert(w.ch_list.end(), ch[g].begin(), ch[g].end());
         }
         int64_t t0 = -1;
-        for (size_t i = 0; i < fi.size(); i++)
+        if (!ons.empty() && !traced_dag(w, ons, !deps.empty(), (int64_t)cfg.num("SEND_LAT_NS", 3000)))
+            return false;
+        for (size_t i = 0; i < fi.size() && !w.traced; i++)
         {
             if (fi[i].dyn && w.ndeps[i] == 0)
             {
@@ -1007,6 +1165,12 @@ int main(int argc, char **argv)
             }
             s_world[sbase[wi] + x] = wi;
         }
+        for (size_t r = 0; r < w.troot.size(); r++)
+        {
+            Chain c = w.troot[r];
+            c.root += fbase[wi];
+            root_chain[c.root - 1] = c;
+        }
         for (size_t f = 0; f < w.fi.size(); f++)
         {
             FlowInfo x = w.fi[f];
@@ -1195,6 +1359,58 @@ int main(int argc, char **argv)
         vector<int> ch_off(F + 1, 0), dep_left(F, 0), wh_base(W), wh_n(W);
         vector<uint32_t> ch_list;
         vector<int64_t> wp_off(W, 0), dep_t(F, -1);
+        // traced DAGs: actions by global cause, timers; the ready flows in their hosts' lists
+        vector<int> tbase(W + 1, 0);
+        for (int wi = 0; wi < W; wi++)
+            tbase[wi + 1] = tbase[wi] + worlds[wi].tdelay.size();
+        const int T = tbase[W];
+        vector<int> act_off(2 * F + T + 1, 0);
+        vector<DAct> act;
+        vector<int64_t> tdelay;
+        vector<Chain> dep_c(F);
+        const int dyn_cap = 256;
+        vector<int> dyn((size_t)H * dyn_cap), dyn_n(H, 0), srv_fpend(S, 0);
+        {
+            vector<vector<DAct>> by(2 * F + T);
+            for (int wi = 0; wi < W; wi++)
+            {
+                World &w = worlds[wi];
+                s.traced |= w.traced;
+                tdelay.insert(tdelay.end(), w.tdelay.begin(), w.tdelay.end());
+                if (!w.traced)
+                    continue;
+                const int Fw = w.fi.size();
+                auto glob = [&](uint32_t ch) {
+                    return ch & DACT_TIMER ? DACT_TIMER | (uint32_t)(tbase[wi] + (ch & ~DACT_TIMER)) : (uint32_t)(fbase[wi] + ch);
+                };
+                for (int c = 0; c < (int)w.acts.size(); c++)
+                {
+                    int g = c < 2 * Fw ? 2 * fbase[wi] + c : 2 * F + tbase[wi] + (c - 2 * Fw);
+                    for (auto &a : w.acts[c])
+                        by[g].push_back(DAct{glob(a.child), a.ord});
+                }
+                for (auto &p : w.pre)
+                {
+                    int g = fbase[wi] + p.flow, h = fi[g].src;
+                    dep_t[g] = p.ts;
+                    dep_c[g] = p.c;
+                    dep_c[g].root += fbase[wi];
+                    if (dyn_n[h] >= dyn_cap)
+                    {
+                        fprintf(stderr, "%s: more than %d flows ready at the start on host %d\n", w.name.c_str(), dyn_cap, h);
+                        return 1;
+                    }
+                    dyn[(size_t)h * dyn_cap + dyn_n[h]++] = g;
+                    if (fi[g].fast)
+                        srv_fpend[h_srv[h]]++;
+                }
+            }
+            for (int c = 0; c < 2 * F + T; c++)
+            {
+                act.insert(act.end(), by[c].begin(), by[c].end());
+                act_off[c + 1] = act.size();
+            }
+        }
         vector<PairNic> pnic;
         vector<uint16_t> pcnt;
         for (int wi = 0; wi < W; wi++)
@@ -1221,7 +1437,14 @@ int main(int argc, char **argv)
         s.ch_list = dev_copy(ch_list);
         s.dep_left = dev_copy(dep_left);
         s.dep_t = dev_copy(dep_t);
-        s.dep_c = dev_alloc<Chain>(F);
+        s.dep_c = dev_copy(dep_c);
+        s.act_off = dev_copy(act_off);
+        s.act = dev_copy(act);
+        s.tdelay = dev_copy(tdelay);
+        s.tchain = dev_alloc<Chain>(T);
+        s.ttime = dev_alloc<int64_t>(T);
+        s.tnext = dev_alloc<int>(T);
+        s.srv_fpend = dev_copy(srv_fpend);
         s.pnic = dev_copy(pnic);
         s.pcnt = dev_copy(pcnt);
         s.wh_base = dev_copy(wh_base);
@@ -1239,10 +1462,9 @@ int main(int argc, char **argv)
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
         s.dmsg_n = dev_alloc<unsigned int>(nbi);
         s.hhead = dev_alloc<unsigned int>((size_t)H * nbi);
-        s.srv_fs = dev_copy(vector<int64_t>((size_t)S * nbi, -1));
-        s.dyn_cap = 256;
-        s.dyn = dev_alloc<int>((size_t)H * s.dyn_cap);
-        s.dyn_n = dev_alloc<int>(H);
+        s.dyn_cap = dyn_cap;
+        s.dyn = dev_copy(dyn);
+        s.dyn_n = dev_copy(dyn_n);
     }
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
@@ -1360,13 +1582,15 @@ int main(int argc, char **argv)
                 if (r == rates.size())
                     rates.push_back(x.bps);
                 x.rc = (uint32_t)r;
-                int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = std::max<int64_t>(1, tx_ns(P.simai, x.bps, 60));
+                int64_t txmax = tx_ns(P.simai, x.bps, mtu + 128), txmin = tx_ns(P.simai, x.bps, 60);
                 // (its sender runs ahead by up to its window - 1 slots; a GPU sends over NVLink only
                 // in single slots)
                 int snd = lsend[lbase[wi] + l], to = link_dst[lbase[wi] + l];
                 int ksnd = snd < H && to >= H && si[to - H].nvs ? kb[snd] : std::max(kb[snd], kq[snd]);
                 int64_t nb = 2 + (txmax + x.delay - 1) / D + (ksnd - 1);
-                int64_t cap = std::min<int64_t>(MAXF, D / txmin + 2); // (back to back: ACKs, 60 bytes; overflows are reported)
+                // (back to back: ACKs, 60 bytes; a link that sends them in 0 ns, as NVLink at 2880
+                // Gb/s, has no bound but its sender's queue; overflows are reported)
+                int64_t cap = txmin == 0 ? MAXF : std::min<int64_t>(MAXF, D / txmin + 2);
                 if (nb > 4096)
                 {
                     fprintf(stderr, "a link's delay (%lld ns) is too long for the slot (%lld ns)\n", (long long)x.delay, (long long)D);
@@ -1626,6 +1850,20 @@ int main(int argc, char **argv)
     }
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);
+    if (s.traced && W == 1)
+    {
+        // the run's end: the last timer fired (a timer fired on the host, by main's actions, is
+        // earlier than the flows it installs) or the last completion
+        vector<int64_t> tt(worlds[0].tdelay.size());
+        CK(cudaMemcpy(tt.data(), s.ttime, tt.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        int64_t last = 0;
+        for (int64_t t : tt)
+            last = std::max(last, t);
+        for (int f = 0; f < F; f++)
+            if (fct[f] >= 0)
+                last = std::max(last, fi[f].start + fct[f]);
+        printf("traced DAG: its last event at %lld ns\n", (long long)last);
+    }
     printf("drops %llu marks %llu pauses %llu resumes %llu nacks %llu | undecided ties %llu, on lost tails %llu | overflows: tx %llu queue %llu ackq %llu qps %llu due %llu | acks for done QPs %llu\n",
            ev[0], ev[1], ev[2], ev[3], ev[11], ev[8], ev[9], ev[4], ev[5], ev[6], ev[7], ev[12], ev[10]);
     if (s.tx)
@@ -1679,5 +1917,5 @@ int main(int argc, char **argv)
     if (ev[8] || ev[9])
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);
-    return done == (unsigned)F && !bad ? 0 : 2;
+    return bad ? 3 : done == (unsigned)F ? 0 : 2; // (2: flows unfinished at the stop time)
 }

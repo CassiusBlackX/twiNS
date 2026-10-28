@@ -558,12 +558,43 @@ __host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip,
 }
 
 // ------------------------------------------------------------------ DAG
+// A DAG message for flow f's source host: an installing event (SendFlow) at tI with chain E and
+// ordinal ord, so its StartApplication at tI + send_lat with chain E (0, ord) (send_lat, 0). It is
+// filed in the slot send_lat after the firing event (at tE: the host learns of it before it can
+// start; a traced DAG's timers can put tI later).
+__device__ __forceinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
+{
+    int64_t ts = tI + s.send_lat;
+    int64_t a = (tE + s.send_lat) / s.P.delay;
+    int b = (int)(a % s.nbi);
+    unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
+    if (n >= (unsigned)s.dcap)
+    {
+        atomicAdd(&s.ev[14], 1ull);
+        return;
+    }
+    DMsg &m = s.dmsg[(size_t)b * s.dcap + n];
+    Chain x;
+    cpush(&x, ccode(0, ord), E);
+    cpush(&m.c, ccode(s.send_lat, 0), x);
+    m.ts = ts;
+    m.flow = f;
+    const FlowInfo &cf = s.fi[f];
+    m.next = atomicExch(&s.hhead[(size_t)cf.src * s.nbi + b], n + 1);
+    if (cf.fast)
+        atomicAdd(&s.srv_fpend[s.h_srv[cf.src]], 1); // (no quiet windows in its server until it starts)
+    if (s.any_win && s.hz[cf.src] > a)
+        atomicAdd(&s.ev[33], 1ull);
+    s.pend[a % s.pend_n] = 1;
+}
+
 // Flow g's dependency of kind k (0 received: its QpComplete; 1 sent: its first SendComplete) fired
-// in an event at tE with chain E: each child of that kind is installed in it (SendFlow), the i-th
-// with ordinal base + i (its index among the event's children of that kind, in id order), and its
-// StartApplication would be at tE + send_lat with chain E (0, base + i) (send_lat, 0). The child's
-// source host learns this send_lat later, in the slot it would start.
-__device__ __forceinline__ void dag_fire(const Sim &s, int g, int k, int64_t tE, const Chain &E, int base)
+// in an event at tE with chain E; base: the ordinals the event had used. Each child of that kind
+// is installed in it (SendFlow), the i-th with ordinal base + i (its index among the event's
+// children of that kind, in id order). A traced DAG's cause has actions instead: flows installed
+// and timers scheduled, by their ordinals; a timer fires its own (timers are expanded here: they
+// touch nothing else). Returns the ordinals used (the event's later ones follow them).
+__device__ __forceinline__ int dag_fire(const Sim &s, int g, int k, int64_t tE, const Chain &E, int base)
 {
     int i = 0;
     for (int j = s.ch_off[g]; j < s.ch_off[g + 1]; j++)
@@ -571,31 +602,50 @@ __device__ __forceinline__ void dag_fire(const Sim &s, int g, int k, int64_t tE,
         uint32_t v = s.ch_list[j];
         if ((int)(v & 1) != k)
             continue;
-        int64_t ts = tE + s.send_lat;
-        int64_t a = ts / s.P.delay;
-        int b = (int)(a % s.nbi);
-        unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
-        if (n >= (unsigned)s.dcap)
-        {
-            atomicAdd(&s.ev[14], 1ull);
-            i++;
-            continue;
-        }
-        DMsg &m = s.dmsg[(size_t)b * s.dcap + n];
-        Chain x;
-        cpush(&x, ccode(0, base + i), E);
-        cpush(&m.c, ccode(s.send_lat, 0), x);
-        m.ts = ts;
-        m.flow = v >> 1;
-        const FlowInfo &cf = s.fi[v >> 1];
-        m.next = atomicExch(&s.hhead[(size_t)cf.src * s.nbi + b], n + 1);
-        if (cf.fast)
-            s.srv_fs[(size_t)s.h_srv[cf.src] * s.nbi + b] = a; // (ends the server's quiet windows before it)
-        if (s.any_win && s.hz[cf.src] > a)
-            atomicAdd(&s.ev[33], 1ull);
-        s.pend[a % s.pend_n] = 1;
+        dag_msg(s, v >> 1, tE, tE, E, base + i);
         i++;
     }
+    if (!s.traced)
+        return i;
+    // the timers fired wait in a list through s.tnext (no local array, no pointer to E: either
+    // would put the host's context in scratch); each fires its actions from its global chain
+    int used = 0, head = -1;
+    const int cause = 2 * g + k;
+    for (int j = s.act_off[cause]; j < s.act_off[cause + 1]; j++)
+    {
+        DAct a = s.act[j];
+        used = (int)a.ord + 1; // (by ordinal)
+        if (a.child & DACT_TIMER)
+        {
+            int t = a.child & ~DACT_TIMER;
+            s.ttime[t] = tE + s.tdelay[t];
+            cpush(&s.tchain[t], ccode(s.tdelay[t], base + a.ord), E);
+            s.tnext[t] = head;
+            head = t;
+        }
+        else
+            dag_msg(s, a.child, tE, tE, E, base + a.ord);
+    }
+    while (head >= 0)
+    {
+        int t = head;
+        head = s.tnext[t];
+        for (int j = s.act_off[2 * s.F + t]; j < s.act_off[2 * s.F + t + 1]; j++)
+        {
+            DAct a = s.act[j];
+            if (a.child & DACT_TIMER)
+            {
+                int u = a.child & ~DACT_TIMER;
+                s.ttime[u] = s.ttime[t] + s.tdelay[u];
+                cpush(&s.tchain[u], ccode(s.tdelay[u], a.ord), s.tchain[t]); // (a timer's callback is its event's first)
+                s.tnext[u] = head;
+                head = u;
+            }
+            else
+                dag_msg(s, a.child, tE, s.ttime[t], s.tchain[t], a.ord);
+        }
+    }
+    return i + used;
 }
 
 // ------------------------------------------------------------------ frames
@@ -1126,7 +1176,7 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         if (s.fi[f].fast)
             atomicSub(&s.srv_fact[s.h_srv[c.h]], 1);
         if (s.dag)
-            dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event has scheduled nothing yet)
+            c.ord += dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event's next events follow its callback's)
     }
     if (p.kind == K_NACK)
         q.snd_nxt = q.snd_una;
@@ -1278,6 +1328,8 @@ __device__ __forceinline__ void h_start_dyn(HCtx<ND> &c, int f)
     x.sport = port;
     x.start = c.now;
     const PairNic &sn = s.pnic[pi], &rn = s.pnic[pr];
+    if (x.fast)
+        atomicSub(&s.srv_fpend[s.h_srv[c.h]], 1);
     x.snic = sn.sn > 1 ? sn.s[qp_pick(node_ip(a), node_ip(b), port, 100, sn.sn)] : sn.s[0];
     x.rnic = rn.rn > 1 ? rn.r[qp_pick(node_ip(b), node_ip(a), 100, port, rn.rn)] : rn.r[0];
     h_start(c, f);
@@ -1455,6 +1507,8 @@ __device__ __forceinline__ bool host_step(const Sim &s, int h, int64_t slot, int
                 else
                     dyn[ndyn++] = f;
             }
+            else if (s.fi[f].fast)
+                atomicSub(&s.srv_fpend[s.h_srv[h]], 1); // (its last message holds the server)
         }
     }
     for (;;)
@@ -2816,8 +2870,10 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
 // then the first lane runs its events (entities sharing a wave would diverge and run in turn).
 // Their LDS is kept small: it bounds how many blocks a CU holds.
 // An entity's window at the launch's slot (Sim::hz): 0 when it has run it already, else the slots
-// it runs. A quiet server's GPU (no NVLink queue pair running) runs up to the slot of the
-// server's next NVLink flow start: its frames reach the server's GPUs a slot later at the earliest.
+// it runs. A quiet server's GPU (no NVLink queue pair running, none fired and waiting to start)
+// runs up to the slot of the server's next NVLink flow of fixed start: its frames reach the
+// server's GPUs a slot later at the earliest. (A DAG flow fired at t starts send_lat later, beyond
+// any window running at t.)
 __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
 {
     if (!s.any_win)
@@ -2825,7 +2881,7 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
     if (s.hz[e] > slot)
         return 0;
     int k = s.wk[e];
-    if (e < s.H && s.wq[e] > k && s.srv_fact[s.h_srv[e]] == 0)
+    if (e < s.H && s.wq[e] > k && s.srv_fact[s.h_srv[e]] == 0 && (!s.dag || s.srv_fpend[s.h_srv[e]] == 0))
     {
         int srv = s.h_srv[e], q = s.wq[e];
         int lo = s.srv_rs_off[srv], hi = s.srv_rs_off[srv + 1], end = hi;
@@ -2839,13 +2895,6 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
         }
         if (lo < end && s.srv_rs[lo] < slot + q)
             q = (int)(s.srv_rs[lo] - slot);
-        if (s.dag)
-            for (int j = 0; j < q; j++)
-                if (s.srv_fs[(size_t)srv * s.nbi + (slot + j) % s.nbi] == slot + j)
-                {
-                    q = j;
-                    break;
-                }
         k = q > k ? q : k;
     }
     if (slot + k > s.max_slots)
@@ -2875,9 +2924,13 @@ __device__ __forceinline__ void host_block(const Sim &s, int h, char *smem)
     const int k = s.any_win ? win : 1;
     if (k == 0)
     {
-        // ahead: the launches may not skip past its window's end
+        // ahead: its earliest event without input is known (arrivals mark their slots), so the
+        // launches may skip past its window
         if (lane == 0)
-            slot_end(s, slot, 0, (unsigned long long)(s.hz[h] * s.P.delay));
+        {
+            int64_t wk = s.hs[s.nic_off[h]].wake;
+            slot_end(s, slot, 0, wk != INT64_MAX ? (unsigned long long)wk : ~0ull);
+        }
         return;
     }
     bool act = false;
@@ -2922,8 +2975,9 @@ __device__ __forceinline__ void switch_block(const Sim &s, int x, char *smem, in
     const int k = s.any_win ? win : 1;
     if (k == 0)
     {
+        // ahead: busy (frames queued: TransmitCompletes due) only until its window's end
         if (lane == 0)
-            slot_end(s, slot, 0, (unsigned long long)(s.hz[s.H + x] * s.P.delay));
+            slot_end(s, slot, 0, s.sw_busy[x] ? (unsigned long long)(s.hz[s.H + x] * s.P.delay) : ~0ull);
         return;
     }
     int any_act = 0;

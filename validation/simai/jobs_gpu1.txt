@@ -3,7 +3,8 @@ g_sx16_ring sx16.topo g16_ring.csv
 g_sx16_cross sx16.topo g16_cross.csv
 g_sx16_intra sx16.topo g16_intra_a2a.csv
 g_sx16_incast sx16.topo g16_incast.csv
-g_sx16_incast_b1 sx16.topo g16_incast.csv BUFFER_SIZE=1
+# (with maxBdp windows, as SimAI forces, PFC deadlocks it: some flows never finish; stopped at 1 ms)
+g_sx16_incast_b1 sx16.topo g16_incast.csv BUFFER_SIZE=1 SIMULATOR_STOP_TIME=0.001
 g_sx16_mix sx16.topo g16_mix.csv
 g_dcn16_ring dcn16.topo g16_ring.csv
 g_dcn16_cross dcn16.topo g16_cross.csv

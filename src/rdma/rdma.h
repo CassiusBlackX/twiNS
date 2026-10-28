@@ -395,7 +395,16 @@ struct Sim
     const int64_t *srv_rs;        //   their start slots
     struct DMsg *dmsg;
     unsigned int *hhead;  // [H][nbi] a host's messages in each bucket: a list (index + 1; 0: none)
-    int64_t *srv_fs;      // [S][nbi] a server's NVLink flow starts: the bucket's slot when it has one
+    int *srv_fpend;       // [S] a server's NVLink flows fired and not started yet
+    // traced DAGs (docs/ai/dag.md): each cause's actions by ordinal (causes: 2 flow + kind, then
+    // 2F + timer), timers' delays, and the chains and times of the timers fired
+    const int *act_off;
+    const struct DAct *act;
+    const int64_t *tdelay;
+    Chain *tchain;
+    int64_t *ttime;
+    int *tnext;           // (the timers waiting to fire their actions, in dag_fire)
+    int traced;
     unsigned int *dmsg_n;
     int nbi, dcap;
     int *dyn, *dyn_n;
@@ -427,6 +436,13 @@ struct DMsg
     uint32_t flow;
     uint32_t next; // the host's next one in the bucket (index + 1; 0: none)
 };
+// a traced DAG's action: a flow installed (SendFlow) or a timer scheduled (DACT_TIMER | timer), the
+// ord-th of its cause's callback
+struct DAct
+{
+    uint32_t child, ord;
+};
+constexpr uint32_t DACT_TIMER = 1u << 31;
 // a host pair's devices: towards b, those a queue pair of a picks from (GetNicIdxOfQp), and those
 // a's receiving queue pair from b picks from (GetNicIdxOfRxQp)
 struct PairNic

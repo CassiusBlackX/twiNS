@@ -23,6 +23,11 @@
 //     when its last dependency does: the callback installs its RdmaClient, started SEND_LAT_NS
 //     (default 3000) later; the children of one event are installed in id order. Roots start at
 //     START_NS as simai-ref's flows (ties in id order).
+//     Traced DAGs (workloads/trace2dag.py: a SimAI run's astra-sim actions): "timer ID DELAY_NS",
+//     and "on CHILD CAUSE ORD" (CHILD f<flow> or t<timer>; CAUSE r<flow>, s<flow>, t<timer>: the
+//     child is that event's ORD-th action, in its callback; m: scheduled before the run, ORD its
+//     place). A flow child is installed (SendFlow) and starts SEND_LAT_NS later; a timer child
+//     fires DELAY_NS later, and its children are its actions.
 // CONFIG is a SimAI network config (SimAI.conf); KEY=VALUE overrides one of its keys (KEY=V1,V2,...
 // for a key with several values). The file and monitor keys are ignored.
 //   topology: SimAI's format (gen_Topo_Template.py): "nodes gpus_per_server nvswitches switches
@@ -231,6 +236,9 @@ static size_t next_flow;
 static vector<Flow> dflows;                       // all flows, by id
 static vector<vector<pair<int, char> > > children; // per flow: (child, kind), by child id
 static vector<int> remaining;                     // dependencies not yet fired
+// traced DAGs: timers' delays; each cause's actions in order ('r' flow, 's' flow, 't' timer)
+static vector<uint64_t> timer_delay;
+static map<pair<char, uint32_t>, vector<pair<uint64_t, pair<char, uint32_t> > > > actions;
 static uint64_t send_lat = 3000;
 static size_t total_flows;
 static unordered_map<uint32_t, unordered_map<uint32_t, uint16_t> > portNumber;
@@ -262,6 +270,21 @@ static void fire(uint32_t g, char k)
             install(dflows[c.first], send_lat);
 }
 
+static void act(char k, uint32_t id);
+static void timer_fire(uint32_t id) { act('t', id); }
+// a traced cause's actions, in order: SendFlow, or a timer (sim_schedule)
+static void act(char k, uint32_t id)
+{
+    auto it = actions.find(make_pair(k, id));
+    if (it == actions.end())
+        return;
+    for (auto &a : it->second)
+        if (a.second.first == 'f')
+            install(dflows[a.second.second], send_lat);
+        else
+            Simulator::Schedule(NanoSeconds(timer_delay[a.second.second]), timer_fire, a.second.second);
+}
+
 static void ScheduleFlowInputs()
 {
     while (next_flow < flows.size() && NanoSeconds(flows[next_flow].start) == Simulator::Now())
@@ -281,7 +304,8 @@ static void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q)
     Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
     rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
     fire(flow_of[flow_key(sid, did, q->sport)], 'r');
-    if (++flows_done == total_flows)
+    act('r', flow_of[flow_key(sid, did, q->sport)]);
+    if (++flows_done == total_flows && actions.empty())
         Simulator::Stop();
 }
 
@@ -295,6 +319,7 @@ static void send_finish(FILE *fout, Ptr<RdmaQueuePair> q)
     if (fout)
         fprintf(fout, "%u %lu\n", it->second, Simulator::Now().GetTimeStep());
     fire(it->second, 's');
+    act('s', it->second);
 }
 
 // ---------------------------------------------------------------- transmission trace
@@ -383,7 +408,9 @@ int main(int argc, char *argv[])
     string dctcp_rate_ai = str("DCTCP_RATE_AI", "1000Mb/s");
     bool clamp_target_rate = u32("CLAMP_TARGET_RATE", 0);
     has_win = u32("HAS_WIN", 1);
-    global_t = u32("GLOBAL_T", 1);
+    // SimAI's ReadConf reads GLOBAL_T and then sets global_t = 1: every queue pair gets maxBdp and
+    // maxRtt (GLOBAL_T_HONOR 1: as GLOBAL_T says, the pair's with 0)
+    global_t = u32("GLOBAL_T_HONOR", 0) ? u32("GLOBAL_T", 1) : 1;
     uint32_t mi_thresh = u32("MI_THRESH", 5);
     bool var_win = u32("VAR_WIN", 0), fast_react = u32("FAST_REACT", 1), multi_rate = u32("MULTI_RATE", 1);
     bool sample_feedback = u32("SAMPLE_FEEDBACK", 0), rate_bound = u32("RATE_BOUND", 1);
@@ -711,6 +738,26 @@ int main(int argc, char *argv[])
                 ff >> id >> k >> par;
                 deps.push_back(make_pair(id, make_pair(k[0], par)));
             }
+            else if (w == "timer")
+            {
+                unsigned id;
+                unsigned long long d;
+                ff >> id >> d;
+                if (id != timer_delay.size())
+                {
+                    fprintf(stderr, "timer ids must be 0, 1, ... in order (timer %u)\n", id);
+                    return 1;
+                }
+                timer_delay.push_back(d);
+            }
+            else if (w == "on")
+            {
+                string ch, ca;
+                unsigned long long o;
+                ff >> ch >> ca >> o;
+                uint32_t cid = ca == "m" ? 0 : (uint32_t)atoi(ca.c_str() + 1);
+                actions[make_pair(ca[0], cid)].push_back(make_pair(o, make_pair(ch[0], (uint32_t)atoi(ch.c_str() + 1))));
+            }
             else
                 getline(ff, w); // a comment
         }
@@ -741,6 +788,9 @@ int main(int argc, char *argv[])
     next_flow = 0;
     if (!flows.empty())
         Simulator::Schedule(NanoSeconds(flows[0].start), ScheduleFlowInputs);
+    for (auto &a : actions)
+        sort(a.second.begin(), a.second.end());
+    act('m', 0); // (main's actions: in uid order)
 
     Simulator::Stop(Seconds(num("SIMULATOR_STOP_TIME", 3.01)));
     Simulator::Run();

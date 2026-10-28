@@ -69,6 +69,53 @@ of that kind, as if every lower-id child were installed there too.
 - The approximation can only change a tie between chains with equal leads all the way down to a
   common root, which none of the DAG runs have shown.
 
-**Phase 3** derives DAGs from astra-sim by instrumenting `sim_send` and ns-3's scheduler, which
-gives the triggering event and k. The DAG semantics extend to astra-sim's own events (`sim_schedule`
-compute delays) as needed.
+## Traced DAGs (phase 3)
+
+A SimAI run records its astra-sim actions (`validation/simai/trace_patch.py`, `TWINS_TRACE`):
+- Every astra-sim action runs in an ns-3 event of one of four kinds:
+  - QpComplete of flow f (`qp_finish`);
+  - the SendComplete that completes f's send (`send_finish`);
+  - a timer firing (`sim_schedule`);
+  - main, before `Simulator::Run`.
+- Each action is a `SendFlow` (one per queue pair) or a `sim_schedule`.
+- An action's ordinal is ns-3's uid counter minus the event's uid at its start. Before the run it is
+  the uid itself.
+- In the runs so far:
+  - every schedule inside a callback is a recorded action;
+  - every callback starts at ordinal 0 (QpComplete precedes ReceiveAck's own scheduling).
+
+`workloads/trace2dag.py` turns the trace into a DAG:
+- `flow ID SRC DST SIZE`;
+- `timer ID DELAY_NS`;
+- one `on CHILD CAUSE ORD` per flow (`f<id>`) and timer (`t<id>`), where CAUSE is `r<flow>`,
+  `s<flow>`, `t<timer>` or `m`. ORD is the ordinal within the cause's callback (for `m`: the uid).
+
+It also turns SimAI's `fct.txt` into a reference per message (by source, destination and source
+port).
+
+The semantics, as in SimAI:
+- A cause's actions run in ORD order inside its event.
+- A flow is installed at the event's time t (Initialize: chain `E ⊕ (0, base + ORD)`) and starts
+  at t + send_lat (`⊕ (send_lat, 0)`).
+- A timer fires DELAY later with chain `E ⊕ (DELAY, base + ORD)`, and its own actions follow from
+  ordinal 0.
+- The event's later events follow its callback's ordinals. `h_ack` adds `dag_fire`'s count to its
+  ordinal, which also applies to untraced DAGs.
+- Main's actions are the roots, in uid order (root i + 1). Their chain is their own event: a
+  timer's delay, or a flow's Initialize.
+
+**TwiNS:**
+- Timers touch only the DAG, so `dag_fire` expands them: a flow under a chain of timers gets the
+  composed time and chain at once.
+- Its message is filed send_lat after the firing event, not its start. The host keeps the flow
+  ready until its start time (dyn list, wake-up).
+- What main and its timers install is expanded on the host and loaded as ready flows.
+- Quiet NVLink windows also wait for a server's fired NVLink flows that haven't started (`srv_fpend`).
+
+**References:**
+- `simai-dag-ref` reads the same DAGs.
+- `simai-trace` (simai-ref's tree, instrumented) is SimAI end to end. Like simai-ref, it orders the
+  frontend's node maps by node id. SimAI keys them by `Ptr<Node>`, which reorders ECMP next hops
+  with the heap layout.
+- SimAI's `ReadConf` forces `global_t = 1` (maxBdp and maxRtt for every queue pair) whatever
+  `GLOBAL_T` says. simai-ref and TwiNS now do the same (`GLOBAL_T_HONOR 1`: as GLOBAL_T says).

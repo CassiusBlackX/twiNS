@@ -354,7 +354,9 @@ int main(int argc, char *argv[])
     string dctcp_rate_ai = str("DCTCP_RATE_AI", "1000Mb/s");
     bool clamp_target_rate = u32("CLAMP_TARGET_RATE", 0);
     has_win = u32("HAS_WIN", 1);
-    global_t = u32("GLOBAL_T", 1);
+    // SimAI's ReadConf reads GLOBAL_T and then sets global_t = 1: every queue pair gets maxBdp and
+    // maxRtt (GLOBAL_T_HONOR 1: as GLOBAL_T says, the pair's with 0)
+    global_t = u32("GLOBAL_T_HONOR", 0) ? u32("GLOBAL_T", 1) : 1;
     uint32_t mi_thresh = u32("MI_THRESH", 5);
     bool var_win = u32("VAR_WIN", 0), fast_react = u32("FAST_REACT", 1), multi_rate = u32("MULTI_RATE", 1);
     bool sample_feedback = u32("SAMPLE_FEEDBACK", 0), rate_bound = u32("RATE_BOUND", 1);

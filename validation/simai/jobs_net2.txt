@@ -10,7 +10,7 @@ h_ft8_dcn_incast64 ft8_dcn.topo k8_incast64.csv BUFFER_SIZE=2
 h_ft8_dcn_a2a30_cc3 ft8_dcn.topo k8_a2a30.csv CC_MODE=3
 h_ft8_long_a2a30 ft8_h100d100_s400d2000.topo k8_a2a30.csv
 h_ft8_long_incast16 ft8_h100d100_s400d2000.topo k8_incast16.csv BUFFER_SIZE=1
-h_ft8_long_perm_gt1 ft8_h100d100_s400d2000.topo k8_perm.csv GLOBAL_T=1
+h_ft8_long_perm_pair ft8_h100d100_s400d2000.topo k8_perm.csv GLOBAL_T_HONOR=1
 h_ft4_inv_inc1 ft4_h25d1500_s100d300.topo inc1.csv
 h_ft4_inv_inc1_b1 ft4_h25d1500_s100d300.topo inc1.csv BUFFER_SIZE=1
 h_ft4_inv_inc1_cc3 ft4_h25d1500_s100d300.topo inc1.csv CC_MODE=3
