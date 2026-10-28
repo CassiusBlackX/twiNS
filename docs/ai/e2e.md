@@ -56,31 +56,31 @@ the first differing decision in both binaries:
 | run | GPUs | topology | workload | messages | identical | last event identical | SimAI (s) | TwiNS (s) |
 |---|---|---|---|---|---|---|---|---|
 | tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.7 |
-| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.1 |
+| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.0 |
 | tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 1.9 |
-| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 0.8 |
-| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.8 |
-| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 6.9 |
-| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.9 |
-| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 66.2 |
-| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 86.0 |
+| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 0.9 |
+| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.4 |
+| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 5.4 |
+| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.5 |
+| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 65.2 |
+| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 82.6 |
 | a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 44.6 |
-| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 62.5 |
-| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 95.2 |
+| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 60.4 |
+| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 87.1 |
 | a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 44.5 |
-| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 40.5 |
-| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 69.3 |
+| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 38.8 |
+| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 62.1 |
 | a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 26.4 |
 
 SimAI is the single-threaded sequential build on a87 (Xeon Gold 5218; up to 9 runs side by side).
 TwiNS runs on an RX 9060 XT. "Last event" is the run's end: the last timer firing or completion,
 from SimAI's trace and TwiNS's report.
-All TwiNS timings are of `fa55288` (one run each, the machine otherwise idle).
-- **Large runs** (128 GPUs, many entities): TwiNS is 9–13× faster than SimAI.
+All TwiNS timings are of `62f7ece` (one run each, the machine otherwise idle).
+- **Large runs** (128 GPUs, many entities): TwiNS is 9.5–14× faster than SimAI.
 - **Small dense runs** (16 GPUs, NVLink saturated for tens of ms):
   - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound. The slowest block of a
     slot, often a GPU host with ~150k cycles of dependent global accesses, sets the pace.
-  - TwiNS goes from 1.3× slower (MoE on AlibabaHPN, whose 2 NICs per GPU make 3 link rates) to
+  - TwiNS goes from 1.15× slower (MoE on AlibabaHPN, whose 2 NICs per GPU make 3 link rates) to
     2.7× faster (DCN+, few enough blocks for persistent launches); it is faster than SimAI on 15
     of the 16 runs.
   - Batching recovers the throughput. The 9 AICB runs (2363520 messages) as one batch
@@ -119,6 +119,11 @@ All TwiNS timings are of `fa55288` (one run each, the machine otherwise idle).
     26.4–95.2 s.
   - Tried without gain: persistent launches that include the wide switches (−2%), `-mcumode`
     (−2% on small runs, +1–2% at 128 GPUs).
+- **Since `fa55288`** (`62f7ece`): the wide switches' blocks have a lane per port (up to 256, in
+  whole waves), not 32. AlibabaHPN's 122- and 136-port switches had loaded, pooled and stored
+  their ports in 4–5 rounds. AlibabaHPN 128 6.9 → 5.4 s, MoE on AlibabaHPN 69.3 → 62.1 s,
+  Spectrum-X 128 4.8 → 4.4 s, Llama on AlibabaHPN 86.0 → 82.6 s, GPT-13B on AlibabaHPN
+  95.2 → 87.1 s.
 
 ## Bugs found on the way (TwiNS)
 
