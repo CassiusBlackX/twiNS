@@ -59,9 +59,9 @@ the first differing decision in both binaries:
 | tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.4 |
 | tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 2.5 |
 | tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 1.5 |
-| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 5.7 |
-| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 8.0 |
-| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 6.9 |
+| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.7 |
+| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 6.9 |
+| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.8 |
 | a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 91.3 |
 | a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 112.2 |
 | a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 56.9 |
@@ -75,7 +75,7 @@ the first differing decision in both binaries:
 SimAI is the single-threaded sequential build on a87 (Xeon Gold 5218; up to 9 runs side by side).
 TwiNS runs on an RX 9060 XT. "Last event" is the run's end: the last timer firing or completion,
 from SimAI's trace and TwiNS's report.
-- **Large runs** (128 GPUs, many entities): TwiNS is 8–11× faster than SimAI.
+- **Large runs** (128 GPUs, many entities): TwiNS is 9–13× faster than SimAI.
 - **Small dense runs** (16 GPUs, NVLink saturated for tens of ms):
   - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound. The slowest block of a
     slot, often a GPU host with ~150k cycles of dependent global accesses, sets the pace.
@@ -90,6 +90,18 @@ from SimAI's trace and TwiNS's report.
   - persistent launches for small topologies;
   - `__launch_bounds__(32)`, and GPU hosts dispatched first.
   - The 128-GPU runs went 7.9–10.0 → 5.7–8.0 s.
+- **Since `0fbb333`** (the 128-GPU rows; the 16-GPU rows are older and now 13–20% faster),
+  guided by thread traces (rocprofv3 ATT):
+  - `Sim` is `__constant__` (`c_sim`). As a kernel argument whose address the contexts take,
+    every wave copied it to scratch at its start and read every field from there.
+  - The host context lives in LDS for one device too, and frames stay out of scratch (the INT
+    hop is written by constant indices; an arrival's frame is read in place).
+  - DCQCN: each device keeps a lower bound on its queue pairs' timers (`Host::due_min`), so a
+    slot reads them only when one is due.
+  - Windows (`--win`) are opt-in; in busy networks their checks cost more than they save.
+  - The 128-GPU runs: 5.8–8.1 → 4.7–6.9 s (interleaved A/B, same machine state).
+  - Tried without gain: power-of-two link rings (masks for `%`) and 32-bit arrival-slot division
+    (HPCC +5%).
 
 ## Bugs found on the way (TwiNS)
 
