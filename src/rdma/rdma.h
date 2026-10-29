@@ -483,6 +483,12 @@ struct Sim
     const int *h_srv;             // [H] a GPU's server: its NVSwitch's index (-1: not a GPU)
     int *srv_fact;                // [S] a server's running NVLink queue pairs
     int any_win;                  // some entity's window can exceed a slot
+    // global windows (--gwin): every entity runs gk slots per launch. gk_static bounds them by the
+    // in-links (without NVLink) and send_lat; a server whose NVLink is quiet bounds them by its
+    // next NVLink flow's start (gk_hz: the servers' least horizon, in slots; 0: one is busy)
+    int gwin, gk_static;
+    int *gk;
+    unsigned long long *gk_hz;
     const int *srv_rs_off;        // [S + 1] a server's NVLink flows of fixed start, by start:
     const int64_t *srv_rs;        //   their start slots
     struct DMsg *dmsg;

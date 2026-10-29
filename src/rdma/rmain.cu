@@ -11,6 +11,10 @@
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
 // --win: the most slots a block runs in one launch (default 1: one slot per launch; windows rarely
 // run in busy networks, and checking for them cost more than they saved)
+// --gwin=N: global windows: every launch runs up to N slots for all entities, as many as no frame
+// sent in them can arrive in them: the shortest delay of the in-links without NVLink (a server's
+// NVLink counts while it is busy, or up to its next NVLink flow) and half of send_lat (default
+// 32; 0: off, and off where that bound is a single slot or with --win; no ranks ahead with it)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
 // --persist=0: always a graph of launches per slot (default: one persistent launch for many slots
 // when every block fits on the GPU at once)
@@ -958,6 +962,7 @@ int main(int argc, char **argv)
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
+    int gwin = 32;
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -996,7 +1001,12 @@ int main(int argc, char **argv)
         else if (k == "--serial")
             serial = 1;
         else if (k == "--win")
+        {
             kw = std::max(1, std::min(255, atoi(v.c_str())));
+            gwin = 0; // (per-entity windows instead)
+        }
+        else if (k == "--gwin")
+            gwin = std::max(0, std::min(255, atoi(v.c_str())));
         else if (k == "--rank")
             rank_ahead = std::max(0, atoi(v.c_str()));
         else if (k == "--rank-join")
@@ -1232,6 +1242,13 @@ int main(int argc, char **argv)
     s.link_dport = dev_copy(link_dport);
     s.rt = dev_copy(rt);
     s.rtp = dev_copy(rtp);
+    // (global windows: the entities' bounds as per-entity windows', which they replace; no ranks
+    // ahead, whose wide switches run single slots)
+    if (gwin)
+    {
+        kw = gwin;
+        rank_ahead = 0;
+    }
     // windows (Sim::hz): an entity's is its in-links' shortest delay in slots, without a GPU's
     // NVLink while its server is quiet; under send_lat with DAGs (their messages must not reach a
     // window already run)
@@ -1308,6 +1325,31 @@ int main(int argc, char **argv)
     s.rank_every = rank_every;
     for (int g = 0; g < H + S; g++)
         s.any_win |= kb[g] > 1 || kq[g] > 1;
+    s.gwin = gwin;
+    if (gwin)
+    {
+        // global windows: every entity's bound without NVLink (a server's NVLink bounds them while
+        // it is busy, or at its next NVLink flow: Sim::gk_hz), and half of send_lat with DAGs
+        int64_t g = gwin;
+        bool dagw = false;
+        for (auto &w : worlds)
+            dagw |= w.dag;
+        for (int e = 0; e < H + S; e++)
+            if (e < H)
+                g = std::min<int64_t>(g, h_srv[e] >= 0 ? kq[e] : kb[e]);
+            else if (!si[e - H].nvs)
+                g = std::min<int64_t>(g, kb[e]);
+        if (dagw)
+            g = std::min<int64_t>(g, ((int64_t)Cfg{base}.num("SEND_LAT_NS", 3000) - 1) / (2 * D));
+        s.gk_static = (int)std::max<int64_t>(g, 1);
+        s.any_win = 0;
+        if (s.gk_static == 1)
+            s.gwin = 0; // (nothing to gain: the slot is the shortest delay)
+        s.gk = dev_copy(vector<int>{1});
+        s.gk_hz = dev_copy(vector<unsigned long long>{~0ull});
+        if (worlds.size() == 1 && s.gwin)
+            printf("global windows: up to %d slots\n", s.gk_static);
+    }
     s.wk = dev_copy(kb);
     s.wq = dev_copy(kq);
     s.h_srv = dev_copy(h_srv);

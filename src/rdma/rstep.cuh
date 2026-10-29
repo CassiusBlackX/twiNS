@@ -1348,7 +1348,13 @@ __device__ __forceinline__ void h_start(HCtx<ND> &c, int f)
     q = SndQP{};
     q.size = fi.size;
     if (fi.fast)
+    {
         atomicAdd(&s.srv_fact[s.h_srv[c.h]], 1); // (its server's GPUs run single slots until it completes)
+        // global windows: the next launch runs a single slot (its server's switch may have read
+        // the count before this, in this launch)
+        if (s.gwin)
+            atomicMin(s.gk_hz, 0ull);
+    }
     hsel(c, fi.snic); // GetNicIdxOfQp
     q.nic = fi.snic;
     const uint64_t nic = s.li[c.link()].bps;
@@ -3134,7 +3140,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
 // ------------------------------------------------------------------ the slot kernel
 // The end of a block's slot: its activity and wake-up time; the last block of the slot (of either
 // kernel) decides the next slot.
-__device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act, unsigned long long blk_wake)
+__device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act, unsigned long long blk_wake, int nsl = 1)
 {
     if (blk_act)
         atomicAdd(&s.activity[0], 1u);
@@ -3146,27 +3152,46 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
         return;
     __threadfence();
     unsigned int fd = atomicAdd(s.flows_done, 0u);
-    if (fd >= (unsigned int)s.F || slot + 1 >= s.max_slots)
+    if (fd >= (unsigned int)s.F || slot + nsl >= s.max_slots)
         *s.finished = 1;
     // idle skip: nothing sent and nothing queued in this slot: go on at the slot of the earliest
     // host event or arrival (this slot's arrivals are read: its pending flag is cleared)
     unsigned int cur = atomicAdd(&s.activity[0], 0u);
     unsigned long long nw = atomicAdd(s.next_wake, 0ull);
-    s.pend[fmod(s.fpend, slot)] = 0;
-    if (s.dag)
-        s.dmsg_n[fmod(s.fnbi, slot)] = 0; // this slot's dependency messages are read
-    int64_t next = slot + 1;
+    for (int i = 0; i < nsl; i++)
+    {
+        s.pend[fmod(s.fpend, slot + i)] = 0;
+        if (s.dag)
+            s.dmsg_n[fmod(s.fnbi, slot + i)] = 0; // this slot's dependency messages are read
+    }
+    const int64_t last = slot + nsl - 1;
+    int64_t next = last + 1;
     if (cur == 0)
     {
         int64_t ws = nw != ~0ull ? (int64_t)fdiv(s.fD, nw) : INT64_MAX;
         for (int i = 1; i < s.pend_n; i++)
-            if (s.pend[fmod(s.fpend, slot + i)])
+            if (s.pend[fmod(s.fpend, last + i)])
             {
-                ws = slot + i < ws ? slot + i : ws;
+                ws = last + i < ws ? last + i : ws;
                 break;
             }
         if (ws != INT64_MAX && ws > next)
             next = ws < s.max_slots ? ws : s.max_slots;
+    }
+    if (s.gwin)
+    {
+        // the next launch's slots: the static bound, or up to the earliest quiet server's next
+        // NVLink flow (none if a server is busy); the horizons are read and reset
+        unsigned long long hz = *s.gk_hz;
+        *s.gk_hz = ~0ull;
+        int64_t k = s.gk_static;
+        if (hz == 0)
+            k = 1;
+        else if (hz != ~0ull && (int64_t)hz - next < k)
+            k = (int64_t)hz - next;
+        if (s.max_slots - next < k)
+            k = s.max_slots - next;
+        *s.gk = k > 1 ? (int)k : 1;
     }
 #ifdef RDMA_PROF
     s.ev[18] += s.ev[16];
@@ -3222,7 +3247,7 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
 }
 
 template <int ND>
-__device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem)
+__device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int gk)
 {
     const int h = bi.e;
     int lane = threadIdx.x, lanes = blockDim.x;
@@ -3240,7 +3265,7 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
             win = entity_window(s, h, slot);
         __syncthreads();
     }
-    const int k = s.any_win ? win : 1;
+    const int k = s.any_win ? win : gk;
     if (k == 0)
     {
         // ahead: its earliest event without input is known (arrivals mark their slots), so the
@@ -3264,14 +3289,14 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
 #endif
     if (lane == 0)
     {
-        if (k > 1)
+        if (s.any_win && k > 1)
             s.hz[h] = slot + k;
-        slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull);
+        slot_end(s, slot, act, w != INT64_MAX ? (unsigned long long)w : ~0ull, s.gwin ? k : 1);
     }
 }
 
 template <bool WIDE, bool GW = false>
-__device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int kl)
+__device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int kl, int gk)
 {
     const int x = bi.e;
     int lane = threadIdx.x, lanes = blockDim.x;
@@ -3291,7 +3316,7 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
             win = entity_window(s, s.H + x, slot);
         __syncthreads();
     }
-    const int k = s.any_win ? win : 1;
+    const int k = s.any_win ? win : gk;
     if (k == 0)
     {
         // ahead: busy (frames queued: TransmitCompletes due) only until its window's end
@@ -3335,9 +3360,32 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
 #endif
     if (lane == 0)
     {
-        if (k > 1)
+        if (s.any_win && k > 1)
             s.hz[s.H + x] = slot + k;
-        slot_end(s, slot, any_act, ~0ull);
+        if (s.gwin && s.si[x].nvs)
+        {
+            // its server's horizon for the next launch: quiet (nothing queued here, no NVLink queue
+            // pair running, none fired to start) until its next NVLink flow of fixed start, else
+            // busy (0). (A flow fired during this launch starts send_lat later: beyond the next
+            // launch, which gk_static bounds by send_lat / 2.)
+            unsigned long long hz = 0;
+            if (!s.sw_busy[x] && s.srv_fact[x] == 0 && (!s.dag || s.srv_fpend[x] == 0))
+            {
+                const int64_t nx = slot + k;
+                int lo = s.srv_rs_off[x], hi = s.srv_rs_off[x + 1], end = hi;
+                while (lo < hi)
+                {
+                    int m = (lo + hi) / 2;
+                    if (s.srv_rs[m] < nx)
+                        lo = m + 1;
+                    else
+                        hi = m;
+                }
+                hz = lo < end ? (unsigned long long)s.srv_rs[lo] : ~0ull;
+            }
+            atomicMin(s.gk_hz, hz);
+        }
+        slot_end(s, slot, any_act, ~0ull, s.gwin ? k : 1);
     }
 }
 
@@ -3353,24 +3401,25 @@ constexpr int BLOCK = 32;
 // a slot's last to finish; their path's scratch, which limits the waves in flight, stays out of
 // the kernel without them)
 template <bool MULTI>
-__device__ __forceinline__ void slot_entity(const Sim &s, int b, const BlockInfo &bi, int64_t slot, char *smem)
+__device__ __forceinline__ void slot_entity(const Sim &s, int b, const BlockInfo &bi, int64_t slot, char *smem, int gk = 1)
 {
     if (MULTI && b < s.nm)
-        host_block<MAXD>(s, bi, slot, smem);
+        host_block<MAXD>(s, bi, slot, smem, gk);
     else if (b < (MULTI ? s.nm : 0) + s.n1)
-        host_block<1>(s, bi, slot, smem);
+        host_block<1>(s, bi, slot, smem, gk);
     else
-        switch_block<false>(s, bi, slot, smem, s.ks);
+        switch_block<false>(s, bi, slot, smem, s.ks, gk);
 }
 // A block's entry: its entity, the slot and the finish flag, loaded together (they were a chain
 // of dependent loads: the flag, the entity's list, its static data)
-__device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, BlockInfo *bi, int64_t *slot)
+__device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, BlockInfo *bi, int64_t *slot, int *gk)
 {
     *bi = tab[blockIdx.x];
     *slot = *s.slot;
     int fin = *s.finished;
+    *gk = s.gwin ? *s.gk : 1;
     // (keeps the loads above the branch: issued together, not one after the other)
-    asm volatile("" ::"v"(bi->e), "v"(bi->deg), "v"(bi->base), "v"(bi->link0), "v"((int)*slot), "v"((int)(*slot >> 32)));
+    asm volatile("" ::"v"(bi->e), "v"(bi->deg), "v"(bi->base), "v"(bi->link0), "v"((int)*slot), "v"((int)(*slot >> 32)), "v"(*gk));
     return !fin;
 }
 template <bool MULTI>
@@ -3380,9 +3429,10 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot()
     extern __shared__ __align__(16) char smem[];
     BlockInfo bi;
     int64_t slot;
-    if (!block_entry(s, s.bi_s, &bi, &slot))
+    int gk;
+    if (!block_entry(s, s.bi_s, &bi, &slot, &gk))
         return;
-    slot_entity<MULTI>(s, blockIdx.x, bi, slot, smem);
+    slot_entity<MULTI>(s, blockIdx.x, bi, slot, smem, gk);
 }
 
 // the switches with many ports (spines), alongside rdma_slot: a lane per port, up to BLOCK_BIG
@@ -3395,9 +3445,10 @@ __global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
     extern __shared__ __align__(16) char smem[];
     BlockInfo bi;
     int64_t slot;
-    if (!block_entry(s, s.bi_b, &bi, &slot))
+    int gk;
+    if (!block_entry(s, s.bi_b, &bi, &slot, &gk))
         return;
-    switch_block<true, GW>(s, bi, slot, smem, s.kb);
+    switch_block<true, GW>(s, bi, slot, smem, s.kb, gk);
 }
 
 // Ranks ahead, alongside a launch's kernels every rank_every launches (a block per wide switch and
@@ -3531,7 +3582,9 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
         int64_t slot = *(volatile int64_t *)s.slot;
         if (*(volatile int *)s.finished)
             return;
-        slot_entity<MULTI>(s, b, bi, slot, smem);
+        // (slot_end writes the slots before the slot)
+        const int gk = s.gwin ? *(volatile int *)s.gk : 1;
+        slot_entity<MULTI>(s, b, bi, slot, smem, gk);
         if (threadIdx.x == 0)
         {
             // until the slot's last block has moved on (a block that never runs would stop it all:
