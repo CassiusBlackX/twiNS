@@ -51,6 +51,11 @@ the first differing decision in both binaries:
   - The traced SimAI orders them by node id, as simai-ref does.
   - On these topologies this changed paths without changing any message's timing.
 
+- **Event uids wrap after 2^32 events.** ns-3.36 keeps event uids in 32 bits, and simultaneous
+  events run in uid order. After the wrap, an event scheduled later runs first. A 1024-GPU GPT-3
+  13B probe passes 2^32 events at 44.6 ms and first differed there (`paper.md`). The traced SimAI
+  now widens uids to 64 bits (`TWINS_UID64`), which changes nothing below 2^32 events.
+
 ## Results
 
 | run | GPUs | topology | workload | messages | identical | last event identical | SimAI (s) | TwiNS (s) |

@@ -1,12 +1,12 @@
 # TwiNS against SimAI on the SimAI paper's workloads
 
-**Status.** In progress. Larger training runs (512 GPUs) are still running on a87. One run, the
-GPT-3 13B probe at 1024 GPUs, is not yet identical (see Open).
+**Status.** In progress. Larger training runs (512 GPUs) are still running on a87.
 
 **Result so far.**
-- 36 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
-- 35 are identical to SimAI: every message's start and completion, to the nanosecond.
-- The 36th, a 1024-GPU training probe, is under investigation.
+- 37 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
+- All 37 are identical to SimAI: every message's start and completion, to the nanosecond.
+- Past 2^32 events, the reference is SimAI with 64-bit event uids. SimAI's own 32-bit uids wrap
+  there and reorder simultaneous events; see below.
 - That includes:
   - full-size training iterations: GPT-3 13B, LLaMA 65B (PP 2) and GPT-3 175B (PP 8) at 128
     GPUs, up to 5.97 M messages;
@@ -60,8 +60,6 @@ there is one, else the traced one.
 
 | run | messages | identical | simulated (ms) | SimAI traced (s) | SimAI untraced (s) | SimAI peak (GB) | TwiNS (s) | speedup |
 |---|---|---|---|---|---|---|---|---|
-| run | messages | identical | simulated (ms) | SimAI traced (s) | SimAI untraced (s) | SimAI peak (GB) | TwiNS (s) | speedup |
-|---|---|---|---|---|---|---|---|---|
 | c_allgather_512m_hpn128 | 1920 | 1920 | 23.37 | 54.7 | 54.4 | — | 11.6 | 4.7× |
 | c_allgather_64m_hpn128 | 1920 | 1920 | 2.63 | 10.9 | 10.2 | — | 1.3 | 7.6× |
 | c_allgather_8m_hpn128 | 1920 | 1920 | 0.40 | 5.4 | 4.8 | — | 0.2 | 26.1× |
@@ -97,6 +95,8 @@ there is one, else the traced one.
 | gpt3_175b_full_hpn128 | 5972864 | 5972864 | 734.78 | 6384.6 | — | 14.5 | 566.2 | 11.3× |
 | gpt3_13b_probe_hpn512 | 562176 | 562176 | 73.74 | 2986.5 | — | 8.9 | 189.6 | 15.8× |
 | llama_65b_probe_hpn512 | 1781248 | 1781248 | 153.75 | 3526.2 | — | 10.1 | 170.1 | 20.7× |
+| llama_65b_mid_hpn512 | 2698752 | 2698752 | 244.28 | 5380.8 | — | 11.5 | 260.4 | 20.7× |
+| gpt3_13b_probe_hpn1024 | 2172928 | 2172928 | 80.32 | 6139.4 | — | 16.5 | 334.1 | 18.4× |
 
 ## What sets the speedup
 
@@ -135,13 +135,29 @@ same collectives, one run at a time.
 - **So sequential SimAI is the reference.** Its untraced runs (`simai-seq`) are identical to the
   traced ones that TwiNS matches.
 
-## Open: GPT-3 13B probe at 1024 GPUs
+## SimAI's event uids wrap after 2^32 events
 
-- 1 465 409 of 2 172 928 messages are identical. The first difference is a 1.2 MB message
-  completing at 44.607 ms: 9966 ns against 9916 ns. Later messages differ in their starts too.
-- TwiNS gives the same result with global windows off and with every switch serial, so the cause
-  is neither of those.
-- Being traced: SimAI's transmissions around 44.4–44.61 ms against TwiNS's.
+The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
+- **Where.** The first difference was at 44.597 ms on GPU 39. An ACK's TransmitComplete on one NIC
+  and a data frame's arrival on the other fell in the same nanosecond. SimAI ran the
+  TransmitComplete first; TwiNS ran the arrival first, as its causal chains say (the arrival was
+  scheduled 860 ns earlier).
+- **Not TwiNS's windows or safe slots.** TwiNS gave the same result with global windows off and
+  with every switch serial.
+- **The cause.** ns-3.36 keeps event uids in 32 bits (`Scheduler::EventKey::m_uid`,
+  `DefaultSimulatorImpl::m_uid`), and runs simultaneous events in uid order. The run passes 2^32
+  events around 44.6 ms. The counter wraps, so the TransmitComplete, scheduled after the wrap, got
+  the smaller uid.
+- **Confirmed.**
+  - `simai-dag-ref`, our ns-3 replay, which counts uids as SimAI does, flips the same pair.
+  - SimAI rebuilt with 64-bit uids (`trace_patch.py`, `TWINS_UID64`) matches TwiNS exactly: all
+    2 172 928 messages.
+- **What we do.** The traced references now use 64-bit uids, like the other reproducibility
+  fixes (node-id maps, per-port ECN streams).
+  - Below 2^32 events this changes nothing: every other run here, and every earlier reference,
+    stays below.
+  - Emulating the wrap in TwiNS would need a global count of ns-3's events and their global order
+    across the slot of the wrap.
 
 ## TwiNS changes that made these runs possible or faster
 

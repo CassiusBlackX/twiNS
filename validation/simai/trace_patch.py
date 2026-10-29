@@ -22,6 +22,12 @@ simai-dag-ref's --txtrace ("ns node dev kind src dst sport seq bytes ecn").
 It also makes the frontend's network setup reproducible as simai-ref's is: the topology maps are
 ordered by node id (SimAI's by Ptr<Node>, a heap address, which orders ECMP next hops), and each
 switch port draws its ECN marks from its own stream (simai.patch; SimAI never configures them).
+
+And it widens ns-3's event uids to 64 bits (TWINS_UID64). ns-3.36 keeps them in 32 bits
+(Scheduler::EventKey::m_uid, DefaultSimulatorImpl::m_uid), and events at equal times run in uid
+order. After 2^32 events the counter wraps, and events scheduled later run first among
+simultaneous ones: a 1024-GPU GPT-3 13B probe passes 2^32 events at 44.6 ms. Below 2^32 events
+nothing changes.
 """
 import sys, os
 
@@ -235,3 +241,32 @@ patch(os.path.join(sim, "scratch/common.h"), [
         sw->m_mmu->ConfigEcnStream(j, (uint64_t)i * SwitchMmu::pCnt + j); // TWINS_ECNSTREAM
 """),
 ], marker="TWINS_ECNSTREAM")
+
+# 64-bit event uids (TWINS_UID64): ns-3.36's 32-bit uid wraps after 2^32 events (above)
+core = os.path.join(sim, "src/core/model")
+patch(os.path.join(core, "scheduler.h"), [
+    ("""    uint32_t m_uid;        /**< Event unique id. */""",
+     """    uint64_t m_uid;        /**< Event unique id. (TWINS_UID64: no wrap after 2^32 events) */"""),
+], marker="TWINS_UID64")
+patch(os.path.join(core, "default-simulator-impl.h"), [
+    ("""  uint32_t m_uid;""", """  uint64_t m_uid; // TWINS_UID64"""),
+    ("""  uint32_t m_currentUid;""", """  uint64_t m_currentUid;"""),
+], marker="TWINS_UID64")
+patch(os.path.join(core, "event-id.h"), [
+    ("""EventId (const Ptr<EventImpl> &impl, uint64_t ts, uint32_t context, uint32_t uid);""",
+     """EventId (const Ptr<EventImpl> &impl, uint64_t ts, uint32_t context, uint64_t uid); // TWINS_UID64"""),
+    ("""  uint32_t GetUid (void) const;""", """  uint64_t GetUid (void) const;"""),
+    ("""  uint32_t m_uid;              /**< The unique id. */""", """  uint64_t m_uid;              /**< The unique id. */"""),
+], marker="TWINS_UID64")
+patch(os.path.join(core, "event-id.cc"), [
+    ("""EventId::EventId (const Ptr<EventImpl> &impl, uint64_t ts, uint32_t context, uint32_t uid)""",
+     """EventId::EventId (const Ptr<EventImpl> &impl, uint64_t ts, uint32_t context, uint64_t uid) // TWINS_UID64"""),
+    ("""uint32_t
+EventId::GetUid (void) const""", """uint64_t
+EventId::GetUid (void) const"""),
+], marker="TWINS_UID64")
+patch(os.path.join(sim, "src/core/model/default-simulator-impl.cc"), [
+    ("""static uint32_t *g_twUid = nullptr;
+static uint32_t g_twEv0 = 0;""", """static uint64_t *g_twUid = nullptr; // TWINS_UID64
+static uint64_t g_twEv0 = 0;"""),
+], marker="TWINS_UID64")

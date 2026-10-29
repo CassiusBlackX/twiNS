@@ -35,3 +35,5 @@ llama_65b_full_hpn128 hpn128.topo
 gpt3_175b_full_hpn128 hpn128.topo
 gpt3_13b_probe_hpn512 hpn512.topo
 llama_65b_probe_hpn512 hpn512.topo
+llama_65b_mid_hpn512 hpn512.topo
+gpt3_13b_probe_hpn1024 hpn1024.topo
