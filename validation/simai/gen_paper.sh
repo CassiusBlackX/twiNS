@@ -3,7 +3,7 @@
 # - collectives across hosts (§4.2): one collective per file, in the data-parallel group with TP 8
 #   (a GPU's group is the same GPU of every server: one rail), at 128, 512 and 1024 GPUs;
 # - training (§4.4, Table 3): GPT-3 13B (TP 2), LLaMA 65B (TP 8, PP 2), GPT-3 175B (TP 8, PP 8),
-#   from AICB, with full layers and with 2 layers per pipeline stage (probes). A pipeline runs PP
+#   from AICB, with full layers, mid (8 or 16 layers) and 2 layers per pipeline stage (probes). A pipeline runs PP
 #   micro-batches (ga = PP), micro-batch 1.
 cd ~/netsim/simai/aicb
 W=~/netsim/aiwork/wl/paper
@@ -28,8 +28,15 @@ train() { # NAME LAYERS GPUS TP PP ARGS...
     [ -f "$f" ] && cp "$f" $W/$n.txt && echo "$n: $(sed -n 2p $W/$n.txt) layers, $(wc -l < $W/$n.txt) lines" || echo "$n: FAILED"
 }
 for g in 128 512 1024; do
-    for v in full probe; do
-        gl=$([ $v = full ] && echo 40 || echo 2) ll=$([ $v = full ] && echo 80 || echo 4) cl=$([ $v = full ] && echo 96 || echo 16)
+    # full: the paper's layers; mid: 8 (GPT-3 13B, LLaMA 65B) and 16 (GPT-3 175B, 2 per stage), where
+    # a full iteration takes SimAI over a day (its gradient collectives grow with the layers);
+    # probe: 2 layers per stage
+    for v in full mid probe; do
+        case $v in
+        full) gl=40 ll=80 cl=96 ;;
+        mid) gl=8 ll=8 cl=16 ;;
+        probe) gl=2 ll=4 cl=16 ;;
+        esac
         train gpt3_13b_${v}_$g $gl $g 2 1 --num_attention_heads=40 --hidden_size=5120 --ffn_hidden_size=20480 --seq_length=2048
         train llama_65b_${v}_$g $ll $g 8 2 --num_attention_heads=64 --hidden_size=8192 --ffn_hidden_size=28672 --seq_length=4096 --swiglu
         train gpt3_175b_${v}_$g $cl $g 8 8 --num_attention_heads=96 --hidden_size=12288 --ffn_hidden_size=49152 --seq_length=2048

@@ -55,27 +55,27 @@ the first differing decision in both binaries:
 
 | run | GPUs | topology | workload | messages | identical | last event identical | SimAI (s) | TwiNS (s) |
 |---|---|---|---|---|---|---|---|---|
-| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.8 |
-| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.1 |
-| tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 1.8 |
-| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 1.0 |
-| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.3 |
-| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 5.2 |
-| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.4 |
-| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 63.6 |
-| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 77.6 |
-| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 43.6 |
-| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 58.5 |
-| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 81.2 |
-| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 43.9 |
-| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 37.3 |
-| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 58.4 |
-| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 26.0 |
+| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.7 |
+| tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.0 |
+| tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 1.7 |
+| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 0.9 |
+| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.2 |
+| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 4.7 |
+| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 4.7 |
+| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 59.0 |
+| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 64.7 |
+| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 40.0 |
+| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 48.4 |
+| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 55.5 |
+| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 36.4 |
+| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 23.9 |
+| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 45.7 |
+| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 19.3 |
 
 SimAI is the single-threaded sequential build on a87 (Xeon Gold 5218; up to 9 runs side by side).
 TwiNS runs on an RX 9060 XT. "Last event" is the run's end: the last timer firing or completion,
 from SimAI's trace and TwiNS's report.
-All TwiNS timings are of `127ce90` (one run each, the machine otherwise idle).
+All TwiNS timings are of `00743b5` (one run each, the machine otherwise idle).
 - **Large runs** (128 GPUs, many entities): TwiNS is 10–14× faster than SimAI.
 - **Small dense runs** (16 GPUs, NVLink saturated for tens of ms):
   - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound. The slowest block of a
@@ -138,6 +138,14 @@ All TwiNS timings are of `127ce90` (one run each, the machine otherwise idle).
   count (12 for AlibabaHPN's 3-device GPU hosts; selection was ~29% of the critical host wave).
   About −2 to −3.5% everywhere: MoE on AlibabaHPN 59.7 → 58.4 s, GPT-13B on AlibabaHPN
   82.2 → 81.2 s, Llama on AlibabaHPN 79.1 → 77.6 s.
+- **Since `9a418c1`** (`fde54b6`, `315c9a1`, `00743b5`):
+  - Wide switches run safe slots, a lane per egress port. They meet the safe condition in 100% of
+    the slots measured.
+  - Switches whose ports exceed LDS keep them in global memory. This is for AlibabaHPN at 512 and
+    1024 GPUs; see `paper.md`.
+  - Global windows: while NVLink is quiet, a launch runs up to 20 slots for every entity. AICB at
+    16 GPUs is 3–31% faster (GPT-13B on AlibabaHPN 81.2 → 55 s). microAllReduce, whose NVLink is
+    always busy, is 1–3.6% slower.
 
 ## Bugs found on the way (TwiNS)
 
