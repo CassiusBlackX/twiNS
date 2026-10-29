@@ -1722,7 +1722,10 @@ int main(int argc, char **argv)
     s.apool = dev_alloc<ArrLds>((size_t)S * POOL);
     s.aidx = dev_alloc<int>((size_t)S * 2 * POOL);
     size_t per_h = HPOOL * sizeof(HArr) + (HHINTS + 1) * sizeof(int) + 8 + MAX_DUE * sizeof(Due);
-    if (per_sw(s.kb) > 64 * 1024)
+    // wide switches whose ports exceed LDS keep them in global memory (rdma_slot_big<true>)
+    const bool gw = s.ns_b && per_sw(s.kb) > 64 * 1024;
+    s.swws = gw ? dev_alloc<SwPortLds>((size_t)s.ns_b * s.kb) : nullptr;
+    if (per_sw(s.ks) > 64 * 1024 || sw_ints(s.kb) * sizeof(int) > 64 * 1024)
     {
         fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw(s.kb), s.kb);
         return 1;
@@ -1758,11 +1761,12 @@ int main(int argc, char **argv)
     for (int x = 0; x < S; x++)
         ranks |= rk_ok[x] != 0;
     const int GS = 64;
-    const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = per_sw(s.kb);
+    const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = gw ? sw_ints(s.kb) * sizeof(int) : per_sw(s.kb);
+    auto big_k = gw ? rdma_slot_big<true> : rdma_slot_big<false>;
     auto slot_k = s.nm ? rdma_slot<true> : rdma_slot<false>;
     auto persist_k = s.nm ? rdma_persist<true> : rdma_persist<false>;
     CK(hipFuncSetAttribute((const void *)slot_k, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds));
-    CK(hipFuncSetAttribute((const void *)rdma_slot_big, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds_b));
+    CK(hipFuncSetAttribute((const void *)big_k, hipFuncAttributeMaxDynamicSharedMemorySize, (int)lds_b));
     hipEvent_t ef, ejc;
     CK(hipEventCreateWithFlags(&ef, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&ejc, hipEventDisableTiming));
@@ -1787,7 +1791,7 @@ int main(int argc, char **argv)
             slot_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>();
         if (s.ns_b)
         {
-            rdma_slot_big<<<s.ns_b, BS_big, lds_b, sc>>>();
+            big_k<<<s.ns_b, BS_big, lds_b, sc>>>();
             CK(hipEventRecord(ejc, sc));
             CK(hipStreamWaitEvent(sa, ejc, 0));
         }

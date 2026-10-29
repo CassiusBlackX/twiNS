@@ -433,6 +433,7 @@ struct Sim
     Chain *p_tc;        // [ports]
     Pkt *q0, *q3;       // [ports][q0_cap], [ports][q3_cap]
     struct ArrLds *apool; // [S][POOL] a switch's arrivals of the slot
+    struct SwPortLds *swws; // [ns_b][kb] the wide switches' ports, when they exceed LDS (else none)
     int *aidx;          // [S][2 POOL] their order per egress port (safe slots)
     int q0_cap, q3_cap;
     // links

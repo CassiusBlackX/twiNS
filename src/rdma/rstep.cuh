@@ -1862,7 +1862,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
 }
 
 // ------------------------------------------------------------------ switch
-constexpr int KMAX = 192;  // ports of a switch (LDS: see switch_block)
+constexpr int KMAX = 256;  // ports of a switch (a lane each in rdma_slot_big)
 constexpr int KSMALL = 32; // switches with more ports (wide) run in rdma_slot_big
 
 // A switch's slot workspace in LDS, per port: its Port, its arrivals of this slot (a range of the
@@ -3270,7 +3270,7 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
     }
 }
 
-template <bool WIDE>
+template <bool WIDE, bool GW = false>
 __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int kl)
 {
     const int x = bi.e;
@@ -3279,9 +3279,9 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
     long long p0 = clock64();
 #endif
     // a switch's workspace: its ports and ints in LDS, its arrival pool and its index lists in
-    // global memory
-    SwPortLds *w = reinterpret_cast<SwPortLds *>(smem);
-    int *ints = reinterpret_cast<int *>(smem + (size_t)kl * sizeof(SwPortLds));
+    // global memory (GW: its ports too, when they exceed LDS: a wide switch's, by its block)
+    SwPortLds *w = GW ? s.swws + (size_t)blockIdx.x * kl : reinterpret_cast<SwPortLds *>(smem);
+    int *ints = reinterpret_cast<int *>(smem + (GW ? 0 : (size_t)kl * sizeof(SwPortLds)));
     ArrLds *pool = s.apool + (size_t)x * POOL;
     int *pidx = s.aidx + (size_t)x * 2 * POOL;
     __shared__ int blk_act, win;
@@ -3388,6 +3388,7 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot()
 // the switches with many ports (spines), alongside rdma_slot: a lane per port, up to BLOCK_BIG
 // lanes (their ports' loads and stores in one round, not one per BLOCK ports)
 constexpr int BLOCK_BIG = 256;
+template <bool GW>
 __global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
 {
     const Sim &s = c_sim;
@@ -3396,7 +3397,7 @@ __global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
     int64_t slot;
     if (!block_entry(s, s.bi_b, &bi, &slot))
         return;
-    switch_block<true>(s, bi, slot, smem, s.kb);
+    switch_block<true, GW>(s, bi, slot, smem, s.kb);
 }
 
 // Ranks ahead, alongside a launch's kernels every rank_every launches (a block per wide switch and
