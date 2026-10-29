@@ -280,7 +280,7 @@ struct Switch
     uint32_t shared_used; // SwitchMmu::shared_used_bytes
     uint32_t total_hdrm, total_rsrv;
     uint32_t max_shift;   // the largest pfc_a_shift of its ports (the lowest PFC threshold)
-    // wide switches (no safe slots: every event in order) number their events; a TransmitComplete's
+    // wide switches number the events of their slots run in order (not safe); a TransmitComplete's
     // key is its event's number and its ordinal there, and simultaneous TransmitCompletes run in key
     // order (their chains differ first at the scheduling events, whose order is that number's)
     uint64_t evseq;

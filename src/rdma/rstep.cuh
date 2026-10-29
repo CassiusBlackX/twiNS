@@ -1863,7 +1863,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
 
 // ------------------------------------------------------------------ switch
 constexpr int KMAX = 192;  // ports of a switch (LDS: see switch_block)
-constexpr int KSMALL = 32; // switches with more ports (wide: no safe slots) run in rdma_slot_big
+constexpr int KSMALL = 32; // switches with more ports (wide) run in rdma_slot_big
 
 // A switch's slot workspace in LDS, per port: its Port, its arrivals of this slot (a range of the
 // pool, or, when the pool overflows, a cursor in the frames of slots s - 2 then s - 1), and the
@@ -1955,7 +1955,8 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     const Sim &s = *c.s;
     int64_t tx = link_txo(s, c.w[port].ob, p.size);
     c.w[port].pt.tc_at = c.now + tx;
-    c.w[port].pt.tc_key = c.sw.evseq * 64 + (c.ord < 63 ? c.ord : 63);
+    // (none in a safe slot: its events are not numbered; the chains decide)
+    c.w[port].pt.tc_key = c.safe ? ~0ull : c.sw.evseq * 64 + (c.ord < 63 ? c.ord : 63);
     if (c.dirty)
     {
         if (c.ndirty < 6)
@@ -2260,9 +2261,12 @@ __device__ __forceinline__ const Chain &sw_arr_chain(const SCtx &c, const SwPort
 //    threshold the slot can reach even if all of its arrivals stay: then no MMU decision
 //    (drop, headroom, PAUSE, RESUME) can occur, ports interact only through the sums in their
 //    ingress counters, and shared_used = sum max(0, ing - reserve) follows at the end;
+//    Wide switches (more ports than the merge cursors fit) sort their arrivals by egress port and
+//    event order instead, and a TransmitComplete scheduled in a safe slot has no event number
+//    (tc_key): an order with another one in a later slot comes from their chains;
 //  - otherwise lane 0 runs all events in order.
 // Last, the lanes store the ports back together.
-constexpr int SAFE_LANES = 32; // safe slots need a lane per port
+constexpr int SAFE_LANES = 32; // a small switch's safe slots: a lane per port, merge cursors for them
 // the LDS int workspace of a switch with K ports (the merge cursors only for safe slots, which
 // have at most SAFE_LANES ports), then LK arrival keys: their times in the slot, egress ports, and
 // two index lists (uint16, uint8, 2 x uint16)
@@ -2445,32 +2449,50 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = !WIDE && pooled && total <= LK && D <= 65535 && deg <= lanes && deg <= SAFE_LANES && !s.serial;
+    bool safe = pooled && total <= LK && D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
+    // (the ports' sums and checks by their lanes: a wide switch's ports, one after the other, cost
+    // more than its events)
+    __shared__ unsigned long long sw_sum;
+    __shared__ int sw_bad;
     if (safe)
     {
-        const Switch &sw = s.sw[x];
-        int64_t amax = sw.shared_used;
-        for (int p = 0; p < deg; p++)
+        if (lane == 0)
         {
-            amax += abytes[p];
-            if (w[p].pt.hdrm || w[p].pt.mmu_paused)
-                safe = false;
+            sw_sum = 0;
+            sw_bad = 0;
         }
+        __syncthreads();
+        unsigned long long my = 0;
+        int bad = 0;
+        for (int p = lane; p < deg; p += lanes)
+        {
+            my += abytes[p];
+            bad |= w[p].pt.hdrm || w[p].pt.mmu_paused;
+        }
+        if (my)
+            atomicAdd(&sw_sum, my);
+        if (bad)
+            sw_bad = 1;
+        __syncthreads();
+        const Switch &sw = s.sw[x];
+        int64_t amax = sw.shared_used + (int64_t)sw_sum;
         int64_t room = (int64_t)WP.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
         int64_t th_min = room > 0 ? room >> sw.max_shift : -1;
-        for (int p = 0; p < deg && safe; p++)
+        bad = sw_bad;
+        for (int p = lane; p < deg && !bad; p += lanes)
         {
             int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
             if ((su > 0 ? su : 0) >= th_min)
-                safe = false;
+                bad = 1;
         }
+        safe = !__syncthreads_or(bad);
     }
     bool act = false;
     if (safe)
     {
         // each egress port's arrivals (counted above), merged from the ingress ports in order: lane
         // p links its port's arrivals to the next one with the same egress, then lane o merges
-        if (lane < deg)
+        if (!WIDE && lane < deg)
         {
             int p = lane, b = 0;
             for (int q = 0; q < p; q++)
@@ -2487,7 +2509,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
             }
         }
         __syncthreads();
-        if (lane < deg)
+        if (!WIDE && lane < deg)
         {
             int o = lane, base = 0;
             for (int p = 0; p < o; p++)
@@ -2530,6 +2552,71 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
                     na--;
                 }
             }
+        }
+        if constexpr (WIDE)
+        {
+            // wide (too many ports for the merge cursors): the arrivals sorted by egress port, then
+            // in event order as the serial path's first() decides (time, rank, chains) - a bitonic
+            // sort of their pool indices; each egress port's arrivals are then olist[obase[o] ..]
+            auto own_of = [&](int u) -> int {
+                const ArrLds &A = pool[u];
+                return A.out >= 0 ? A.out : (A.p.kind == K_PAUSE || A.p.kind == K_RESUME ? A.in : 0x7FFF);
+            };
+            auto eg_first = [&](int u, int v) -> bool {
+                if (u < 0 || v < 0)
+                    return v < 0 && u >= 0;
+                int ou = own_of(u), ov = own_of(v);
+                if (ou != ov)
+                    return ou < ov;
+                const ArrLds &A = pool[u], &B = pool[v];
+                if (A.ts != B.ts)
+                    return A.ts < B.ts;
+                if (A.rank >= 0 && B.rank >= 0)
+                    return A.rank < B.rank;
+                int r = qcmp(s, A.ap, A.ah, A.ar, B.ap, B.ah, B.ar);
+                if (r == 0)
+                {
+                    bool inexact;
+                    r = ccmp(s, A.acode, s.msg[A.frame].c, B.acode, s.msg[B.frame].c, &inexact);
+                    if (inexact)
+                        atomicAdd(&s.ev[9], 1ull);
+                    if (r == 0)
+                    {
+                        atomicAdd(&s.ev[8], 1ull);
+                        return u < v;
+                    }
+                }
+                return r < 0;
+            };
+            int n2 = 1;
+            while (n2 < total)
+                n2 <<= 1;
+            for (int i = lane; i < n2; i += lanes)
+                pidx[i] = i < total ? i : -1;
+            __syncthreads();
+            for (int k = 2; k <= n2; k <<= 1)
+                for (int j = k >> 1; j > 0; j >>= 1)
+                {
+                    for (int i = lane; i < n2; i += lanes)
+                    {
+                        int l = i ^ j;
+                        if (l > i)
+                        {
+                            int u = pidx[i], v = pidx[l];
+                            bool up = (i & k) == 0;
+                            if (up ? eg_first(v, u) : eg_first(u, v))
+                            {
+                                pidx[i] = v;
+                                pidx[l] = u;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
+            block_exscan(ocnt, obase, deg, lane, lanes);
+            for (int i = lane; i < total; i += lanes)
+                olist[i] = (uint16_t)pidx[i];
+            __syncthreads();
         }
         if (lane < deg)
         {
@@ -2602,16 +2689,26 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
                     s_forward(c, a.in, pk, a.out, a.q);
             }
         }
+        // shared_used = sum over ports of max(0, ing - reserve), which changed with ing only (the
+        // ports' changes summed by their lanes; modulo 2^32, as the counter)
+        if (lane == 0)
+            sw_sum = 0;
+        __syncthreads();
+        {
+            uint32_t my = 0;
+            for (int p = lane; p < deg; p += lanes)
+            {
+                uint32_t a = ing0[p] > RESERVE ? ing0[p] - RESERVE : 0, b = w[p].pt.ing > RESERVE ? w[p].pt.ing - RESERVE : 0;
+                my += b - a;
+            }
+            if (my)
+                atomicAdd(&sw_sum, (unsigned long long)my);
+        }
         __syncthreads();
         if (lane == 0)
         {
-            // shared_used = sum over ports of max(0, ing - reserve), which changed with ing only
             Switch sw = s.sw[x];
-            for (int p = 0; p < deg; p++)
-            {
-                uint32_t a = ing0[p] > RESERVE ? ing0[p] - RESERVE : 0, b = w[p].pt.ing > RESERVE ? w[p].pt.ing - RESERVE : 0;
-                sw.shared_used += b - a;
-            }
+            sw.shared_used += (uint32_t)sw_sum;
             s.sw[x] = sw;
 #ifdef RDMA_PROF
             atomicAdd(&s.ev[31], 1ull);
@@ -2820,7 +2917,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         auto first = [&](int i, int j, int64_t t) -> bool {
             const SwPortLds &a = w[i >> 1], &b = w[j >> 1];
             int ki = i & 1, kj = j & 1;
-            if (ki && kj) // two TransmitCompletes: their keys
+            if (ki && kj && a.pt.tc_key != ~0ull && b.pt.tc_key != ~0ull) // two TransmitCompletes: their keys
                 return a.pt.tc_key < b.pt.tc_key;
             if (!ki && !kj && c.pool && pool[a.ai].rank >= 0 && pool[b.ai].rank >= 0) // two arrivals: their ranks
                 return pool[a.ai].rank < pool[b.ai].rank;
