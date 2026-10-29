@@ -55,32 +55,32 @@ the first differing decision in both binaries:
 
 | run | GPUs | topology | workload | messages | identical | last event identical | SimAI (s) | TwiNS (s) |
 |---|---|---|---|---|---|---|---|---|
-| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.7 |
+| tr_sx8 | 8 | Spectrum-X | microAllReduce | 1792 | 1792 | yes | 2.0 | 0.8 |
 | tr_sx16 | 16 | Spectrum-X | microAllReduce | 7680 | 7680 | yes | 3.6 | 1.1 |
 | tr_hpn16 | 16 | AlibabaHPN | microAllReduce | 7680 | 7680 | yes | 5.4 | 1.8 |
-| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 0.9 |
-| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.2 |
-| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 5.0 |
-| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.2 |
-| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 64.1 |
-| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 79.1 |
-| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 45.1 |
-| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 58.7 |
-| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 82.2 |
-| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 44.9 |
-| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 37.6 |
-| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 59.7 |
-| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 26.7 |
+| tr_dcn16 | 16 | DCN+ | microAllReduce | 7680 | 7680 | yes | 1.8 | 1.0 |
+| tr_sx128 | 128 | Spectrum-X | microAllReduce | 520192 | 520192 | yes | 60.4 | 4.3 |
+| tr_hpn128 | 128 | AlibabaHPN | microAllReduce | 520192 | 520192 | yes | 62.7 | 5.2 |
+| tr_dcn128 | 128 | DCN+ | microAllReduce | 520192 | 520192 | yes | 52.6 | 5.4 |
+| a_llama_sx16 | 16 | Spectrum-X | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 121.4 | 63.6 |
+| a_llama_hpn16 | 16 | AlibabaHPN | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 122.4 | 77.6 |
+| a_llama_dcn16 | 16 | DCN+ | Megatron Llama-7B-like, tp 8 | 517008 | 517008 | yes | 120.3 | 43.6 |
+| a_gpt13_sx16 | 16 | Spectrum-X | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 95.3 | 58.5 |
+| a_gpt13_hpn16 | 16 | AlibabaHPN | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 98.0 | 81.2 |
+| a_gpt13_dcn16 | 16 | DCN+ | Megatron GPT-13B-like, tp 8, SP | 264336 | 264336 | yes | 93.2 | 43.9 |
+| a_moe_sx16 | 16 | Spectrum-X | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 49.6 | 37.3 |
+| a_moe_hpn16 | 16 | AlibabaHPN | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 53.8 | 58.4 |
+| a_moe_dcn16 | 16 | DCN+ | MoE, tp 2, ep 8 | 6496 | 6496 | yes | 37.2 | 26.0 |
 
 SimAI is the single-threaded sequential build on a87 (Xeon Gold 5218; up to 9 runs side by side).
 TwiNS runs on an RX 9060 XT. "Last event" is the run's end: the last timer firing or completion,
 from SimAI's trace and TwiNS's report.
-All TwiNS timings are of `9a418c1` (one run each, the machine otherwise idle).
+All TwiNS timings are of `127ce90` (one run each, the machine otherwise idle).
 - **Large runs** (128 GPUs, many entities): TwiNS is 10–14× faster than SimAI.
 - **Small dense runs** (16 GPUs, NVLink saturated for tens of ms):
   - Only ~20 entities run each 25 ns slot, so the GPU is latency-bound. The slowest block of a
     slot, often a GPU host with ~150k cycles of dependent global accesses, sets the pace.
-  - TwiNS goes from 1.11× slower (MoE on AlibabaHPN, whose 2 NICs per GPU make 3 link rates) to
+  - TwiNS goes from 1.09× slower (MoE on AlibabaHPN, whose 2 NICs per GPU make 3 link rates) to
     2.7× faster (DCN+, few enough blocks for persistent launches); it is faster than SimAI on 15
     of the 16 runs.
   - Batching recovers the throughput. The 9 AICB runs (2363520 messages) as one batch
@@ -131,6 +131,13 @@ All TwiNS timings are of `9a418c1` (one run each, the machine otherwise idle).
   AlibabaHPN 128 5.4 → 5.0 s, Spectrum-X 128 4.4 → 4.2 s, MoE on AlibabaHPN 62.1 → 59.7 s,
   GPT-13B on AlibabaHPN 87.1 → 82.2 s. What remains on a wide switch is its serial event loop
   (lane 0).
+- **Since `9a418c1`** (`127ce90`): a host's selection reads its candidates' times (per device:
+  arrival, TransmitComplete, m_nextSend; the timer, flow start, DAG flow) in one unrolled pass,
+  then finds the earliest; only candidates sharing it go through the comparisons, in the same
+  order. Before, each candidate was a chain of LDS reads and branches in a loop over the device
+  count (12 for AlibabaHPN's 3-device GPU hosts; selection was ~29% of the critical host wave).
+  About −2 to −3.5% everywhere: MoE on AlibabaHPN 59.7 → 58.4 s, GPT-13B on AlibabaHPN
+  82.2 → 81.2 s, Llama on AlibabaHPN 79.1 → 77.6 s.
 
 ## Bugs found on the way (TwiNS)
 
