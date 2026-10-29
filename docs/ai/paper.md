@@ -1,11 +1,12 @@
 # TwiNS against SimAI on the SimAI paper's workloads
 
-**Status.** In progress. Larger training runs (512 and 1024 GPUs) and the multi-threaded baselines
-are still running on a87.
+**Status.** In progress. Larger training runs (512 GPUs) are still running on a87. One run, the
+GPT-3 13B probe at 1024 GPUs, is not yet identical (see Open).
 
 **Result so far.**
-- 35 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
-- All 35 are identical to SimAI: every message's start and completion, to the nanosecond.
+- 36 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
+- 35 are identical to SimAI: every message's start and completion, to the nanosecond.
+- The 36th, a 1024-GPU training probe, is under investigation.
 - That includes:
   - full-size training iterations: GPT-3 13B, LLaMA 65B (PP 2) and GPT-3 175B (PP 8) at 128
     GPUs, up to 5.97 M messages;
@@ -112,11 +113,35 @@ slowest entity. SimAI's cost grows with its events.
   NVLink quiet and run in windows. Full GPT-3 13B (TP 2) runs 19.1 M launches over 22.3 M slots;
   LLaMA 65B runs 8.2 M over 36.2 M.
 
-## Speed baselines still pending
+## SimAI multi-threaded
 
-**SimAI multi-threaded** (`simai-mtp`, Unison), `-t 16/32/64`: time, whether the run completes,
-whether two runs agree. Phase 0 (`baseline.md`) found it irreproducible, at most 1.3× faster at 16
-GPUs, and crashing or losing flows at 128 GPUs.
+`simai-mtp` is SimAI with Unison (`--enable-mtp`), optimized, at `-t 16/32/64`. It was run on the
+same collectives, one run at a time.
+
+| run | sequential (s) | `-t 16` (s) | `-t 32` (s) | `-t 64` (s) | messages that differ from sequential | TwiNS (s) |
+|---|---|---|---|---|---|---|
+| c_allreduce_64m_hpn128 | 16.5 | 9.0 | 7.8 | 11.9 | 53 of 3840 | 2.7 |
+| c_allgather_512m_hpn128 | 54.4 | 20.2 | 18.9 | 32.4 | 298 of 1920 | 11.6 |
+| c_allreduce_64m_hpn512 | 74.0 | 27.6 | 28.6 | 52.0 | 25 of 64512 | 5.5 |
+| c_allgather_512m_hpn512 | 258.0 | 70.9 | 60.1, aborted: 31719 of 32256 done | 115.5 | 756 of 32256 | 23.6 |
+| c_allreduce_64m_hpn1024 | 171.6 | 68.1 | 84.7 | 184.4 | 739 of 260096 | 7.3 |
+| c_allgather_512m_hpn1024 | 542.7 | 144.7 | 133.4 | 228.0 | 2467 of 130048 | 30.7 |
+
+- **Speed.** Threads gain 1.8–4.1× at `-t 16/32`; `-t 64` is slower. TwiNS stays 1.6–9.3×
+  faster than SimAI's best thread count.
+- **Results differ from sequential SimAI.** The same messages differ at every thread count, so
+  this is Unison's event order (see `phase0-notes.md`), not noise. One run aborted and lost 537
+  messages.
+- **So sequential SimAI is the reference.** Its untraced runs (`simai-seq`) are identical to the
+  traced ones that TwiNS matches.
+
+## Open: GPT-3 13B probe at 1024 GPUs
+
+- 1 465 409 of 2 172 928 messages are identical. The first difference is a 1.2 MB message
+  completing at 44.607 ms: 9966 ns against 9916 ns. Later messages differ in their starts too.
+- TwiNS gives the same result with global windows off and with every switch serial, so the cause
+  is neither of those.
+- Being traced: SimAI's transmissions around 44.4–44.61 ms against TwiNS's.
 
 ## TwiNS changes that made these runs possible or faster
 
