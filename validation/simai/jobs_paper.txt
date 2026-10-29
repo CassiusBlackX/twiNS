@@ -10,6 +10,7 @@ c_reducescatter_512m_hpn128 hpn128.topo
 c_reducescatter_64m_hpn128 hpn128.topo
 c_reducescatter_8m_hpn128 hpn128.topo
 gpt3_13b_probe_hpn128 hpn128.topo
+gpt3_175b_probe_hpn128 hpn128.topo
 llama_65b_probe_hpn128 hpn128.topo
 c_allgather_512m_hpn512 hpn512.topo
 c_allgather_64m_hpn512 hpn512.topo
