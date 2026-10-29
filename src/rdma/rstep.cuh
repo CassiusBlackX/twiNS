@@ -1612,8 +1612,9 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
         // candidates: 0 an arrival, 1 a TransmitComplete, 2 an m_nextSend (each per device), 3 a
         // DCQCN timer, 4 a flow start (the arrivals' and the flow start's times are kept between
         // events)
-        for (int d = 0; d < nd; d++)
-            if (!af[d])
+#pragma unroll
+        for (int d = 0; d < ND; d++)
+            if (d < nd && !af[d])
             {
                 if (pooled)
                 {
@@ -1684,28 +1685,61 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             }
             return &q;
         };
+        // the candidates' times (unrolled: constant indices, no loads in a loop's chain), and their
+        // earliest; only candidates at that time go on to the comparisons, in the same order (once
+        // the best holds the earliest time, the loop below compares as it did over all of them)
+        int64_t tt[3 * ND + 3];
+#pragma unroll
+        for (int k = 0; k < 3; k++)
+#pragma unroll
+            for (int d = 0; d < ND; d++)
+                tt[k * ND + d] = d < nd ? ctime(k, d) : INT64_MAX;
+#pragma unroll
+        for (int k = 3; k < 6; k++)
+            tt[3 * ND + k - 3] = ctime(k, 0);
+        int64_t tmin = INT64_MAX;
+        int nmin = 0, kmin = -1, dmin = 0;
+#pragma unroll
+        for (int i = 0; i < 3 * ND + 3; i++)
+        {
+            if (tt[i] < tmin)
+            {
+                tmin = tt[i];
+                nmin = 0;
+                kmin = i < 3 * ND ? i / ND : i - 3 * ND + 3;
+                dmin = i < 3 * ND ? i % ND : 0;
+            }
+            nmin += tt[i] == tmin;
+        }
         int bk = -1, bd = 0;
         int64_t bt = INT64_MAX;
-        for (int k = 0; k < 6; k++)
-            for (int d = 0; d < (k < 3 ? nd : 1); d++)
-            {
-                int64_t t = ctime(k, d);
-                if (t == INT64_MAX)
-                    continue;
-                bool b4 = bk < 0 || t < bt;
-                if (bk >= 0 && t == bt)
+        if (nmin == 1)
+        {
+            bk = kmin;
+            bd = dmin;
+            bt = tmin;
+        }
+        else if (tmin != INT64_MAX)
+            for (int k = 0; k < 6; k++)
+                for (int d = 0; d < (k < 3 ? nd : 1); d++)
                 {
-                    const QPre *qa = quick(k, d), *qb = quick(bk, bd);
-                    int r = qa && qb ? qcmp(s, qa->r, qa->h, qa->root, qb->r, qb->h, qb->root) : 0;
-                    b4 = r ? r < 0 : before(s, t, code(k, d), chain(k, d), bt, code(bk, bd), chain(bk, bd));
+                    int64_t t = tt[k < 3 ? k * ND + d : 3 * ND + k - 3];
+                    if (t != tmin)
+                        continue;
+                    bool b4 = bk < 0 || t < bt;
+                    if (bk >= 0 && t == bt)
+                    {
+                        const QPre *qa = quick(k, d), *qb = quick(bk, bd);
+                        int r = qa && qb ? qcmp(s, qa->r, qa->h, qa->root, qb->r, qb->h, qb->root) : 0;
+                        b4 = r ? r < 0 : before(s, t, code(k, d), chain(k, d), bt, code(bk, bd), chain(bk, bd));
+                    }
+                    if (b4)
+                    {
+                        bk = k;
+                        bd = d;
+                        bt = t;
+                    }
                 }
-                if (b4)
-                {
-                    bk = k;
-                    bd = d;
-                    bt = t;
-                }
-            }
         if (bk < 0)
             break;
         if (bt < t0)
