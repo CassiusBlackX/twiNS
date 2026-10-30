@@ -7,7 +7,8 @@ With TWINS_TRACE=FILE set, the AstraSimNetwork binary writes one line per astra-
 the ns-3 event that took it (the cause) and the action's ordinal in that event (the events the
 event had scheduled before, from ns-3's uid counter):
 
-  F id src dst bytes sport send_lat_ns cause cause_id ord now_ns   SendFlow, per queue pair
+  F id src dst bytes sport send_lat_ns cause cause_id ord now_ns flow_id channel   SendFlow, per
+                                                                    queue pair (flow_id: SimCCL's)
   T id delay_ns cause cause_id ord now_ns                          sim_schedule
   C cause cause_id ord0 ord1                                       a callback ran: its event's
                                                                     ordinals at entry and exit
@@ -115,9 +116,9 @@ static long tw_flow (uint32_t sport, uint32_t src, uint32_t dst) {
   if (tw_out) {
     long id = tw_nflow++;
     tw_flow_of[std::make_tuple ((uint32_t) port, (uint32_t) src, (uint32_t) dst)] = id;
-    fprintf (tw_out, "F %ld %d %d %llu %u %lld %c %ld %llu %lld\\n", id, src, dst, (unsigned long long) real_PacketCount, port,
+    fprintf (tw_out, "F %ld %d %d %llu %u %lld %c %ld %llu %lld %d %d\\n", id, src, dst, (unsigned long long) real_PacketCount, port,
              (long long) send_lat / 1000, tw_kind, tw_id, (unsigned long long) ns3::TwinsOrd (),
-             (long long) Simulator::Now ().GetNanoSeconds ());
+             (long long) Simulator::Now ().GetNanoSeconds (), request->flowTag.current_flow_id, tag);
   }
 """),
     ("""void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {""", """void qp_finish0(FILE *fout, Ptr<RdmaQueuePair> q);

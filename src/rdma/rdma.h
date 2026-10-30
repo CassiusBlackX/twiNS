@@ -119,14 +119,18 @@ enum : uint8_t
 
 // An event's place in ns-3's event order. ns-3 runs simultaneous events in the order they were
 // scheduled. An event's chain is the sequence of leads from it back to its ancestors (run-length
-// encoded): code = (lead + 1) * 8 + 7 - ordinal, where the ordinal counts the events its parent
-// had scheduled before it. Two simultaneous events compare by their first differing lead, the
+// encoded): code = (lead + 1) << CODE_ORD_BITS | CODE_ORD_MAX - ordinal, where the ordinal counts
+// the events its parent had scheduled before it (a tick of astra-sim's can start many flows; larger
+// ordinals tie, which is counted as undecided). Two simultaneous events compare by their first differing lead, the
 // larger first (an earlier ancestor); if all leads are equal, by the ordinals at the deepest level
 // where they differ (siblings in the order they were scheduled; see ccmp). A chain ends at a
 // flow's StartApplication (see the host), which records its own lineage and a root key, the
 // flow's place in the start order. When the runs overflow, the oldest spills into a TailNode.
 // hash: of the leads pushed since the root's StartApplication; anc: the hashes of its ancestors
 // NANC levels down (see ccmp: comparisons decided by the leads are remembered by these hashes)
+constexpr int CODE_ORD_BITS = 5;
+constexpr uint32_t CODE_ORD_MAX = (1u << CODE_ORD_BITS) - 1;
+constexpr uint64_t CODE_LEAD_MAX = (1ull << (32 - CODE_ORD_BITS)) - 2;
 struct Run
 {
     uint32_t code, cnt;

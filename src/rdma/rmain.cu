@@ -24,7 +24,8 @@
 // launches later, default 1; --rank-bs: its block size, default 512)
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
-// overwritten tail are reported as "on lost tails"
+// overwritten tail are reported as "on lost tails", and the run starts again with 8x the room
+// unless --tail was given
 //
 // out: "id start_ns fct_ns" per flow, by id.
 // Exit status: 0 every flow done; 2 some unfinished at the stop time; 3 an error counter (an
@@ -966,6 +967,7 @@ int main(int argc, char **argv)
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
+    bool tail_set = false;
     int dcap = 4096, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
     for (int i = 2; i < argc; i++)
     {
@@ -999,7 +1001,10 @@ int main(int argc, char **argv)
         else if (k == "--q3cap")
             q3cap = atoi(v.c_str());
         else if (k == "--tail")
+        {
             tail_log2 = atoi(v.c_str());
+            tail_set = true;
+        }
         else if (k == "--spread")
             spread = std::max(1, std::min(BLOCK, atoi(v.c_str())));
         else if (k == "--serial")
@@ -1375,7 +1380,7 @@ int main(int argc, char **argv)
             vector<uint32_t> v;
             for (int i = 0; i < RUNS && c.r[i].code; i++)
                 for (uint32_t k = 0; k < c.r[i].cnt; k++)
-                    v.push_back(c.r[i].code >> 3);
+                    v.push_back(c.r[i].code >> CODE_ORD_BITS);
             return v;
         };
         vector<vector<uint32_t>> L(F);
@@ -2031,15 +2036,18 @@ int main(int argc, char **argv)
     if (ev[8] || ev[9])
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);
-    if (ev[14] && !dcap_set && dcap < (1 << 20))
+    // a slot's DAG messages overflowed (more firings in one slot than dcap), or a tie met an
+    // overwritten tail: the run is not exact; it starts again with 4x (8x) the room, the same
+    // arguments otherwise
+    const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set;
+    if (redo_d || redo_t)
     {
-        // a slot's DAG messages overflowed (more firings in one slot than dcap): the run is not
-        // exact; it starts again with 4x the room, the same arguments otherwise
-        fprintf(stderr, "DAG message overflow: running again with --dcap=%d\n", 4 * dcap);
+        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail=" + std::to_string(tail_log2 + 3);
+        fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
         fflush(stdout);
         fflush(stderr);
         vector<string> av(argv, argv + argc);
-        av.push_back("--dcap=" + std::to_string(4 * dcap));
+        av.push_back(more);
         vector<char *> pv;
         for (auto &a : av)
             pv.push_back(const_cast<char *>(a.c_str()));

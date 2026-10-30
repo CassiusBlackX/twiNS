@@ -147,9 +147,9 @@ __device__ __forceinline__ uint64_t rate_of(double d) { return (uint64_t)d; }
 __host__ __device__ __forceinline__ uint32_t ccode(int64_t lead, int ord)
 {
     uint64_t l = (uint64_t)lead + 1;
-    if (l > 0x1FFFFFFEull)
-        l = 0x1FFFFFFEull;
-    return (uint32_t)(l * 8 + (7 - (ord < 7 ? ord : 7)));
+    if (l > CODE_LEAD_MAX)
+        l = CODE_LEAD_MAX;
+    return (uint32_t)(l << CODE_ORD_BITS | (CODE_ORD_MAX - (ord < CODE_ORD_MAX ? ord : CODE_ORD_MAX)));
 }
 
 __device__ TailPool g_tail;
@@ -168,7 +168,7 @@ __device__ unsigned long long g_prof[8]; // ccmp calls, walks, walk steps, memo 
 // only between chains of one root (see ccmp)
 __host__ __device__ __forceinline__ uint64_t chash(uint64_t h, uint32_t code)
 {
-    uint64_t z = h + 0x9e3779b97f4a7c15ull * ((code >> 3) + 1ull);
+    uint64_t z = h + 0x9e3779b97f4a7c15ull * ((code >> CODE_ORD_BITS) + 1ull);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
     return z ^ (z >> 31);
@@ -375,10 +375,10 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
                 return A.lost ? ord : by_leads(-1);
             return B.lost ? ord : by_leads(1);
         }
-        if (ca >> 3 != cb >> 3)
+        if (ca >> CODE_ORD_BITS != cb >> CODE_ORD_BITS)
             return by_leads(ca > cb ? -1 : 1);
         if (ca != cb)
-            ord = (ca & 7) > (cb & 7) ? -1 : 1;
+            ord = (ca & CODE_ORD_MAX) > (cb & CODE_ORD_MAX) ? -1 : 1;
         // at the same tail node, at the same place in it: the rest is one lineage (the chains met at
         // a common ancestor), so the deepest ordinal difference is one seen above
         if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
@@ -432,7 +432,7 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
             *inexact = false;
             return m;
         }
-        if (j == NANC || A.code == 0 || B.code == 0 || (A.code >> 3) != (B.code >> 3))
+        if (j == NANC || A.code == 0 || B.code == 0 || (A.code >> CODE_ORD_BITS) != (B.code >> CODE_ORD_BITS))
             break;
         eq = j + 1;
         if (--A.left == 0)
@@ -496,7 +496,7 @@ __device__ __forceinline__ int pcmp(const Run *a, const Run *b)
         uint32_t ca = a[ia].code, cb = b[ib].code;
         if (!ca || !cb)
             return 0;
-        if (ca >> 3 != cb >> 3)
+        if (ca >> CODE_ORD_BITS != cb >> CODE_ORD_BITS)
             return ca > cb ? -1 : 1;
         uint32_t m = ra < rb ? ra : rb;
         ra -= m;
@@ -532,12 +532,12 @@ __device__ __forceinline__ bool before(const Sim &s, int64_t ta, uint32_t pa, co
     {
         atomicAdd(&s.ev[8], 1ull);
 #ifdef RDMA_TRACE_TIES
-        printf("tie %lld: [%u.%u]", (long long)ta, pa ? (pa >> 3) - 1 : 0, pa ? 7 - (pa & 7) : 0);
+        printf("tie %lld: [%u.%u]", (long long)ta, pa ? (pa >> CODE_ORD_BITS) - 1 : 0, pa ? CODE_ORD_MAX - (pa & CODE_ORD_MAX) : 0);
         for (int i = 0; i < RUNS && a.r[i].code; i++)
-            printf(" %u.%u:%u", (a.r[i].code >> 3) - 1, 7 - (a.r[i].code & 7), a.r[i].cnt);
-        printf(" root %u%s  | [%u.%u]", a.root, a.tail ? " +tail" : "", pb ? (pb >> 3) - 1 : 0, pb ? 7 - (pb & 7) : 0);
+            printf(" %u.%u:%u", (a.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (a.r[i].code & CODE_ORD_MAX), a.r[i].cnt);
+        printf(" root %u%s  | [%u.%u]", a.root, a.tail ? " +tail" : "", pb ? (pb >> CODE_ORD_BITS) - 1 : 0, pb ? CODE_ORD_MAX - (pb & CODE_ORD_MAX) : 0);
         for (int i = 0; i < RUNS && b.r[i].code; i++)
-            printf(" %u.%u:%u", (b.r[i].code >> 3) - 1, 7 - (b.r[i].code & 7), b.r[i].cnt);
+            printf(" %u.%u:%u", (b.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (b.r[i].code & CODE_ORD_MAX), b.r[i].cnt);
         printf(" root %u%s\n", b.root, b.tail ? " +tail" : "");
 #endif
     }
@@ -553,7 +553,7 @@ __device__ __forceinline__ void trace_event(int node, int64_t now, const char *w
         return;
     printf("ev %lld node %d %s port %d chain", (long long)now, node, what, port);
     for (int i = 0; i < RUNS && c.r[i].code; i++)
-        printf(" %u.%u:%u", (c.r[i].code >> 3) - 1, 7 - (c.r[i].code & 7), c.r[i].cnt);
+        printf(" %u.%u:%u", (c.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (c.r[i].code & CODE_ORD_MAX), c.r[i].cnt);
     printf(" root %u%s\n", c.root, c.tail ? " +tail" : "");
 }
 #else
@@ -3156,6 +3156,10 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
             k = 1;
         else if (hz != ~0ull && (int64_t)hz - next < k)
             k = (int64_t)hz - next;
+        // (slots skipped: the horizons may predate a flow fired in this launch, whose start the bound
+        // by send_lat / 2 only keeps beyond the launch right after it)
+        if (next > last + 1)
+            k = 1;
         if (s.max_slots - next < k)
             k = s.max_slots - next;
         *s.gk = k > 1 ? (int)k : 1;
