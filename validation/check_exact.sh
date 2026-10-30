@@ -40,9 +40,11 @@ for w in $1; do
         fi
         out=$OUT/${w}_${t}_$V.csv
         bin=twins
-        if ./build/twins $topo --flows=$fl --out=$out --tcp=$t --ecmp_from=$rf $X 2>&1 > /dev/null | grep -q undecided; then
+        # (TwiNS computes ns-3's ECMP hashes; ECMP_FROM=1 takes them from the reference instead)
+        [ -n "$ECMP_FROM" ] && X="$X --ecmp_from=$rf"
+        if ./build/twins $topo --flows=$fl --out=$out --tcp=$t $X 2>&1 > /dev/null | grep -q undecided; then
             bin=twins128 # undecided ties: longer event histories
-            ./build/twins128 $topo --flows=$fl --out=$out --tcp=$t --ecmp_from=$rf $X > /dev/null 2>&1
+            ./build/twins128 $topo --flows=$fl --out=$out --tcp=$t $X > /dev/null 2>&1
         fi
         paste -d, <(tail -n +2 $rf | cut -d, -f5,6) <(tail -n +2 $out | cut -d, -f5,6) |
             awk -F, -v w=$w -v t=$t -v v=$V -v b=$bin '{n++; if ($1 == $3 && $2 == $4) x++} END {printf "%s %s %s: %d/%d flows identical%s\n", w, t, v, x, n, b == "twins" ? "" : " (twins128)"}'

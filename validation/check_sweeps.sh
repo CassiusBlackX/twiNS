@@ -16,12 +16,12 @@ for s in ${*:-k8 k16}; do
     case $s in
     k8)
         rm -rf out/sweep_k8
-        python3 bench/sweep.py --out out/sweep_k8 --batch 69 --hashes "data/ns3/sweep_k8/{w}_TcpDctcp_q200_K30.csv" | grep -v "^batch [0-9]*: [0-9]* worlds"
+        python3 bench/sweep.py --out out/sweep_k8 --batch 69 | grep -v "^batch [0-9]*: [0-9]* worlds"
         cmp_sweep data/ns3/sweep_k8 out/sweep_k8 ;;
     k16)
         rm -rf out/sweep_k16
         python3 bench/sweep.py --k 16 --workloads k16_a2a30,k16_a2a50w --queues 100,400 --Ks 10,20,40,80 --batch 16 \
-            --out out/sweep_k16 --hashes "data/ns3/sweep_k16/{w}_TcpDctcp_q100_K20.csv" | grep -v "^batch [0-9]*: [0-9]* worlds"
+            --out out/sweep_k16 | grep -v "^batch [0-9]*: [0-9]* worlds"
         cmp_sweep data/ns3/sweep_k16 out/sweep_k16 ;;
     esac
 done

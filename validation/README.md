@@ -6,7 +6,9 @@
 (`--topo=leafspine --leaves --spines --hpl`), reads the same flow files as TwiNS, and gives
 every flow its own TCP connection. FCT is recorded from connection establishment to the ACK of
 the last byte. Each output row also carries ns-3's two ECMP flow hashes (`hash_data,hash_ack`),
-which TwiNS takes with `--ecmp_from`, plus the flow's retransmission count.
+plus the flow's retransmission count. TwiNS computes the same hashes
+(`check_hashes.sh`: all 292 references match). `--ecmp_from` can take them from such a row
+instead.
 
 Parameters (aligned with GeDES, so its model can be compared too):
 
@@ -64,8 +66,8 @@ The run scripts in `ns3/` work in `$NS3_WORK` (default `~/netsim/cmp`). That dir
 
 ## TwiNS against ns-3: identical
 
-With ns-3's hashes (`--ecmp_from`), TwiNS gives every flow the same establishment and
-completion time as ns-3 in all of these runs:
+TwiNS, computing ns-3's ECMP hashes itself (no `--ecmp_from`), gives every flow the same
+establishment and completion time as ns-3 in all of these runs:
 
 | set | flows | TCP | runs | identical flows |
 |---|---|---|---|---|

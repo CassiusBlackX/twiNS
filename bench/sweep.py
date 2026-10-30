@@ -52,8 +52,8 @@ def main():
     ap.add_argument("--workloads", default="k8_a2a30,k8_a2a50w")
     ap.add_argument("--queues", default="100,200,400")
     ap.add_argument("--Ks", default="5,10,20,30,40,60,80,120")
-    ap.add_argument("--hashes", default="data/ns3/ref/{w}_TcpDctcp.csv",
-                    help="an ns-3 output of the same flows (its ECMP hashes; the same for every configuration)")
+    ap.add_argument("--hashes", default="",
+                    help="an ns-3 output of the same flows to take the ECMP hashes from (default: TwiNS computes ns-3's)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     cfg = list(configs(a.workloads.split(","), [int(x) for x in a.queues.split(",")], [int(x) for x in a.Ks.split(",")]))

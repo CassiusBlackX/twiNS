@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "model.h"
+#include "ns3hash.h"
 
 using namespace nsm;
 
@@ -139,6 +140,7 @@ int main(int argc, char **argv)
 {
     int k = 4, graph_k = 64;
     std::string flow_file, output = "fct.csv", tcp = "dctcp", ecmp_from, qtrace_file;
+    int hash_check = 0;
     long long qtrace_until = 0, qtrace_from = 0;
     int host_lanes = 0; // 0: chosen from the host count
     int ooo_segs = 0;   // per-flow caps; 0: default
@@ -172,6 +174,8 @@ int main(int argc, char **argv)
             qtrace_until = std::stoll(val("--qtrace_until="));
         else if (a.rfind("--ecmp_from=", 0) == 0)
             ecmp_from = val("--ecmp_from=");
+        else if (a.rfind("--hash_check=", 0) == 0)
+            hash_check = std::stoi(val("--hash_check="));
         else if (a.rfind("--rtt_ring=", 0) == 0)
             rtt_ring = std::stoi(val("--rtt_ring="));
         else if (a.rfind("--ooo_segs=", 0) == 0)
@@ -253,7 +257,7 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N | --topo=graph --topofile=F)\n"
                         "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--fin=0|1]\n"
-                        "          [--ecmp_from=csv] [--spray=1 [--RngSeed=1 --RngRun=1]]\n"
+                        "          [--ecmp_from=csv [--hash_check=1]] [--spray=1 [--RngSeed=1 --RngRun=1]]\n"
                         "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,ecmp_from=..,out=..)\n"
                         "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
         return 1;
@@ -667,21 +671,57 @@ int main(int argc, char **argv)
             for (int m : conn_msgs[c])
                 conn_bytes[c] += flows[m].size;
         }
-        // ECMP hashes: from an ns-3 run of the same flows (identical paths; a connection's rows
-        // carry its hashes), or a hash of the connection id and direction (statistically equivalent)
-        auto mix = [](uint32_t x) {
-            x ^= x >> 16;
-            x *= 0x7feb352du;
-            x ^= x >> 15;
-            x *= 0x846ca68bu;
-            x ^= x >> 16;
-            return x;
-        };
-        for (int i = 0; i < F; i++)
+        // ECMP hashes, as ns-3 computes them (validation/ns3/twins-ref.cc): Hash32 of the
+        // connection's (src IP, dst IP, TCP, src port, dst port) in either direction.
+        // - A host's IP is 10.(n >> 8).(n & 255).1 with n its link's subnet: the host's index
+        //   (hosts are installed first), or with a topology file its link's place among the links.
+        // - The destination port is the sink's, 1000.
+        // - The source port is the host's next ephemeral port, from 49153, taken as its senders
+        //   bind: in order of their starts, then of their connections (the applications' order).
+        // --ecmp_from=csv takes them from an ns-3 run instead (its rows carry them).
+        bool ecmp_given = false;
+        for (auto &w : worlds)
+            ecmp_given |= !w.ecmp_from.empty();
         {
-            recs[i].hash_data = mix(2u * i + 1);
-            recs[i].hash_ack = mix(2u * i + 2);
+            std::vector<int> hsub(H1);
+            for (int h = 0; h < H1; h++)
+                hsub[h] = h;
+            if (is_graph)
+                for (int i = 0; i < (int)g_links.size(); i++)
+                    if (g_links[i].first >= 0)
+                        hsub[g_links[i].first] = i;
+            auto ip = [&](int h) { return 0x0a000001u | (uint32_t)(hsub[h] & 0xFFFF) << 8; };
+            auto hash = [](uint32_t a, uint32_t b, uint16_t pa, uint16_t pb) {
+                uint8_t k[17] = {(uint8_t)(a >> 24), (uint8_t)(a >> 16), (uint8_t)(a >> 8), (uint8_t)a,
+                                 (uint8_t)(b >> 24), (uint8_t)(b >> 16), (uint8_t)(b >> 8), (uint8_t)b,
+                                 6, (uint8_t)(pa >> 8), (uint8_t)pa, (uint8_t)(pb >> 8), (uint8_t)pb};
+                return ns3_hash32(k, 17);
+            };
+            std::vector<int> byhost(F);
+            for (int c = 0; c < F; c++)
+                byhost[c] = c;
+            std::stable_sort(byhost.begin(), byhost.end(), [&](int a, int b) {
+                const FlowIn &x = flows[conn_msgs[a][0]], &y = flows[conn_msgs[b][0]];
+                return x.src != y.src ? x.src < y.src : x.start_ns < y.start_ns;
+            });
+            for (int i = 0, n = 0; i < F; i++, n++)
+            {
+                const int c = byhost[i];
+                if (i > 0 && recs[byhost[i - 1]].src != recs[c].src)
+                    n = 0;
+                if (n > 65535 - 49153 && !ecmp_given)
+                {
+                    // (the ports wrap around, skipping those in use: --ecmp_from)
+                    fprintf(stderr, "host %d binds more than %d connections: give --ecmp_from\n", recs[c].src % H1, 65535 - 49152);
+                    return 1;
+                }
+                const uint16_t sport = (uint16_t)(49153 + n), dport = 1000;
+                const uint32_t a = ip(recs[c].src % H1), b = ip(recs[c].dst % H1);
+                recs[c].hash_data = hash(a, b, sport, dport);
+                recs[c].hash_ack = hash(b, a, dport, sport);
+            }
         }
+        int hash_same = 0, hash_n = 0;
         for (int w = 0; w < W; w++)
         {
             const std::string &ecmp_from = worlds[w].ecmp_from;
@@ -705,8 +745,12 @@ int main(int argc, char **argv)
                 }
                 if (is_first(i))
                 {
-                    recs[msg_conn[i]].hash_data = (uint32_t)std::stoul(v[6]);
-                    recs[msg_conn[i]].hash_ack = (uint32_t)std::stoul(v[7]);
+                    const uint32_t hd = (uint32_t)std::stoul(v[6]), ha = (uint32_t)std::stoul(v[7]);
+                    FlowRec &r = recs[msg_conn[i]];
+                    hash_n++;
+                    hash_same += r.hash_data == hd && r.hash_ack == ha;
+                    r.hash_data = hd;
+                    r.hash_ack = ha;
                 }
                 i++;
             }
@@ -715,6 +759,12 @@ int main(int argc, char **argv)
                 fprintf(stderr, "%s: %d rows for %d flows\n", ecmp_from.c_str(), i - wfirst[w], n - wfirst[w]);
                 exit(1);
             }
+        }
+        if (hash_check)
+        {
+            // (--hash_check: the computed hashes against --ecmp_from's, then stop)
+            printf("ECMP hashes: %d of %d connections as ns-3's\n", hash_same, hash_n);
+            return hash_same == hash_n ? 0 : 1;
         }
     }
     // per connection: the sent list and the RTT history (one entry per segment in flight; a

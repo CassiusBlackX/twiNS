@@ -1,8 +1,8 @@
 # TwiNS
 
 TwiNS is a GPU packet-level simulator of data-center networks that reproduces **sequential
-ns-3 exactly**. Given ns-3's ECMP hashes, every flow's connection-establishment and completion
-time equals ns-3's, to the nanosecond.
+ns-3 exactly**. Every flow's connection-establishment and completion time equals ns-3's, to the
+nanosecond. TwiNS computes ns-3's ECMP flow hashes itself, so no ns-3 run is needed.
 
 It models:
 - TCP NewReno, DCTCP and Cubic as in ns-3's TcpSocketBase, with ns-3's TcpTxBuffer and
@@ -53,7 +53,7 @@ cmake --build build -j
 
 ```shell
 ./build/twins --k=8 --flows=data/flows/k8_paper.csv --out=fct.csv --tcp=dctcp|newreno|cubic \
-              [--ecmp_from=data/ns3/ref/k8_paper_TcpDctcp.csv] [--ecnK=30] [--queue=200]
+              [--ecnK=30] [--queue=200]
 ./build/twins --topo=leafspine --leaves=16 --spines=8 --hpl=16 --flows=data/flows/ls_paper.csv ...
 ./build/twins --topo=graph --topofile=data/topo/jf32.txt --flows=... [--fail=300000:s2:s10,700000:s2:s10:up]
 ./build/twins --k=8 --flows=... --spray=1 [--RngRun=1]   # per-packet ECMP
@@ -80,11 +80,19 @@ cmake --build build -j
   instant (`Ipv4::SetDown` + `RecomputeRoutingTables` in ns-3).
 - **Output** has the columns of the ns-3 scenario: `src,dst,flow_size,start_ns,established_ns,completed_ns`.
   FCT is `completed_ns - established_ns`.
-- **`--ecmp_from`** takes an ns-3 output of the same flows. Its `hash_data,hash_ack` columns make
-  every flow take ns-3's path. Without it, flows are hashed independently. The statistics are
-  the same, but per-flow paths and results differ.
+- **ECMP hashes.** Per-flow ECMP picks a route by ns-3's flow hash: `Hash32` (Murmur3) of the
+  connection's source and destination IP, protocol and ports, in each direction. TwiNS
+  computes them as ns-3 assigns these values in the reference scenario:
+  - a host's IP is `10.(n>>8).(n&255).1`, with `n` its link's subnet;
+  - the sink's port is 1000;
+  - each sender binds the host's next ephemeral port, from 49153, in order of start time, then
+    of connection.
+
+  `validation/check_hashes.sh` compares them with every stored ns-3 output: all 292 match.
+  `--ecmp_from=csv` takes the hashes from an ns-3 output of the same flows instead (its
+  `hash_data,hash_ack` columns), and `--hash_check=1` only compares the two and exits.
 - **`--worlds`**: each line of a worlds file is one simulation, for example
-  `flows=a.csv,tcp=cubic,ecnK=40,queue=100,ecmp_from=ref.csv,out=o.csv`. The worlds run side by
+  `flows=a.csv,tcp=cubic,ecnK=40,queue=100,out=o.csv` (`ecmp_from=` is optional). The worlds run side by
   side as disjoint copies of the topology, and each world's output equals its standalone run.
   `bench/sweep.py` builds such batches for parameter grids.
 - **Counters:** the last output line reports `tx-cap`, `active-ovf`, `ooo-ovf`, `due-ovf`, `rtt-ovf`
