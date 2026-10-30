@@ -1,9 +1,12 @@
 #include "astra/frontend.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
+#include <utility>
 
 #include "SimCCL/mock/MockNcclLog.h"
 #include "astra-sim/system/RecvPacketEventHadndlerData.hh"
@@ -12,6 +15,35 @@
 
 namespace astra
 {
+
+// entry.h's state, and what the calls of AstraNetworkAPI do with it
+struct Frontend::Impl
+{
+    struct Task
+    {
+        int src, dest;
+        uint64_t count;
+        void *fun_arg;
+        void (*msg_handler)(void *);
+    };
+    using PK = std::pair<int, std::pair<int, int>>;
+    static PK pk(int a, int b, int c) { return {a, {b, c}}; }
+    std::vector<AstraSim::ncclFlowTag> flow_tags;
+    std::map<std::pair<std::pair<int, int>, int>, AstraSim::ncclFlowTag> receiver_pending_queue;
+    std::map<PK, Task> expeRecvHash, sentHash;
+    std::map<PK, uint64_t> recvHash, received_chunksize, sent_chunksize;
+    std::map<PK, int> waiting_to_sent_callback, waiting_to_notify_receiver;
+    std::vector<AstraSim::AstraNetworkAPI *> networks;
+    std::vector<AstraSim::Sys *> systems;
+    void add_timer(Frontend *f, AstraSim::timespec_t delta, void (*fn)(void *), void *arg);
+    void send(Frontend *f, int rank, int dst, uint64_t count, int tag, AstraSim::sim_request *req, void (*h)(void *), void *arg);
+    void recv(int rank, int src, uint64_t count, void (*h)(void *), void *arg);
+    void notify_receiver(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag);
+    void notify_sender(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag);
+};
+using PK = Frontend::Impl::PK;
+using Task = Frontend::Impl::Task;
+static PK pk(int a, int b, int c) { return Frontend::Impl::pk(a, b, c); }
 
 class Net : public AstraSim::AstraNetworkAPI
 {
@@ -33,20 +65,20 @@ class Net : public AstraSim::AstraNetworkAPI
         t.time_val = (double)f->now;
         return t;
     }
-    void sim_schedule(AstraSim::timespec_t delta, void (*fn)(void *), void *arg) override { f->add_timer(delta, fn, arg); }
+    void sim_schedule(AstraSim::timespec_t delta, void (*fn)(void *), void *arg) override { f->x->add_timer(f, delta, fn, arg); }
     int sim_send(void *, uint64_t count, int, int dst, int tag, AstraSim::sim_request *req, void (*h)(void *), void *arg) override
     {
-        f->send(rank, dst, count, tag, req, h, arg);
+        f->x->send(f, rank, dst, count, tag, req, h, arg);
         return 0;
     }
     int sim_recv(void *, uint64_t count, int, int src, int, AstraSim::sim_request *, void (*h)(void *), void *arg) override
     {
-        f->recv(rank, src, count, h, arg);
+        f->x->recv(rank, src, count, h, arg);
         return 0;
     }
 };
 
-Frontend::Frontend(const std::string &topo, const std::string &workload, Network *n) : net(n)
+Frontend::Frontend(const std::string &topo, const std::string &workload, Network *n) : x(new Impl), net(n)
 {
     std::ifstream in(topo);
     int node_num, switch_num, link_num;
@@ -70,8 +102,8 @@ Frontend::Frontend(const std::string &topo, const std::string &workload, Network
         auto *sys = new AstraSim::Sys(net_j, nullptr, j, 0, 1, {nodes_num}, {1}, "", workload, 1, 1, 1, 1, 0, "./ncclFlowModel_", "test1", true, false, gt, {gpu_num}, nvs, gpus_per_server);
         sys->nvswitch_id = j < gpu_num ? gpu_num + j / gpus_per_server : j;
         sys->num_gpus = nodes_num - nvswitch_num;
-        networks.push_back(net_j);
-        systems.push_back(sys);
+        x->networks.push_back(net_j);
+        x->systems.push_back(sys);
     }
 }
 
@@ -79,8 +111,8 @@ void Frontend::fire()
 {
     cur = Cause{'m', -1};
     ord = 0;
-    for (auto *s : systems)
-        ((AstraSim::Sys *)s)->workload->fire();
+    for (auto *s : x->systems)
+        s->workload->fire();
 }
 
 void Frontend::run_timer()
@@ -92,44 +124,43 @@ void Frontend::run_timer()
     timers[q.id].fn(timers[q.id].arg);
 }
 
-void Frontend::add_timer(AstraSim::timespec_t delta, void (*fn)(void *), void *arg)
+void Frontend::Impl::add_timer(Frontend *f, AstraSim::timespec_t delta, void (*fn)(void *), void *arg)
 {
-    int64_t id = (int64_t)timers.size();
+    int64_t id = (int64_t)f->timers.size();
     Timer t;
     t.delay = (int64_t)delta.time_val;
-    t.t = now + t.delay;
-    t.uid = next_uid++;
+    t.t = f->now + t.delay;
+    t.uid = f->next_uid++;
     t.fn = fn;
     t.arg = arg;
-    t.cause = cur;
-    t.ord = ord++;
-    timers.push_back(t);
-    timers_q.push(TQ{t.t, t.uid, id});
-    net->timer_added(id, t);
+    t.cause = f->cur;
+    t.ord = f->ord++;
+    f->timers.push_back(t);
+    f->timers_q.push(TQ{t.t, t.uid, id});
+    f->net->timer_added(id, t);
 }
 
 // entry.h's SendFlow; the port is the network's, a QP's tag the flow's own
-void Frontend::send(int rank, int dst, uint64_t count, int tag, AstraSim::sim_request *req, void (*h)(void *), void *arg)
+void Frontend::Impl::send(Frontend *fe, int rank, int dst, uint64_t count, int tag, AstraSim::sim_request *req, void (*h)(void *), void *arg)
 {
     sentHash[pk(tag, rank, dst)] = Task{rank, dst, count, arg, h};
     Flow f;
     f.src = rank;
     f.dst = dst;
     f.size = count ? count : 1;
-    f.tag = tag;
-    f.flow_tag = req->flowTag;
-    f.cause = cur;
-    f.ord = ord++;
-    f.t = now;
-    waiting_to_sent_callback[pk(f.flow_tag.current_flow_id, rank, dst)]++;
-    waiting_to_notify_receiver[pk(f.flow_tag.current_flow_id, rank, dst)]++;
-    int64_t id = (int64_t)flows.size();
-    flows.push_back(f);
-    net->flow_added(id, flows.back());
+    f.cause = fe->cur;
+    f.ord = fe->ord++;
+    f.t = fe->now;
+    waiting_to_sent_callback[pk(req->flowTag.current_flow_id, rank, dst)]++;
+    waiting_to_notify_receiver[pk(req->flowTag.current_flow_id, rank, dst)]++;
+    int64_t id = (int64_t)fe->flows.size();
+    fe->flows.push_back(f);
+    flow_tags.push_back(req->flowTag);
+    fe->net->flow_added(id, f);
 }
 
 // AstraSimNetwork.cc's sim_recv
-void Frontend::recv(int rank, int src, uint64_t count, void (*h)(void *), void *arg)
+void Frontend::Impl::recv(int rank, int src, uint64_t count, void (*h)(void *), void *arg)
 {
     Task t{src, rank, count, arg, h};
     auto *ehd = (AstraSim::RecvPacketEventHadndlerData *)arg;
@@ -167,7 +198,7 @@ void Frontend::recv(int rank, int src, uint64_t count, void (*h)(void *), void *
 }
 
 // entry.h's notify_receiver_receive_data
-void Frontend::notify_receiver(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag)
+void Frontend::Impl::notify_receiver(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag)
 {
     int t = tag.tag_id;
     PK k = pk(t, sender, receiver);
@@ -205,7 +236,7 @@ void Frontend::notify_receiver(int sender, int receiver, uint64_t size, const As
 }
 
 // entry.h's notify_sender_sending_finished
-void Frontend::notify_sender(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag)
+void Frontend::Impl::notify_sender(int sender, int receiver, uint64_t size, const AstraSim::ncclFlowTag &tag)
 {
     PK k = pk(tag.tag_id, sender, receiver);
     auto it = sentHash.find(k);
@@ -226,15 +257,16 @@ void Frontend::qp_finish(int64_t id)
 {
     begin(Cause{'r', id});
     const Flow f = flows[id];
-    PK k = pk(f.flow_tag.current_flow_id, f.src, f.dst);
-    received_chunksize[k] += f.size;
-    auto w = waiting_to_notify_receiver.find(k);
-    if (w == waiting_to_notify_receiver.end() || --w->second != 0)
+    const AstraSim::ncclFlowTag tag = x->flow_tags[id];
+    PK k = pk(tag.current_flow_id, f.src, f.dst);
+    x->received_chunksize[k] += f.size;
+    auto w = x->waiting_to_notify_receiver.find(k);
+    if (w == x->waiting_to_notify_receiver.end() || --w->second != 0)
         return;
-    waiting_to_notify_receiver.erase(w);
-    uint64_t size = received_chunksize[k];
-    received_chunksize.erase(k);
-    notify_receiver(f.src, f.dst, size, f.flow_tag);
+    x->waiting_to_notify_receiver.erase(w);
+    uint64_t size = x->received_chunksize[k];
+    x->received_chunksize.erase(k);
+    x->notify_receiver(f.src, f.dst, size, tag);
 }
 
 // entry.h's send_finish
@@ -242,15 +274,68 @@ void Frontend::send_finish(int64_t id)
 {
     begin(Cause{'s', id});
     const Flow f = flows[id];
-    PK k = pk(f.flow_tag.current_flow_id, f.src, f.dst);
-    sent_chunksize[k] += f.size;
-    auto w = waiting_to_sent_callback.find(k);
-    if (w == waiting_to_sent_callback.end() || --w->second != 0)
+    const AstraSim::ncclFlowTag tag = x->flow_tags[id];
+    PK k = pk(tag.current_flow_id, f.src, f.dst);
+    x->sent_chunksize[k] += f.size;
+    auto w = x->waiting_to_sent_callback.find(k);
+    if (w == x->waiting_to_sent_callback.end() || --w->second != 0)
         return;
-    waiting_to_sent_callback.erase(w);
-    uint64_t size = sent_chunksize[k];
-    sent_chunksize.erase(k);
-    notify_sender(f.src, f.dst, size, f.flow_tag);
+    x->waiting_to_sent_callback.erase(w);
+    uint64_t size = x->sent_chunksize[k];
+    x->sent_chunksize.erase(k);
+    x->notify_sender(f.src, f.dst, size, tag);
+}
+
+namespace
+{
+struct Stub : Network
+{
+    struct Ev
+    {
+        int64_t t;
+        uint64_t seq;
+        int64_t flow;
+        bool recv;
+        bool operator<(const Ev &o) const { return t != o.t ? t > o.t : seq > o.seq; }
+    };
+    std::priority_queue<Ev> q;
+    uint64_t seq = 0;
+    double gbps = 400;
+    void flow_added(int64_t id, const Flow &f) override
+    {
+        int64_t tx = 3000 + (int64_t)((double)f.size * 8 / gbps) + 1000;
+        q.push(Ev{f.t + tx, seq++, id, false});
+        q.push(Ev{f.t + tx + 1000, seq++, id, true});
+    }
+};
+} // namespace
+
+StubStats stub_run(const std::string &topo, const std::string &workload, double gbps, std::vector<Flow> *flows)
+{
+    Stub net;
+    net.gbps = gbps;
+    auto t0 = std::chrono::steady_clock::now();
+    Frontend fe(topo, workload, &net);
+    fe.fire();
+    auto t1 = std::chrono::steady_clock::now();
+    while (!fe.finished && (fe.has_timer() || !net.q.empty()))
+    {
+        if (fe.has_timer() && (net.q.empty() || fe.next_timer() <= net.q.top().t))
+            fe.run_timer();
+        else
+        {
+            auto e = net.q.top();
+            net.q.pop();
+            fe.now = e.t;
+            if (e.recv)
+                fe.qp_finish(e.flow);
+            else
+                fe.send_finish(e.flow);
+        }
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    *flows = fe.flows;
+    return StubStats{fe.timers.size(), fe.callbacks, fe.now, fe.finished, std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count()};
 }
 
 } // namespace astra

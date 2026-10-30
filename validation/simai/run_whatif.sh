@@ -4,11 +4,11 @@
 # with nohup. Then, per run, trace2dag.py gives w_*/run.{dag,ref}; the trace stays on a87.
 cd ~/netsim/aiwork
 mem=$1 tmo=$2; shift 2
-LOADS="mar:microAR_tp128.txt:128 moe:moe_16.txt:16 ar64:paper/c_allreduce_64m_128.txt:128 llp:paper/llama_65b_probe_128.txt:128"
+LOADS=${LOADS:-mar:microAR_tp128.txt:128 moe:moe_16.txt:16 ar64:paper/c_allreduce_64m_128.txt:128 llp:paper/llama_65b_probe_128.txt:128 a2a:paper/c_alltoall_64m_128.txt:128}
 topo() { # CONFIG GPUS
     case $1 in
     hpn) echo AlibabaHPN_$2g_8gps_DualToR_SinglePlane_200Gbps_H100 ;;
-    dcn) echo DCN+SingleToR_$2g_8gps_200Gbps_A100 ;;
+    dcn*) echo DCN+SingleToR_$2g_8gps_200Gbps_A100 ;;
     g200) echo Spectrum-X_$2g_8gps_200Gbps_H100 ;;
     *) echo Spectrum-X_$2g_8gps_400Gbps_H100 ;;
     esac

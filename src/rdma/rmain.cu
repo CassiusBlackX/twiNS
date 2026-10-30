@@ -15,6 +15,9 @@
 // sent in them can arrive in them: the shortest delay of the in-links without NVLink (a server's
 // NVLink counts while it is busy, or up to its next NVLink flow) and half of send_lat (default
 // 32; 0: off, and off where that bound is a single slot or with --win; no ranks ahead with it)
+// twins-ai: --astra=WORKLOAD: no flows or recording, astra-sim's system layer runs on the host
+// (src/astra/closed.h); --dag-out=F: its actions as a traced DAG; --flows-cache=F: its flows, kept
+// (they depend on the workload and the GPUs only: the runs of other configurations skip the stub)
 // --dcap=N: DAG messages a slot holds (default 4096; when they overflow, the run starts again with
 // 4x, unless --dcap was given)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
@@ -51,6 +54,9 @@
 #include <unistd.h>
 #include <vector>
 #include "rstep.cuh"
+#if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__)
+#define TWINS_ASTRA_HOST
+#endif
 
 using namespace rdma;
 using std::string;
@@ -221,6 +227,10 @@ struct World
     vector<Chain> troot;
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
+
+#ifdef TWINS_ASTRA_HOST
+#include "astra/closed.h"
+#endif
 
 // a traced DAG (docs/ai/dag.md): its actions by cause; main's, and their timers', expanded here
 struct TracedOn
@@ -757,6 +767,10 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
             w.ch_list.insert(w.ch_list.end(), ch[g].begin(), ch[g].end());
         }
         int64_t t0 = -1;
+#ifdef TWINS_ASTRA_HOST
+        if (g_cl)
+            g_cl->world(w, (int64_t)cfg.num("SEND_LAT_NS", 3000));
+#endif
         if (!ons.empty() && !traced_dag(w, ons, !deps.empty(), (int64_t)cfg.num("SEND_LAT_NS", 3000)))
             return false;
         for (size_t i = 0; i < fi.size() && !w.traced; i++)
@@ -968,6 +982,9 @@ int main(int argc, char **argv)
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
     bool tail_set = false;
+#ifdef TWINS_ASTRA_HOST
+    string astra_wl, astra_dag, astra_cache;
+#endif
     int dcap = 4096, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
     for (int i = 2; i < argc; i++)
     {
@@ -1016,6 +1033,14 @@ int main(int argc, char **argv)
         }
         else if (k == "--gwin")
             gwin = std::max(0, std::min(255, atoi(v.c_str())));
+#ifdef TWINS_ASTRA_HOST
+        else if (k == "--astra")
+            astra_wl = v;
+        else if (k == "--dag-out")
+            astra_dag = v;
+        else if (k == "--flows-cache")
+            astra_cache = v;
+#endif
         else if (k == "--dcap")
         {
             dcap = std::max(16, atoi(v.c_str()));
@@ -1061,6 +1086,15 @@ int main(int argc, char **argv)
     };
     if (batch_file.empty())
     {
+#ifdef TWINS_ASTRA_HOST
+        // the system layer runs here: its flows come from a run of it on a stub network
+        if (!astra_wl.empty())
+        {
+            flow_file = !astra_cache.empty() ? astra_cache : out_file + ".flows.dag";
+            if (!closed_prepare(topo_file, astra_wl, flow_file, astra_dag, !astra_cache.empty()))
+                return 1;
+        }
+#endif
         simai_link0(topo_file, &bps, &delay); // a SimAI topology gives the rate and delay
         worlds.emplace_back();
         worlds[0].name = "run";
@@ -1503,6 +1537,15 @@ int main(int argc, char **argv)
         s.act_off = dev_copy(act_off);
         s.act = dev_copy(act);
         s.tdelay = dev_copy(tdelay);
+#ifdef TWINS_ASTRA_HOST
+        if (g_cl)
+        {
+            g_cl->setup(s, send_lat_slots(s.send_lat, D));
+            s.tchain = dev_alloc<Chain>(Closed::TCAP);
+            g_cl->init_timers(s.tchain);
+        }
+        else
+#endif
         s.tchain = dev_alloc<Chain>(T);
         s.ttime = dev_alloc<int64_t>(T);
         s.tnext = dev_alloc<int>(T);
@@ -1817,6 +1860,11 @@ int main(int argc, char **argv)
     for (int x = 0; x < S; x++)
         ranks |= rk_ok[x] != 0;
     const int GS = 64;
+#ifdef TWINS_ASTRA
+    // the closed loop's graph while windows run (the limit comes sooner than its last launch); GS
+    // while a server's NVLink keeps launches to a slot each
+    const int GS_win = 8;
+#endif
     const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = gw ? sw_ints(s.kb) * sizeof(int) : per_sw(s.kb);
     auto big_k = gw ? rdma_slot_big<true> : rdma_slot_big<false>;
     auto slot_k = s.nm ? rdma_slot<true> : rdma_slot<false>;
@@ -1830,10 +1878,10 @@ int main(int argc, char **argv)
     // joins cost launches tens of us); the next 64 slots run with it while the last ones' wide
     // switches met ties their prefixes left open (ev[34]: about a chain walk each, on the slot's
     // critical path) at more than one in 4 slots
-    auto capture = [&](bool ranks, hipGraphExec_t *ge) {
+    auto capture = [&](bool ranks, hipGraphExec_t *ge, int gs = GS) {
     hipGraph_t graph;
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
-    for (int i = 0; i < GS; i++)
+    for (int i = 0; i < gs; i++)
     {
         if (s.ns_b)
         {
@@ -1869,6 +1917,10 @@ int main(int argc, char **argv)
     CK(hipMemcpyToSymbol(HIP_SYMBOL(c_sim), &s, sizeof(Sim))); // (the kernels' Sim: it does not change from here)
     hipGraphExec_t g_plain, g_rank = nullptr;
     capture(false, &g_plain);
+#ifdef TWINS_ASTRA
+    hipGraphExec_t g_win = nullptr;
+    capture(false, &g_win, GS_win);
+#endif
     if (ranks)
         capture(true, &g_rank);
     bool use_rank = false;
@@ -1896,6 +1948,19 @@ int main(int argc, char **argv)
             printf("persistent: %d blocks, %d per CU fit on %d CUs\n", nb, per_cu, prop.multiProcessorCount);
     }
     const int PS = 4096; // (slots per persistent launch)
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl)
+    {
+        g_cl->run(s, sa, D, [&](int k) {
+            if (persist)
+                persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(PS);
+            else
+                CK(hipGraphLaunch(k > 1 ? g_win : g_plain, sa));
+            launches += persist ? PS : k > 1 ? GS_win : GS;
+        });
+        fin = 1;
+    }
+#endif
     while (!fin && persist)
     {
         persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(PS);
@@ -1941,6 +2006,13 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < worlds[wi].fi.size(); i++)
         {
             int g = fbase[wi] + i;
+#ifdef TWINS_ASTRA_HOST
+            if (g_cl && fct[g] >= 0) // (by the order the system layer made them in: a recording's)
+            {
+                fprintf(fo, "%d %lld %lld\n", g_cl->fe_of[g], (long long)fi[g].start, (long long)fct[g]);
+                continue;
+            }
+#endif
             if (fct[g] >= 0)
                 fprintf(fo, "%zu %lld %lld\n", i, (long long)fi[g].start, (long long)fct[g]);
         }
@@ -1967,6 +2039,11 @@ int main(int argc, char **argv)
     }
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl)
+        g_cl->report();
+    else
+#endif
     if (s.traced && W == 1)
     {
         // the run's end: the last timer fired (a timer fired on the host, by main's actions, is
@@ -2055,5 +2132,14 @@ int main(int argc, char **argv)
         execv("/proc/self/exe", pv.data());
         perror("execv");
     }
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl)
+    {
+        // (no atexit: Sys's own expects ns-3's exit)
+        fflush(stdout);
+        fflush(stderr);
+        _exit(bad ? 3 : done == (unsigned)F ? 0 : 2);
+    }
+#endif
     return bad ? 3 : done == (unsigned)F ? 0 : 2; // (2: flows unfinished at the stop time)
 }

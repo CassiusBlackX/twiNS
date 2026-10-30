@@ -515,6 +515,16 @@ struct Sim
     uint16_t *pcnt;
     const int *wh_base, *wh_n;
     const int64_t *wp_off;
+#ifdef TWINS_ASTRA
+    // the closed loop with astra-sim (src/astra/closed.h)
+    struct ClCtl *cl;
+    struct CEvH *cev_h;
+    Chain *cev_c;
+    unsigned long long cev_mask;
+    const struct CAct *cact;
+    struct CSort *cs;
+    int cl_span;
+#endif
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;
     unsigned long long *tx_cnt, tx_cap;
@@ -545,6 +555,43 @@ struct DAct
     uint32_t child, ord;
 };
 constexpr uint32_t DACT_TIMER = 1u << 31;
+#ifdef TWINS_ASTRA
+// The closed loop with astra-sim on the host (src/astra/closed.h). A completion (a QpComplete or a
+// SendComplete) is recorded for the host; its chain stays in cev_c for the actions of its callback.
+struct CEvH
+{
+    int64_t t;
+    int32_t flow;
+    uint32_t kind; // 0 QpComplete, 1 SendComplete
+    uint32_t base; // ordinals its event had used
+    uint32_t code; // its chain's first code (the lead: its order among timers of its time)
+};
+// an action of a callback, for closed_apply: a flow installed or a timer scheduled (DACT_TIMER | its
+// place in tchain), from a completion (its place in cev_c) or a timer (DACT_TIMER | its place)
+struct CAct
+{
+    uint32_t child, parent, ord, pad;
+    int64_t t, delay;
+};
+struct ClCtl
+{
+    unsigned long long head;  // completions recorded
+    unsigned long long seen;  // of them, those the host has read
+    unsigned long long floor; // the oldest it still needs
+    int64_t limit;            // launches run no slot from here on
+    int64_t cap;              // the slot of the host's next event (INT64_MAX: none)
+    int idle;                 // nothing on the way, nothing due, nothing for the host
+    int cmp;                  // closed_cmp's result
+    int k;                    // the next launch's slots (the static bound clamped by the horizons)
+    int pad;
+};
+// a completion among those of its time: rank among [g0, g1)
+struct CSort
+{
+    uint32_t j;
+    int g0, g1, rank;
+};
+#endif
 // a host pair's devices: towards b, those a queue pair of a picks from (GetNicIdxOfQp), and those
 // a's receiving queue pair from b picks from (GetNicIdxOfRxQp)
 struct PairNic

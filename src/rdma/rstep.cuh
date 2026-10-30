@@ -601,6 +601,27 @@ __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI
     s.pend[fmod(s.fpend, a)] = 1;
 }
 
+#ifdef TWINS_ASTRA
+// a completion for the host; the chain is the event's
+__device__ __noinline__ void closed_rec(const Sim &s, int64_t t, int flow, int kind, int base, const Chain &E)
+{
+    unsigned long long i = atomicAdd(&s.cl->head, 1ull);
+    if (i - s.cl->floor > s.cev_mask)
+    {
+        atomicAdd(&s.ev[37], 1ull);
+        return;
+    }
+    const unsigned long long j = i & s.cev_mask;
+    s.cev_c[j] = E;
+    CEvH &h = s.cev_h[j];
+    h.t = t;
+    h.flow = flow;
+    h.kind = kind;
+    h.base = base;
+    h.code = E.r[0].code;
+}
+#endif
+
 // Flow g's dependency of kind k (0 received: its QpComplete; 1 sent: its first SendComplete) fired
 // in an event at tE with chain E; base: the ordinals the event had used. Each child of that kind
 // is installed in it (SendFlow), the i-th with ordinal base + i (its index among the event's
@@ -881,7 +902,11 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
             {
                 Chain e;
                 cpush(&e, ccode(tx, k), c.cur);
+#ifdef TWINS_ASTRA
+                closed_rec(s, c.now + tx, p.flow, 1, 0, e);
+#else
                 dag_fire(s, p.flow, 1, c.now + tx, e, 0);
+#endif
             }
         }
     }
@@ -1224,8 +1249,15 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         atomicAdd(s.flows_done, 1u);
         if (s.fi[f].fast)
             atomicSub(&s.srv_fact[s.h_srv[c.h]], 1);
+#ifdef TWINS_ASTRA
+        // (the ACK event's next events follow its callback's: their order is what counts, and the
+        // callback's actions are not known yet)
+        closed_rec(s, c.now, f, 0, c.ord, c.cur);
+        c.ord += CODE_ORD_MAX / 2 + 1;
+#else
         if (s.dag)
             c.ord += dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event's next events follow its callback's)
+#endif
     }
     if (p.kind == K_NACK)
         q.snd_nxt = q.snd_una;
@@ -3113,8 +3145,14 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
         return;
     __threadfence();
     unsigned int fd = atomicAdd(s.flows_done, 0u);
+#ifdef TWINS_ASTRA
+    (void)fd; // (the host ends the run: the system layer has the last word)
+    if (slot + nsl >= s.max_slots)
+        *s.finished = 1;
+#else
     if (fd >= (unsigned int)s.F || slot + nsl >= s.max_slots)
         *s.finished = 1;
+#endif
     // idle skip: nothing sent and nothing queued in this slot: go on at the slot of the earliest
     // host event or arrival (this slot's arrivals are read: its pending flag is cleared)
     unsigned int cur = atomicAdd(&s.activity[0], 0u);
@@ -3127,6 +3165,9 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     }
     const int64_t last = slot + nsl - 1;
     int64_t next = last + 1;
+#ifdef TWINS_ASTRA
+    s.cl->idle = 0;
+#endif
     if (cur == 0)
     {
         int64_t ws = nw != ~0ull ? (int64_t)fdiv(s.fD, nw) : INT64_MAX;
@@ -3136,6 +3177,21 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
                 ws = last + i < ws ? last + i : ws;
                 break;
             }
+#ifdef TWINS_ASTRA
+        // a jump only with nothing for the host to answer: up to the network's next event or the
+        // host's; the slots after it are safe as those after a sync
+        if (s.cl->head == s.cl->seen)
+        {
+            const int64_t cap = s.cl->cap, to = ws < cap ? ws : cap;
+            if (to == INT64_MAX)
+                s.cl->idle = 1;
+            else if (to > next)
+            {
+                next = to < s.max_slots ? to : s.max_slots;
+                s.cl->limit = next + s.cl_span;
+            }
+        }
+#else
         if (ws != INT64_MAX && ws > next)
             next = ws < s.max_slots ? ws : s.max_slots;
         // quiescent: nothing ran, nothing is due and nothing is on its way (every frame in flight
@@ -3144,6 +3200,7 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
         // causes never come, or a deadlock), instead of stepping through empty slots
         if (ws == INT64_MAX)
             *s.finished = 1;
+#endif
     }
     if (s.gwin)
     {
@@ -3162,7 +3219,14 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
             k = 1;
         if (s.max_slots - next < k)
             k = s.max_slots - next;
+#ifdef TWINS_ASTRA
+        if (s.cl->limit - next < k)
+            k = s.cl->limit - next;
+#endif
         *s.gk = k > 1 ? (int)k : 1;
+#ifdef TWINS_ASTRA
+        s.cl->k = *s.gk;
+#endif
     }
 #ifdef RDMA_PROF
     s.ev[18] += s.ev[16];
@@ -3391,7 +3455,11 @@ __device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, 
     *gk = s.gwin ? *s.gk : 1;
     // (keeps the loads above the branch: issued together, not one after the other)
     asm volatile("" ::"v"(bi->e), "v"(bi->deg), "v"(bi->base), "v"(bi->link0), "v"((int)*slot), "v"((int)(*slot >> 32)), "v"(*gk));
+#ifdef TWINS_ASTRA
+    return !fin && *slot < s.cl->limit;
+#else
     return !fin;
+#endif
 }
 template <bool MULTI>
 __global__ void __launch_bounds__(BLOCK) rdma_slot()
@@ -3553,6 +3621,10 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
         int64_t slot = *(volatile int64_t *)s.slot;
         if (*(volatile int *)s.finished)
             return;
+#ifdef TWINS_ASTRA
+        if (slot >= *(volatile int64_t *)&s.cl->limit)
+            return;
+#endif
         // (slot_end writes the slots before the slot)
         const int gk = s.gwin ? *(volatile int *)s.gk : 1;
         slot_entity<MULTI>(s, b, bi, slot, smem, gk);
@@ -3575,5 +3647,71 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
         __syncthreads();
     }
 }
+
+#ifdef TWINS_ASTRA
+// a sync's actions in the order they were made (a timer's chain before its children's), then the
+// host's bounds on what runs next. On one lane: they are few, and chains build on each other.
+__global__ void closed_apply(int n, int64_t limit, int64_t cap, int single, unsigned long long seen, unsigned long long floor)
+{
+    const Sim &s = c_sim;
+    for (int i = 0; i < n; i++)
+    {
+        const CAct a = s.cact[i];
+        const Chain &E = a.parent & DACT_TIMER ? s.tchain[a.parent & ~DACT_TIMER] : s.cev_c[a.parent];
+        if (a.child & DACT_TIMER)
+            cpush(&s.tchain[a.child & ~DACT_TIMER], ccode(a.delay, a.ord), E);
+        else
+            dag_msg(s, a.child, a.t, a.t, E, a.ord);
+    }
+    ClCtl &c = *s.cl;
+    c.limit = limit;
+    c.cap = cap;
+    c.seen = seen;
+    c.floor = floor;
+    if (single && s.gwin)
+        *s.gk = 1; // (a flow fired since the horizons were read)
+}
+
+// a timer against a completion of its time and lead: their chains decide (in cl->cmp)
+__global__ void closed_cmp(int tslot, int j)
+{
+    const Sim &s = c_sim;
+    bool inexact;
+    int c = ccmp(s, 0, s.tchain[tslot], 0, s.cev_c[j], &inexact);
+    if (inexact)
+        atomicAdd(&s.ev[9], 1ull);
+    if (c == 0)
+        atomicAdd(&s.ev[8], 1ull);
+    s.cl->cmp = c;
+}
+
+// the order of the completions of one time, as ccmp decides it
+__global__ void closed_sort(int n)
+{
+    const Sim &s = c_sim;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n)
+        return;
+    CSort &x = s.cs[e];
+    int r = 0;
+    for (int j = x.g0; j < x.g1; j++)
+    {
+        if (j == e)
+            continue;
+        bool inexact;
+        int c = ccmp(s, 0, s.cev_c[s.cs[j].j], 0, s.cev_c[x.j], &inexact);
+        if (inexact)
+            atomicAdd(&s.ev[9], 1ull);
+        if (c == 0)
+        {
+            atomicAdd(&s.ev[8], 1ull);
+            c = j < e ? -1 : 1;
+        }
+        if (c < 0)
+            r++;
+    }
+    x.rank = r;
+}
+#endif
 
 } // namespace rdma
