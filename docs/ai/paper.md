@@ -1,20 +1,22 @@
 # TwiNS against SimAI on the SimAI paper's workloads
 
-**Status.** In progress. Larger training runs (512 GPUs) are still running on a87.
-
-**Result so far.**
-- 37 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
-- All 37 are identical to SimAI: every message's start and completion, to the nanosecond.
+**Result.**
+- 42 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
+- All 42 are identical to SimAI: every message's start and completion, to the nanosecond.
 - Past 2^32 events, the reference is SimAI with 64-bit event uids. SimAI's own 32-bit uids wrap
   there and reorder simultaneous events; see below.
 - That includes:
   - full-size training iterations: GPT-3 13B, LLaMA 65B (PP 2) and GPT-3 175B (PP 8) at 128
     GPUs, up to 5.97 M messages;
+  - training at 512 and 1024 GPUs (mid and probe sizes), up to 11.2 M messages (GPT-3 175B probe
+    at 1024 GPUs);
   - 1024-GPU AlibabaHPN, whose switches have 248 ports.
 - Against SimAI on one core, TwiNS on an RX 9060 XT is:
   - 4–55× faster on collectives;
   - 6–13× faster on 128-GPU training;
-  - 16–21× faster on 512-GPU training probes.
+  - 15–28× faster on 512- and 1024-GPU training.
+- SimAI's single-threaded runs take up to 6.5 h (GPT-3 175B probe at 1024 GPUs); TwiNS's take
+  14 min.
 
 ## Workloads
 
@@ -97,6 +99,11 @@ there is one, else the traced one.
 | llama_65b_probe_hpn512 | 1781248 | 1781248 | 153.75 | 3526.2 | — | 10.1 | 170.1 | 20.7× |
 | llama_65b_mid_hpn512 | 2698752 | 2698752 | 244.28 | 5380.8 | — | 11.5 | 260.4 | 20.7× |
 | gpt3_13b_probe_hpn1024 | 2172928 | 2172928 | 80.32 | 6139.4 | — | 16.5 | 334.1 | 18.4× |
+| gpt3_13b_mid_hpn1024 | 2271232 | 2271232 | 184.44 | 16032.2 | — | 16.8 | 736.6 | 21.8× |
+| llama_65b_mid_hpn1024 | 5463040 | 5463040 | 338.37 | 12517.3 | — | 18.8 | 446.0 | 28.1× |
+| gpt3_175b_probe_hpn1024 | 11197440 | 11197440 | 527.91 | 23325.9 | — | 27.7 | 844.8 | 27.6× |
+| gpt3_13b_mid_hpn512 | 611328 | 611328 | 175.93 | 7156.8 | — | 9.1 | 474.7 | 15.1× |
+| llama_65b_probe_hpn1024 | 3628032 | 3628032 | 183.12 | 7026.8 | — | 16.0 | 273.1 | 25.7× |
 
 ## What sets the speedup
 
@@ -168,6 +175,16 @@ The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
 - `00743b5`: global windows. Each NVSwitch files its server's NVLink horizon. An NVLink flow that
   starts during a launch forces the next launch to one slot: a race that `g_sx16_ring` and
   `d_sx16_ring` exposed, now fixed.
+
+## Two TwiNS fixes from the large runs
+
+- **DAG messages per slot.** A slot held at most 4096 DAG messages. LLaMA 65B (PP 2) and the GPT-3
+  175B probe at 1024 GPUs fire more in one slot. The extra messages were dropped (reported, rc 3),
+  their flows never started, and the run went on through empty slots up to its stop time.
+  - `--dcap` (default 4096) now sets the room. On an overflow, the run starts again with 4×.
+  - A quiescent run (nothing ran, nothing is due, nothing is on its way) now ends where it
+    stands.
+  - `47f122e`.
 
 ## Rejected, with measurements
 
