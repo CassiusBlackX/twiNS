@@ -1100,6 +1100,10 @@ int main(int argc, char **argv)
         worlds[0].name = "run";
         if (!build_world(worlds[0], base, topo_file, flow_file, bps, delay))
             return 1;
+#ifdef TWINS_ASTRA_HOST
+        if (!astra_wl.empty() && astra_cache.empty())
+            unlink(flow_file.c_str());
+#endif
     }
     else
     {

@@ -473,7 +473,5 @@ static bool closed_prepare(const string &topo, const string &wl, const string &f
     c->fe = new astra::Frontend(atopo, awl, c);
     c->fe->fire();
     printf("the system layer's flows: %d (%.3f s%s)\n", n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), have ? ", kept" : " on a stub network");
-    if (!cache)
-        unlink(path.c_str());
     return true;
 }
