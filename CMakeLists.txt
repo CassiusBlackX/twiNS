@@ -60,3 +60,27 @@ else()
     set_source_files_properties(src/rdma/rmain.cu PROPERTIES LANGUAGE CUDA)
     target_link_libraries(twins-rdma PRIVATE CUDA::cudart)
 endif()
+
+# astra-sim's system layer over TwiNS (docs/ai/whatif.md): SimAI's code is fetched by
+# src/astra/fetch.sh into out/astra; without it these targets do not exist
+set(ASTRA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/out/astra/SimAI/astra-sim-alibabacloud)
+if(EXISTS ${ASTRA_ROOT}/astra-sim/system/Sys.cc)
+    enable_language(CXX)
+    file(GLOB ASTRA_SRC CONFIGURE_DEPENDS
+        ${ASTRA_ROOT}/astra-sim/system/*.cc
+        ${ASTRA_ROOT}/astra-sim/system/collective/*.cc
+        ${ASTRA_ROOT}/astra-sim/system/fast-backend/*.cc
+        ${ASTRA_ROOT}/astra-sim/system/memory/*.cc
+        ${ASTRA_ROOT}/astra-sim/system/scheduling/*.cc
+        ${ASTRA_ROOT}/astra-sim/system/topology/*.cc
+        ${ASTRA_ROOT}/astra-sim/workload/*.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/out/astra/inc/SimCCL/mock/*.cc)
+    list(FILTER ASTRA_SRC EXCLUDE REGEX ".*(BootStrapnet|SimAiFlowModelRdma|PhyMultiThread)\\.cc")
+    add_library(astra-frontend STATIC ${ASTRA_SRC} src/astra/frontend.cc)
+    target_include_directories(astra-frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${ASTRA_ROOT} ${CMAKE_CURRENT_SOURCE_DIR}/out/astra/inc)
+    target_compile_options(astra-frontend PRIVATE -O2 -w)
+    set_target_properties(astra-frontend PROPERTIES CXX_STANDARD 17)
+    add_executable(twins-astra-stub src/astra/stub.cc)
+    target_link_libraries(twins-astra-stub PRIVATE astra-frontend pthread)
+    set_target_properties(twins-astra-stub PROPERTIES CXX_STANDARD 17)
+endif()
