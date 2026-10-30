@@ -15,6 +15,8 @@
 // sent in them can arrive in them: the shortest delay of the in-links without NVLink (a server's
 // NVLink counts while it is busy, or up to its next NVLink flow) and half of send_lat (default
 // 32; 0: off, and off where that bound is a single slot or with --win; no ranks ahead with it)
+// --dcap=N: DAG messages a slot holds (default 4096; when they overflow, the run starts again with
+// 4x, unless --dcap was given)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
 // --persist=0: always a graph of launches per slot (default: one persistent launch for many slots
 // when every block fits on the GPU at once)
@@ -45,6 +47,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 #include "rstep.cuh"
 
@@ -963,6 +966,7 @@ int main(int argc, char **argv)
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
+    int dcap = 4096, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -1007,6 +1011,11 @@ int main(int argc, char **argv)
         }
         else if (k == "--gwin")
             gwin = std::max(0, std::min(255, atoi(v.c_str())));
+        else if (k == "--dcap")
+        {
+            dcap = std::max(16, atoi(v.c_str()));
+            dcap_set = 1;
+        }
         else if (k == "--rank")
             rank_ahead = std::max(0, atoi(v.c_str()));
         else if (k == "--rank-join")
@@ -1507,7 +1516,7 @@ int main(int argc, char **argv)
         nbi = (int)((s.send_lat + txmax) / D) + 3 + kw; // (a host's window runs ahead by up to kw - 1 slots)
         s.nbi = nbi;
         s.fnbi = fdiv_make(nbi);
-        s.dcap = 4096;
+        s.dcap = dcap;
         s.dmsg = dev_alloc<DMsg>((size_t)nbi * s.dcap);
         s.dmsg_n = dev_alloc<unsigned int>(nbi);
         s.hhead = dev_alloc<unsigned int>((size_t)H * nbi);
@@ -2022,5 +2031,21 @@ int main(int argc, char **argv)
     if (ev[8] || ev[9])
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);
+    if (ev[14] && !dcap_set && dcap < (1 << 20))
+    {
+        // a slot's DAG messages overflowed (more firings in one slot than dcap): the run is not
+        // exact; it starts again with 4x the room, the same arguments otherwise
+        fprintf(stderr, "DAG message overflow: running again with --dcap=%d\n", 4 * dcap);
+        fflush(stdout);
+        fflush(stderr);
+        vector<string> av(argv, argv + argc);
+        av.push_back("--dcap=" + std::to_string(4 * dcap));
+        vector<char *> pv;
+        for (auto &a : av)
+            pv.push_back(const_cast<char *>(a.c_str()));
+        pv.push_back(nullptr);
+        execv("/proc/self/exe", pv.data());
+        perror("execv");
+    }
     return bad ? 3 : done == (unsigned)F ? 0 : 2; // (2: flows unfinished at the stop time)
 }

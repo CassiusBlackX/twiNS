@@ -3177,6 +3177,12 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
             }
         if (ws != INT64_MAX && ws > next)
             next = ws < s.max_slots ? ws : s.max_slots;
+        // quiescent: nothing ran, nothing is due and nothing is on its way (every frame in flight
+        // marks a pending slot within pend_n, every host its next event): nothing can happen again,
+        // so the run ends here as it would at its stop time (some flows unfinished: a DAG whose
+        // causes never come, or a deadlock), instead of stepping through empty slots
+        if (ws == INT64_MAX)
+            *s.finished = 1;
     }
     if (s.gwin)
     {
