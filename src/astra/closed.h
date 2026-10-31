@@ -44,7 +44,7 @@ struct Closed : astra::Network
     uint32_t parent = 0, base = 0;
     unsigned long long lead_ties = 0, syncs = 0, sort_runs = 0, sorted = 0;
     double t_cpu = 0, t_gpu = 0, t_sync = 0;
-    bool in_main = true, bad = false;
+    bool in_main = true, bad = false, stop_d = false, stop_t = false;
     int span = 0;
 
     int slot_alloc()
@@ -209,6 +209,16 @@ struct Closed : astra::Network
             t_gpu += sec(a, b);
             syncs++;
             k = ctl.k;
+            // a run that will start again with more room (see main) stops here
+            if (syncs % 1024 == 0 && (stop_d || stop_t))
+            {
+                unsigned long long e[2];
+                CK(hipMemcpyAsync(&e[0], s.ev + 9, sizeof(e[0]), hipMemcpyDeviceToHost, st));
+                CK(hipMemcpyAsync(&e[1], s.ev + 14, sizeof(e[1]), hipMemcpyDeviceToHost, st));
+                CK(hipStreamSynchronize(st));
+                if ((stop_t && e[0]) || (stop_d && e[1]))
+                    return;
+            }
             if (progress && syncs % 2000 == 0)
                 fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync);
             // the completions recorded, as a contiguous range of the ring

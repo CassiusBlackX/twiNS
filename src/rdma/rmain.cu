@@ -27,8 +27,8 @@
 // launches later, default 1; --rank-bs: its block size, default 512)
 //
 // --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
-// overwritten tail are reported as "on lost tails", and the run starts again with 8x the room
-// unless --tail was given
+// overwritten tail are reported as "on lost tails", and the run starts again with more room (log2
+// 26, then 27: the most a GPU of 16 GB leaves for it on the largest runs) unless --tail was given
 //
 // out: "id start_ns fct_ns" per flow, by id.
 // Exit status: 0 every flow done; 2 some unfinished at the stop time; 3 an error counter (an
@@ -1022,6 +1022,8 @@ int main(int argc, char **argv)
             tail_log2 = atoi(v.c_str());
             tail_set = true;
         }
+        else if (k == "--tail-auto") // (a rerun's: it may ask for more again)
+            tail_log2 = atoi(v.c_str());
         else if (k == "--spread")
             spread = std::max(1, std::min(BLOCK, atoi(v.c_str())));
         else if (k == "--serial")
@@ -1955,6 +1957,8 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
     if (g_cl)
     {
+        g_cl->stop_d = !dcap_set && dcap < (1 << 20);
+        g_cl->stop_t = !tail_set && tail_log2 < 27;
         g_cl->run(s, sa, D, [&](int k) {
             if (persist)
                 persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(PS);
@@ -2118,12 +2122,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);
     // a slot's DAG messages overflowed (more firings in one slot than dcap), or a tie met an
-    // overwritten tail: the run is not exact; it starts again with 4x (8x) the room, the same
-    // arguments otherwise
-    const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set;
+    // overwritten tail: the run is not exact; it starts again with more room, the same arguments
+    // otherwise
+    const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set && tail_log2 < 27;
     if (redo_d || redo_t)
     {
-        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail=" + std::to_string(tail_log2 + 3);
+        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail-auto=" + std::to_string(tail_log2 < 26 ? 26 : 27);
         fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
         fflush(stdout);
         fflush(stderr);
