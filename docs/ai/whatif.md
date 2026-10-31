@@ -169,6 +169,11 @@ With `--flows-cache` the stub column drops out.
   messages at scale spend most of their time there: 8 MB AllReduce at 1024 GPUs is 2.9× instead of
   replay's 43×.
 
+Replay still works after these changes: `twins-rdma`, built from the same sources, reproduces 41 of the
+42 paper runs message for message (`gpt3_175b_full_hpn128` on its 64-bit DAG). The other,
+`gpt3_175b_probe_hpn1024`, was left out for its memory use; its identical result in `paper.md` comes
+from an earlier build.
+
 ## Limits
 
 - **GPT-3 175B probe, 1024 GPUs (11.2 M messages): not verified.** It needs a larger DAG message buffer
