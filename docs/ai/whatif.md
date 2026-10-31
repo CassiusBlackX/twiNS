@@ -2,17 +2,14 @@
 
 **Result.** `twins-ai` runs an AI workload on a new network with no SimAI run first:
 - It runs astra-sim's real system layer on the CPU and the network on the GPU.
-- On 34 of the 35 runs of a matrix of 5 workloads and 7 configurations, every message's start and
-  completion is identical to SimAI, to the nanosecond. So is the DAG its system layer produces, line by
-  line: every flow, timer, cause and ordinal. The other run did not finish.
-- On 41 of the 42 runs of the SimAI paper's workloads, up to 1024 GPUs, the same holds. The other run did
-  not finish either.
+- On all 47 runs of a matrix of 5 workloads and 10 configurations, every message's start and completion
+  is identical to SimAI, to the nanosecond. So is the DAG its system layer produces, line by line: every
+  flow, timer, cause and ordinal.
+- On all 42 runs of the SimAI paper's workloads, up to 1024 GPUs, the same holds.
 - Replaying a recorded DAG on another configuration is not exact, with makespan errors up to 26%. That
   is why the closed loop is needed.
-- On the SimAI paper's workloads, it is 3–14× faster than SimAI on one core for collectives, 6–9× for
+- On the SimAI paper's workloads, it is 3–12× faster than SimAI on one core for collectives, 5–8× for
   128-GPU training, and 9–18× for 512- and 1024-GPU training.
-
-Not verified (see "Limits"): GPT-3 175B probe at 1024 GPUs; LLaMA 65B probe on DCN+ with 1 MB buffers.
 
 ## Why replay is not enough
 
@@ -86,25 +83,59 @@ it at the validated commit.
 SimAI here: `simai-trace64` (64-bit event uids), run directly on each configuration.
 `validation/simai/check_whatif.sh closed` runs this.
 
-| | Spectrum-X | AlibabaHPN | DCN+ | HPCC | 200G NICs | 1 MB | DCN+, 1 MB |
-|---|---|---|---|---|---|---|---|
-| microAllReduce, 128 GPUs (520192) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| MoE, 16 GPUs (6496) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| AllReduce 64 MB, 128 GPUs (3840) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| LLaMA 65B probe, 128 GPUs (439168) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | not finished |
-| All-to-all 64 MB, 128 GPUs (1920) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| | Spectrum-X | AlibabaHPN | DCN+ | HPCC | 200G NICs | 1 MB | 2 MB | DCN+, 1 MB | DCN+, 2 MB | DCN+, 4 MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| microAllReduce, 128 GPUs (520192) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | no reference | ✓ |
+| MoE, 16 GPUs (6496) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | no reference | ✓ |
+| AllReduce 64 MB, 128 GPUs (3840) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | no reference | ✓ |
+| LLaMA 65B probe, 128 GPUs (439168) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| All-to-all 64 MB, 128 GPUs (1920) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 ✓: all messages identical, and no line of the DAG differs (flows, timers, causes, ordinals).
-HPCC is CC_MODE 3; 1 MB is BUFFER_SIZE 1.
+HPCC is CC_MODE 3; 1, 2 and 4 MB are BUFFER_SIZE on Spectrum-X or DCN+. "No reference": SimAI was not run
+there.
 
-**What buffers test.** Ring collectives never fill a buffer: at 1 MB, on Spectrum-X and on DCN+, SimAI's
-own results equal those at 32 MB, so those cells prove little. All-to-all on DCN+ does respond: at 32 MB
-it has 2899 PFC pauses and 34 drops, and at 1 MB every message's time changes (makespan 7.36 → 7.07 ms).
-Both are exact.
+**What buffers test.** Few of the small-buffer cells test PFC, because of a quirk in SimAI's ns-3. The
+threshold is 32 bits unsigned:
+
+```
+uint32_t SwitchMmu::GetPfcThreshold(uint32_t port){
+    return (buffer_size - total_hdrm - total_rsrv - shared_used_bytes) >> pfc_a_shift[port];
+}
+```
+
+When the buffer is smaller than the switch's headroom and reserves, the sum wraps to about 2^32. That
+switch then never pauses and never drops, so a "1 MB" buffer on a wide switch behaves as an infinite one.
+TwiNS reproduces this, as exactness requires.
+
+| switch | headroom + reserves (MB) |
+|---|---|
+| DCN+, 128 GPUs, 72 ports | 3.14 |
+| Spectrum-X, 128 GPUs, 80 ports | 6.03 |
+| 200G NICs, 128 GPUs | 5.46 |
+| AlibabaHPN, 128 GPUs, 136 ports | 9.69 |
+| AlibabaHPN, 512 GPUs | 11.59 |
+| AlibabaHPN, 1024 GPUs | 14.13 |
+
+What the cells therefore show:
+- **1 and 2 MB, on Spectrum-X and on DCN+:** the wide switches wrap, so these cells prove little about
+  PFC. All-to-all on DCN+ finishes earlier at 1 MB than at 32 MB (7.07 ms against 7.36 ms, with 2899
+  pauses and 34 drops at 32 MB), and 1 and 2 MB give the same 7.07 ms.
+- **32 MB:** no configuration wraps.
+- **DCN+, 4 MB:** this is the cell where the buffer really is small, and it is exact, including the flows
+  that never finish. SimAI strands the same flows after the drops. Why they strand was not investigated.
+
+| DCN+, 4 MB | drops | pauses | NACKs | flows finished |
+|---|---|---|---|---|
+| LLaMA 65B probe | 40 | 982827 | 34 | 439089 of 439168 |
+| All-to-all 64 MB | 1178 | 284617 | 933 | 1879 of 1920 |
+| AllReduce 64 MB | 21 | 5072 | 14 | 3575 of 3840 |
+| microAllReduce, MoE | 0 | 0 | 0 | all |
 
 **On the paper's workloads** (`validation/simai/check_closed.sh validation/simai/jobs_paper.txt`):
-41 of 42 runs are identical, messages and DAG lines. The other one, GPT-3 175B probe at 1024 GPUs, did
-not finish (see "Limits").
+all 42 runs are identical, messages and DAG lines. GPT-3 175B probe at 1024 GPUs needs options of its
+own (see "Limits"): all 11197440 messages are identical, with no line of the DAG differing, and no
+undecided ties or lost tails.
 
 GPT-3 175B full at 128 GPUs first showed 165 messages and most DAG lines differing. Its reference was
 32-bit SimAI, and the run passes 2^32 events (see `paper.md`): compared by (source, destination, size,
@@ -115,77 +146,74 @@ recording carries its own numbering.
 
 ## Speed
 
-RX 9060 XT at `784c6cf`, SimAI on one core of a87 (untraced where measured, as in `paper.md`). twins-ai's
-time is one pass: GPU, system layer, sync and stub. Reruns for more room are not counted; 8 happened.
-With `--flows-cache` the stub column drops out.
+RX 9060 XT at `2e156c4`, SimAI on one core of a87 (untraced where measured, as in `paper.md`). twins-ai's
+time is one pass: GPU, system layer, sync and stub. Reruns for more room are not counted; 9 happened.
+With `--flows-cache` the stub column drops out. The machine drifts by 10–15% between runs, so small
+differences between rows or from earlier builds mean little.
 
 | run | messages | simulated (ms) | SimAI (s) | replay (s) | twins-ai (s) | GPU | system layer | sync | stub | speedup |
 |---|---|---|---|---|---|---|---|---|---|---|
-| c_allgather_512m_hpn128 | 1920 | 23.37 | 54.4 | 11.6 | 15.4 | 14.9 | 0.0 | 0.4 | 0.0 | 3.5× |
-| c_allgather_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 1.9 | 1.7 | 0.0 | 0.1 | 0.0 | 5.4× |
-| c_allgather_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.3 | 0.2 | 0.0 | 0.0 | 0.0 | 14.5× |
-| c_allreduce_512m_hpn128 | 3840 | 55.66 | 102.7 | 25.7 | 34.9 | 33.9 | 0.1 | 0.9 | 0.1 | 2.9× |
-| c_allreduce_64m_hpn128 | 3840 | 5.25 | 16.6 | 2.7 | 3.7 | 3.4 | 0.0 | 0.2 | 0.1 | 4.5× |
-| c_allreduce_8m_hpn128 | 3840 | 0.80 | 6.2 | 0.4 | 0.6 | 0.5 | 0.0 | 0.1 | 0.1 | 9.7× |
-| c_reducescatter_512m_hpn128 | 1920 | 23.37 | 55.2 | 11.4 | 15.5 | 15.0 | 0.0 | 0.4 | 0.0 | 3.6× |
-| c_reducescatter_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 1.9 | 1.7 | 0.0 | 0.1 | 0.0 | 5.4× |
-| c_reducescatter_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.3 | 0.2 | 0.0 | 0.0 | 0.0 | 14.3× |
-| gpt3_13b_probe_hpn128 | 42240 | 56.37 | 517.8 | 86.1 | 91.8 | 87.8 | 0.9 | 2.4 | 0.7 | 5.6× |
-| gpt3_175b_probe_hpn128 | 1385344 | 189.25 | 2125.2 | 166.8 | 226.9 | 190.2 | 15.6 | 7.5 | 13.7 | 9.4× |
-| llama_65b_probe_hpn128 | 439168 | 81.35 | 620.4 | 60.4 | 82.5 | 70.8 | 4.7 | 2.7 | 4.2 | 7.5× |
-| c_allgather_512m_hpn512 | 32256 | 27.80 | 258.1 | 23.6 | 30.5 | 28.2 | 0.6 | 1.0 | 0.7 | 8.5× |
-| c_allgather_64m_hpn512 | 32256 | 3.01 | 39.4 | 2.7 | 4.8 | 3.2 | 0.6 | 0.4 | 0.7 | 8.1× |
-| c_allgather_8m_hpn512 | 32256 | 0.67 | 13.0 | 0.4 | 1.9 | 0.5 | 0.6 | 0.2 | 0.7 | 6.7× |
-| c_allreduce_512m_hpn512 | 64512 | 108.05 | 490.0 | 75.8 | 99.1 | 93.5 | 1.3 | 3.0 | 1.2 | 4.9× |
-| c_allreduce_64m_hpn512 | 64512 | 6.02 | 74.1 | 5.5 | 9.6 | 6.5 | 1.2 | 0.6 | 1.2 | 7.8× |
-| c_allreduce_8m_hpn512 | 64512 | 1.35 | 19.0 | 0.8 | 3.8 | 1.0 | 1.2 | 0.4 | 1.2 | 5.0× |
-| c_reducescatter_512m_hpn512 | 32256 | 27.75 | 250.8 | 23.7 | 30.6 | 28.3 | 0.6 | 1.1 | 0.7 | 8.2× |
-| c_reducescatter_64m_hpn512 | 32256 | 3.01 | 38.7 | 2.8 | 4.9 | 3.2 | 0.6 | 0.4 | 0.7 | 7.9× |
-| c_reducescatter_8m_hpn512 | 32256 | 0.67 | 12.9 | 0.4 | 2.0 | 0.5 | 0.6 | 0.2 | 0.7 | 6.5× |
-| c_allgather_512m_hpn1024 | 130048 | 29.95 | 542.8 | 30.7 | 44.8 | 35.6 | 3.4 | 2.0 | 3.7 | 12.1× |
-| c_allgather_64m_hpn1024 | 130048 | 3.37 | 92.4 | 3.6 | 12.6 | 4.6 | 3.4 | 0.8 | 3.8 | 7.3× |
-| c_allgather_8m_hpn1024 | 130048 | 1.02 | 34.2 | 0.6 | 8.9 | 0.9 | 3.4 | 0.9 | 3.7 | 3.8× |
-| c_allreduce_512m_hpn1024 | 260096 | 172.60 | 1079.0 | 129.2 | 180.8 | 160.0 | 7.3 | 6.2 | 7.3 | 6.0× |
-| c_allreduce_64m_hpn1024 | 260096 | 6.75 | 171.6 | 7.3 | 25.2 | 9.4 | 6.9 | 1.6 | 7.2 | 6.8× |
-| c_allreduce_8m_hpn1024 | 260096 | 2.04 | 53.2 | 1.2 | 18.1 | 1.9 | 7.2 | 1.6 | 7.4 | 2.9× |
-| c_reducescatter_512m_hpn1024 | 130048 | 43.90 | 530.5 | 37.7 | 55.0 | 45.3 | 3.5 | 2.3 | 3.8 | 9.7× |
-| c_reducescatter_64m_hpn1024 | 130048 | 3.38 | 86.4 | 3.6 | 12.8 | 4.7 | 3.4 | 0.9 | 3.8 | 6.8× |
-| c_reducescatter_8m_hpn1024 | 130048 | 1.02 | 32.1 | 0.6 | 9.2 | 0.9 | 3.5 | 1.0 | 3.8 | 3.5× |
-| gpt3_13b_full_hpn128 | 120064 | 557.97 | 5220.5 | 824.3 | 860.4 | 844.5 | 1.9 | 12.4 | 1.5 | 6.1× |
-| llama_65b_full_hpn128 | 4797312 | 904.12 | 6673.1 | 639.0 | 892.7 | 763.4 | 54.5 | 26.7 | 48.1 | 7.5× |
-| gpt3_175b_full_hpn128 | 5972864 | 734.78 | 6384.6 | 566.2 | 826.8 | 669.4 | 68.0 | 29.5 | 60.0 | 7.7× |
-| gpt3_13b_probe_hpn512 | 562176 | 73.74 | 2986.5 | 189.6 | 247.8 | 193.3 | 23.9 | 6.9 | 23.7 | 12.1× |
-| llama_65b_probe_hpn512 | 1781248 | 153.75 | 3526.2 | 170.1 | 250.7 | 198.0 | 23.2 | 9.0 | 20.5 | 14.1× |
-| llama_65b_mid_hpn512 | 2698752 | 244.28 | 5380.8 | 260.4 | 385.1 | 304.9 | 35.8 | 13.1 | 31.3 | 14.0× |
-| gpt3_13b_probe_hpn1024 | 2172928 | 80.32 | 6139.4 | 334.1 | 659.3 | 332.8 | 156.8 | 14.5 | 155.2 | 9.3× |
-| gpt3_13b_mid_hpn1024 | 2271232 | 184.44 | 16032.2 | 736.6 | 1075.5 | 735.0 | 162.4 | 21.5 | 156.6 | 14.9× |
-| llama_65b_mid_hpn1024 | 5463040 | 338.37 | 12517.3 | 446.0 | 688.5 | 514.4 | 81.6 | 25.3 | 67.3 | 18.2× |
-| gpt3_13b_mid_hpn512 | 611328 | 175.93 | 7156.8 | 474.7 | 537.6 | 476.2 | 25.2 | 12.1 | 24.1 | 13.3× |
-| llama_65b_probe_hpn1024 | 3628032 | 183.12 | 7026.8 | 273.1 | 425.6 | 309.7 | 54.0 | 16.8 | 45.2 | 16.5× |
+| c_allgather_512m_hpn128 | 1920 | 23.37 | 54.4 | 11.6 | 15.7 | 15.2 | 0.0 | 0.5 | 0.0 | 3.5× |
+| c_allgather_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 2.0 | 1.8 | 0.0 | 0.1 | 0.0 | 5.0× |
+| c_allgather_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.5 | 0.4 | 0.0 | 0.1 | 0.0 | 9.4× |
+| c_allreduce_512m_hpn128 | 3840 | 55.66 | 102.7 | 25.7 | 36.5 | 35.4 | 0.1 | 1.0 | 0.1 | 2.8× |
+| c_allreduce_64m_hpn128 | 3840 | 5.25 | 16.6 | 2.7 | 4.0 | 3.7 | 0.0 | 0.2 | 0.1 | 4.1× |
+| c_allreduce_8m_hpn128 | 3840 | 0.80 | 6.2 | 0.4 | 0.9 | 0.7 | 0.0 | 0.1 | 0.1 | 7.1× |
+| c_reducescatter_512m_hpn128 | 1920 | 23.37 | 55.2 | 11.4 | 15.9 | 15.3 | 0.0 | 0.5 | 0.0 | 3.5× |
+| c_reducescatter_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 2.1 | 1.9 | 0.0 | 0.1 | 0.0 | 4.8× |
+| c_reducescatter_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.5 | 0.3 | 0.0 | 0.1 | 0.0 | 10.6× |
+| gpt3_13b_probe_hpn128 | 42240 | 56.37 | 517.8 | 86.1 | 94.5 | 90.3 | 0.9 | 2.5 | 0.7 | 5.5× |
+| gpt3_175b_probe_hpn128 | 1385344 | 189.25 | 2125.2 | 166.8 | 259.5 | 217.7 | 17.5 | 9.9 | 14.5 | 8.2× |
+| llama_65b_probe_hpn128 | 439168 | 81.35 | 620.4 | 60.4 | 85.5 | 73.3 | 4.8 | 3.0 | 4.3 | 7.3× |
+| c_allgather_512m_hpn512 | 32256 | 27.80 | 258.1 | 23.6 | 31.1 | 28.7 | 0.6 | 1.1 | 0.7 | 8.3× |
+| c_allgather_64m_hpn512 | 32256 | 3.01 | 39.4 | 2.7 | 5.3 | 3.6 | 0.6 | 0.4 | 0.7 | 7.5× |
+| c_allgather_8m_hpn512 | 32256 | 0.67 | 13.0 | 0.4 | 2.5 | 0.9 | 0.6 | 0.4 | 0.7 | 5.2× |
+| c_allreduce_512m_hpn512 | 64512 | 108.05 | 490.0 | 75.8 | 99.8 | 94.0 | 1.4 | 3.2 | 1.2 | 4.9× |
+| c_allreduce_64m_hpn512 | 64512 | 6.02 | 74.1 | 5.5 | 10.0 | 6.9 | 1.2 | 0.7 | 1.2 | 7.4× |
+| c_allreduce_8m_hpn512 | 64512 | 1.35 | 19.0 | 0.8 | 4.9 | 1.9 | 1.2 | 0.6 | 1.2 | 3.8× |
+| c_reducescatter_512m_hpn512 | 32256 | 27.75 | 250.8 | 23.7 | 31.3 | 28.8 | 0.6 | 1.1 | 0.7 | 8.0× |
+| c_reducescatter_64m_hpn512 | 32256 | 3.01 | 38.7 | 2.8 | 5.4 | 3.6 | 0.6 | 0.5 | 0.7 | 7.2× |
+| c_reducescatter_8m_hpn512 | 32256 | 0.67 | 12.9 | 0.4 | 2.6 | 0.9 | 0.6 | 0.4 | 0.7 | 5.0× |
+| c_allgather_512m_hpn1024 | 130048 | 29.95 | 542.8 | 30.7 | 45.7 | 36.4 | 3.4 | 2.1 | 3.8 | 11.9× |
+| c_allgather_64m_hpn1024 | 130048 | 3.37 | 92.4 | 3.6 | 13.6 | 5.5 | 3.4 | 1.0 | 3.8 | 6.8× |
+| c_allgather_8m_hpn1024 | 130048 | 1.02 | 34.2 | 0.6 | 9.8 | 1.4 | 3.5 | 1.2 | 3.8 | 3.5× |
+| c_allreduce_512m_hpn1024 | 260096 | 172.60 | 1079.0 | 129.2 | 183.6 | 162.4 | 7.3 | 6.5 | 7.4 | 5.9× |
+| c_allreduce_64m_hpn1024 | 260096 | 6.75 | 171.6 | 7.3 | 27.9 | 11.8 | 7.0 | 1.8 | 7.2 | 6.2× |
+| c_allreduce_8m_hpn1024 | 260096 | 2.04 | 53.2 | 1.2 | 20.4 | 2.6 | 7.7 | 2.2 | 7.9 | 2.6× |
+| c_reducescatter_512m_hpn1024 | 130048 | 43.90 | 530.5 | 37.7 | 57.1 | 46.7 | 3.8 | 2.5 | 4.1 | 9.3× |
+| c_reducescatter_64m_hpn1024 | 130048 | 3.38 | 86.4 | 3.6 | 16.9 | 7.6 | 3.8 | 1.3 | 4.2 | 5.1× |
+| c_reducescatter_8m_hpn1024 | 130048 | 1.02 | 32.1 | 0.6 | 10.8 | 1.4 | 3.9 | 1.4 | 4.1 | 3.0× |
+| gpt3_13b_full_hpn128 | 120064 | 557.97 | 5220.5 | 824.3 | 884.2 | 866.7 | 2.3 | 13.6 | 1.7 | 5.9× |
+| llama_65b_full_hpn128 | 4797312 | 904.12 | 6673.1 | 639.0 | 971.1 | 824.0 | 61.2 | 31.5 | 54.4 | 6.9× |
+| gpt3_175b_full_hpn128 | 5972864 | 734.78 | 6384.6 | 566.2 | 832.2 | 677.5 | 66.7 | 29.8 | 58.2 | 7.7× |
+| gpt3_13b_probe_hpn512 | 562176 | 73.74 | 2986.5 | 189.6 | 248.1 | 194.5 | 23.3 | 6.9 | 23.5 | 12.0× |
+| llama_65b_probe_hpn512 | 1781248 | 153.75 | 3526.2 | 170.1 | 252.6 | 200.1 | 23.1 | 9.1 | 20.3 | 14.0× |
+| llama_65b_mid_hpn512 | 2698752 | 244.28 | 5380.8 | 260.4 | 388.1 | 308.3 | 35.5 | 13.2 | 31.2 | 13.9× |
+| gpt3_13b_probe_hpn1024 | 2172928 | 80.32 | 6139.4 | 334.1 | 661.5 | 335.1 | 156.3 | 14.5 | 155.7 | 9.3× |
+| gpt3_13b_mid_hpn1024 | 2271232 | 184.44 | 16032.2 | 736.6 | 1077.5 | 740.6 | 159.1 | 21.6 | 156.2 | 14.9× |
+| llama_65b_mid_hpn1024 | 5463040 | 338.37 | 12517.3 | 446.0 | 694.3 | 522.5 | 79.6 | 25.3 | 66.9 | 18.0× |
+| gpt3_13b_mid_hpn512 | 611328 | 175.93 | 7156.8 | 474.7 | 540.5 | 479.7 | 24.6 | 12.2 | 24.0 | 13.2× |
+| llama_65b_probe_hpn1024 | 3628032 | 183.12 | 7026.8 | 273.1 | 428.8 | 314.6 | 52.6 | 16.9 | 44.7 | 16.4× |
+| gpt3_175b_probe_hpn1024 | 11197440 | 527.91 | 23325.9 | 844.8 | 1575.5 | 1164.4 | 187.2 | 73.7 | 150.2 | 14.8× |
 
 **What sets the speedup.**
 - GPU time is close to replay's: the rounds add little, except `rdma_rank`, which the loop leaves out.
 - The system layer costs 3–13 µs per callback on one CPU core, and the stub about the same again. Small
-  messages at scale spend most of their time there: 8 MB AllReduce at 1024 GPUs is 2.9× instead of
+  messages at scale spend most of their time there: 8 MB AllReduce at 1024 GPUs is 2.6× instead of
   replay's 43×.
 
 Replay still works after these changes: `twins-rdma`, built from the same sources, reproduces 41 of the
 42 paper runs message for message (`gpt3_175b_full_hpn128` on its 64-bit DAG). The other,
 `gpt3_175b_probe_hpn1024`, was left out for its memory use; its identical result in `paper.md` comes
-from an earlier build.
+from an earlier build. Those runs were on `bb6c863`. On `2e156c4`, four replays were rerun, with the same
+output as before.
 
 ## Limits
 
-- **GPT-3 175B probe, 1024 GPUs (11.2 M messages): not verified.** It needs a larger DAG message buffer
-  and a larger tail ring than the default. `--tail=26` did not fit the GPU's 16 GB next to 11 M flows.
-  A run at `--dcap=16384 --tail=25` was stopped because the machine ran low on memory: the system layer
-  alone takes about 13 GB of host memory here, on a 31 GB desktop. Its replay is identical (`paper.md`).
-- **LLaMA 65B probe, DCN+, 1 MB: not finished.** It reached about 20% of its slots in the one hour it
-  was given, and replay is slow there too, so this is TwiNS's network path, not the loop. The same point
-  takes 126 s at 8 MB and 2518 s at 1 MB; 2 and 4 MB are slow as well. The likely reason is that wide
-  switches lose their fast path once the buffer cannot cover the ports' reserves, which is not
-  confirmed. SimAI's result at 1 MB equals its result at 32 MB. Exactness at small buffers is shown by
-  the all-to-all, and speed there is an open problem.
+- **GPT-3 175B probe, 1024 GPUs (11.2 M messages) needs `--dcap=16384 --tail=25`.** `--tail=26` does not
+  fit the GPU's 16 GB next to 11 M flows, and the automatic reruns would reach it. The run peaks at 18.3 GB
+  of host memory and 3.1 GB of swap, with about 11 GB of GPU driver and kernel memory on top, outside the
+  process's cgroup. Forbidding swap on a 31 GB machine ends in an out-of-memory kill.
 - Only what these workloads use has been compared: ring collectives, and all-to-all. Tree, NVLS and PAT
   are not covered.
 - A uniform send_lat is assumed (`SEND_LAT_NS`, SimAI's `AS_SEND_LAT`). Windows rely on it, and so does
@@ -204,3 +232,30 @@ All three affected exactness:
   have 5 bits now.
 - **Lost tails.** A tie on an overwritten chain tail is not exact. The run now starts again with more
   room, as `--dcap` does.
+
+## Two fixes for speed at small buffers
+
+LLaMA 65B probe on DCN+ at 1 MB did not finish in an hour, and was much slower at 2 and 4 MB too. Both
+causes were in TwiNS, and neither changed a result: the matrix and the paper's runs above are on the fixed
+build, and the 229 runs and worlds of the gate pass.
+
+4 MB does not wrap on DCN+, so only the second fix applies there.
+
+| LLaMA 65B probe, DCN+ | before (s) | wrap fixed (s) | both fixed (s) | SimAI (s) |
+|---|---|---|---|---|
+| 1 MB | over 3600, at about 20% of its slots | 393 | 185 | 618 |
+| 2 MB | not measured | not measured | 184 | 637 |
+| 4 MB | not measured | 3775 | 268 | 665 |
+
+- **Safe slots ignored the wrap.** A wide switch's slot runs in parallel only if no port can cross the
+  PFC threshold. The check computed the threshold's room as a signed number, so a wrapped threshold looked
+  negative and every slot of that switch looked unsafe. It now wraps as SimAI does
+  (`switch_step` in `src/rdma/rstep.cuh`).
+- **Long chain walks repeated themselves.** Under heavy PFC at 4 MB, comparing two events' chains took
+  deep walks that decide by lead, about 5000 runs each, and the memo saw only the chains' top levels. In a
+  30 ms profile of 4 MB, 794 thousand walks took 1.4 G steps. `ccmp_walk` now remembers sampled states from
+  the walk's tail (a direct-mapped table of 2^22 entries, 32 MB). The same profile went from 873 s to 53 s
+  and from 1.4 G steps to 6 M, with the same pauses and events.
+- **The cost.** Runs that do not need this are at most about 1.2% slower: in interleaved replays,
+  `gpt3_13b_mid_hpn512` took 484.1 s against 478.6 s, and three others differed by less. Their output was
+  the same.

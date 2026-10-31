@@ -40,7 +40,7 @@ k=16; incasts, whose hot switch port serializes everything, 4–8×). See [RDMA]
 **AI workloads.** `twins-ai` runs astra-sim's real system layer on the CPU and twins-rdma's network on
 the GPU, with no SimAI run first. Against SimAI, every message and every action of the system layer
 is identical on 5 workloads across Spectrum-X, AlibabaHPN, DCN+, HPCC, 200G NICs and small buffers,
-and on 41 of the 42 runs of SimAI's paper workloads, up to 1024 GPUs. It is 3–18× faster than SimAI on
+and on all 42 runs of SimAI's paper workloads, up to 1024 GPUs. It is 3–18× faster than SimAI on
 one core. `src/astra/fetch.sh` gets SimAI's code first. See [docs/ai/whatif.md](docs/ai/whatif.md).
 
 ## Build
