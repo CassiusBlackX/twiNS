@@ -158,6 +158,10 @@ struct Memo
 {
     unsigned long long *t;
     uint64_t mask;
+    // walks decided by a lead, from where they passed in the tails (see ccmp_walk): key | result,
+    // direct mapped, the last one stays
+    unsigned long long *walk;
+    uint64_t walk_mask;
 };
 __device__ Memo g_memo;
 #ifdef RDMA_PROF
@@ -339,8 +343,14 @@ __device__ __forceinline__ void memo_put(uint64_t ha, uint64_t hb, int r)
 // scheduled first) decides; distinct roots (flows' StartApplications) decide in start order.
 // (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
 // (inline_only: give up, returning 2, where either chain goes on into its tail)
+constexpr int WALK_EVERY = 16, WALK_KEEP = 4;
 __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr,
-                                         bool inline_only = false)
+                                         bool inline_only = false
+#ifdef RDMA_PROF
+                                         ,
+                                         unsigned long long *steps = nullptr
+#endif
+)
 {
     *inexact = false;
     if (by_lead)
@@ -349,13 +359,25 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
     RunCursor A, B;
     A.init(a, pa);
     B.init(b, pb);
+    // Lineages in lockstep can have equal leads for thousands of runs, and the next comparison of
+    // the two adds a few runs above them. So a walk decided by a lead remembers where it passed: two
+    // places in the (immutable) tail nodes, from which only the same walk can follow. One state in
+    // WALK_EVERY is looked up and kept, chosen by its bits, so that all walks agree on which.
+    uint64_t seen[WALK_KEEP];
+    int nseen = 0;
     auto by_leads = [&](int r) {
         if (by_lead)
             *by_lead = true;
+        for (int i = 0; i < nseen; i++)
+            g_memo.walk[seen[i] >> 2 & g_memo.walk_mask] = seen[i] | (r < 0 ? 1 : 2);
         return r;
     };
     for (;;)
     {
+#ifdef RDMA_PROF
+        if (steps)
+            ++*steps;
+#endif
         if (inline_only && (A.i > RUNS || B.i > RUNS))
             return 2;
         uint32_t ca = A.code, cb = B.code;
@@ -383,6 +405,23 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
         // a common ancestor), so the deepest ordinal difference is one seen above
         if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
             return ord;
+        if (A.i > RUNS && B.i > RUNS)
+        {
+            const uint64_t k = memo_key(A.node + ((uint64_t)A.left << 40), B.node + ((uint64_t)B.left << 40));
+            if ((k >> 2 & (WALK_EVERY - 1)) == 0)
+            {
+                const unsigned long long v = g_memo.walk[k >> 2 & g_memo.walk_mask];
+                if ((v & ~3ull) == k)
+                {
+#ifdef RDMA_PROF
+                    atomicAdd(&g_prof[7], 1ull);
+#endif
+                    return by_leads((v & 3) == 1 ? -1 : 1);
+                }
+                if (nseen < WALK_KEEP)
+                    seen[nseen++] = k;
+            }
+        }
         uint32_t m = A.left < B.left ? A.left : B.left;
         A.left -= m;
         B.left -= m;
@@ -441,9 +480,15 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
             B.next();
     }
     bool by_lead;
-    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead);
 #ifdef RDMA_PROF
+    long long walk0 = clock64();
+    unsigned long long wsteps = 0;
+    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead, false, &wsteps);
     atomicAdd(&g_prof[1], 1ull);
+    atomicAdd(&g_prof[by_lead ? 2 : 5], wsteps);
+    atomicAdd(&g_prof[6], (unsigned long long)(clock64() - walk0));
+#else
+    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead);
 #endif
     // a decision by the leads: not the end of both chains (roots, ordinals), nor a lost tail
     if (by_lead && !*inexact)
@@ -2475,7 +2520,10 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         __syncthreads();
         const Switch &sw = s.sw[x];
         int64_t amax = sw.shared_used + (int64_t)sw_sum;
-        int64_t room = (int64_t)WP.buffer_size - sw.total_hdrm - sw.total_rsrv - amax;
+        // (GetPfcThreshold is uint32_t: with less buffer than headroom and reserves, its sum wraps to
+        // about 2^32 and stays there, so this switch never pauses; only a shared_used that crosses
+        // the sum itself takes the threshold through 0)
+        int64_t room = (int64_t)(uint32_t)(WP.buffer_size - sw.total_hdrm - sw.total_rsrv) - amax;
         int64_t th_min = room > 0 ? room >> sw.max_shift : -1;
         bad = sw_bad;
         for (int p = lane; p < deg && !bad; p += lanes)

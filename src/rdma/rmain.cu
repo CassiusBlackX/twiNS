@@ -1808,6 +1808,8 @@ int main(int argc, char **argv)
         uint64_t cap = 1ull << 22; // 32 MB
         m.t = dev_alloc<unsigned long long>(cap);
         m.mask = cap - 1;
+        m.walk = dev_alloc<unsigned long long>(cap);
+        m.walk_mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo), &m, sizeof(m)));
     }
     {
@@ -2093,7 +2095,7 @@ int main(int argc, char **argv)
     {
         unsigned long long gp[8];
         CK(hipMemcpyFromSymbol(gp, HIP_SYMBOL(g_prof), sizeof(gp)));
-        printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu), walk steps %llu (in tails %llu)\n", gp[0], gp[3], gp[1], gp[4], gp[2], gp[5]);
+        printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu), walk steps %llu by leads, %llu others, walks' cycles %.3f G; walks cut short %llu\n", gp[0], gp[3], gp[1], gp[4], gp[2], gp[5], gp[6] * 1e-9, gp[7]);
     }
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",

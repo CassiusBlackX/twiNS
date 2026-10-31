@@ -4,7 +4,7 @@
 # own DAG in twins-rdma, against SimAI on it. cross: the DAG recorded on sx replayed on the others.
 # closed: no recording at all (twins-ai, the workloads in WL, default out/simai/wl), against SimAI.
 # env: BIN (build/twins-rdma), CFG (validation/simai/SimAI.conf), W (out/simai/whatif), DATA (data/simai), TMO,
-# NORUN=1: compare the runs already made
+# NORUN=1: compare the runs already made; ARGS: more options for twins-ai
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 AI=${AI:-build/twins-ai}
@@ -39,11 +39,13 @@ for c in $CONFIGS; do
             # (SimAI's csv files in a directory of the run's)
             mkdir -p "$out.d"
             s=$(date +%s.%N)
-            ( cd "$out.d" && timeout ${TMO:-1800} "$ROOT/$AI" "$ROOT/$CFG" --topo="$ROOT/$DATA/$topo" --astra="$WL/$wl" --out="$ROOT/$out" --dag-out="$ROOT/$out.dag" --flows-cache="$ROOT/$W/$load.flows.dag" $rest > "$ROOT/$out.log" 2>&1 )
+            ( cd "$out.d" && timeout ${TMO:-1800} "$ROOT/$AI" "$ROOT/$CFG" --topo="$ROOT/$DATA/$topo" --astra="$WL/$wl" --out="$ROOT/$out" --dag-out="$ROOT/$out.dag" --flows-cache="$ROOT/$W/$load.flows.dag" $rest $ARGS > "$ROOT/$out.log" 2>&1 )
             rc=$?
             rm -rf "$out.d"
             w=$(echo "$(date +%s.%N) - $s" | bc)
-            [ $rc = 0 ] || { echo "$load $c: rc $rc: $(grep -am1 'error\|failed' "$out.log")"; continue; }
+            # (2: flows left unfinished, which SimAI's run may share: drops can strand a flow)
+            [ $rc = 0 ] || [ $rc = 2 ] || { echo "$load $c: rc $rc: $(grep -am1 'error\|failed' "$out.log")"; continue; }
+            [ $rc = 2 ] && echo "$load $c: unfinished: $(grep -a 'flows done' "$out.log" | tail -1)"
             python3 validation/simai/check_whatif.py "${load}_$c" "$W/${load}_$c.dag" "$W/${load}_$c.ref" "$out.dag" "$out" --lines
             echo "$(grep -a 'closed loop:' "$out.log" | sed 's/^closed loop: //') wall ${w} s; $(grep -a -o 'undecided ties [0-9]*, on lost tails [0-9]*' "$out.log" | tail -1)"
             continue
