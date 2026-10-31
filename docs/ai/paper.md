@@ -1,5 +1,7 @@
 # TwiNS against SimAI on the SimAI paper's workloads
 
+These runs replay SimAI's recordings. `whatif.md` runs the same workloads with no recording.
+
 **Result.**
 - 42 runs compared, from 128 to 1024 GPUs, of the workloads in SimAI's own paper (NSDI '25 §4).
 - All 42 are identical to SimAI: every message's start and completion, to the nanosecond.
@@ -161,8 +163,11 @@ The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
     2 172 928 messages.
 - **What we do.** The traced references now use 64-bit uids, like the other reproducibility
   fixes (node-id maps, per-port ECN streams).
-  - Below 2^32 events this changes nothing: every other run here, and every earlier reference,
-    stays below.
+  - Below 2^32 events this changes nothing.
+  - Replay cannot tell the two apart when the wrap only reorders ranks that do not interact: GPT-3
+    175B full at 128 GPUs also passes 2^32 and first kept its 32-bit reference, identical per
+    message. `twins-ai`, which makes its own actions, showed the difference (`whatif.md`). Its
+    reference is 64-bit now too, and identical.
   - Emulating the wrap in TwiNS would need a global count of ns-3's events and their global order
     across the slot of the wrap.
 

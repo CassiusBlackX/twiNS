@@ -9,8 +9,8 @@
   up to 520192 messages per run.
 - TwiNS replays astra-sim's recorded actions, which makes it a trace-driven system model:
   - Exactness at the system level holds for the recorded run.
-  - A different network (another topology or CC) would need astra-sim to run again, since its
-    decisions could change.
+  - A different network (another topology or CC) needs astra-sim to run again, since its decisions
+    change. `twins-ai` does that, with no recording: see `whatif.md`.
 
 ## Method
 

@@ -37,6 +37,12 @@ k=4–16, leaf-spine, Jellyfish, torus and Dragonfly, PFC storms, and every swit
 twins-rdma is 3.5–200× faster than the reference (25–200× on the larger workloads, 180–200× at
 k=16; incasts, whose hot switch port serializes everything, 4–8×). See [RDMA](#rdma).
 
+**AI workloads.** `twins-ai` runs astra-sim's real system layer on the CPU and twins-rdma's network on
+the GPU, with no SimAI run first. Against SimAI, every message and every action of the system layer
+is identical on 5 workloads across Spectrum-X, AlibabaHPN, DCN+, HPCC, 200G NICs and small buffers,
+and on 41 of the 42 runs of SimAI's paper workloads, up to 1024 GPUs. It is 3–18× faster than SimAI on
+one core. `src/astra/fetch.sh` gets SimAI's code first. See [docs/ai/whatif.md](docs/ai/whatif.md).
+
 ## Build
 
 ```shell
@@ -333,6 +339,7 @@ them, see `validation/README.md`.
 | `data/gedes/` | GeDES-model outputs on the k=8 workloads, for `validation/noise.py` |
 | `data/twins_speed.csv` | TwiNS wall times behind the speed table |
 | `src/rdma/` | twins-rdma: `rdma.h` (state and execution model), `rstep.cuh` (NIC, switch, slot kernel), `rmain.cu` (driver) |
+| `src/astra/` | twins-ai: `frontend.cc` (astra-sim over a network), `closed.h` (the loop with the GPU), `fetch.sh` (SimAI's code) |
 | `validation/hpcc/` | the RDMA reference (`rdma-ref.cc`, `hpcc.patch`, container), job files, `check.sh`, `txdiff.py`, `events.py` |
 | `data/rdma/` | topologies and flow files of the RDMA runs |
 
