@@ -1871,7 +1871,12 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA
     // the closed loop's graph while windows run (the limit comes sooner than its last launch); GS
     // while a server's NVLink keeps launches to a slot each
-    const int GS_win = 8;
+    int GS_win = 8;
+#ifdef TWINS_ASTRA_HOST
+    // (as many as the windows up to the limit: a launch past it dispatches every block for nothing)
+    if (g_cl && s.gwin)
+        GS_win = std::max(1, std::min(8, (g_cl->span + s.gk_static - 1) / s.gk_static));
+#endif
 #endif
     const size_t lds = std::max(per_h, per_sw(s.ks)), lds_b = gw ? sw_ints(s.kb) * sizeof(int) : per_sw(s.kb);
     auto big_k = gw ? rdma_slot_big<true> : rdma_slot_big<false>;

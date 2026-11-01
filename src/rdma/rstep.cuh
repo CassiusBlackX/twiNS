@@ -875,7 +875,7 @@ __device__ __forceinline__ void qpre_of(QPre &q, uint32_t code0, const Chain &ch
 // QbbNetDevice and RdmaEgressQueue state (Host, its TransmitComplete and m_nextSend chains, its ACK
 // queue and queue-pair group: the per-NIC arrays, at s.nic_off[h] + device); RdmaHw (queue pairs)
 // is shared. The host's flow starts live in its first device's Host.
-constexpr int MAXD = 4;
+constexpr int MAXD = 3;
 // a host's devices' TransmitComplete, m_nextSend and next arrival's chains in quick form (lane 0's,
 // made when a tie needs them; hq_ok bits: d, MAXD + d, 2 MAXD + d)
 __shared__ QPre hq_tc[MAXD], hq_ns[MAXD], hq_ar[MAXD];
@@ -3368,6 +3368,16 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
             *s.finished = 1;
 #endif
     }
+#ifdef TWINS_ASTRA
+    // nothing for the host to answer: the slots from here on are safe as those after a sync, as far as
+    // its next timer lets them be, so the run need not stop for it
+    if (s.cl->head == s.cl->seen)
+    {
+        const int64_t cap = s.cl->cap, to = next < cap ? next : cap;
+        if (to + s.cl_span > s.cl->limit)
+            s.cl->limit = to + s.cl_span;
+    }
+#endif
     if (s.gwin)
     {
         // the next launch's slots: the static bound, or up to the earliest quiet server's next
@@ -3386,13 +3396,13 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
         if (s.max_slots - next < k)
             k = s.max_slots - next;
 #ifdef TWINS_ASTRA
+        // (the window the horizons allow, for the host's choice of graph and for the launch after a
+        // sync: the limit that cuts it here moves)
+        s.cl->k = k > 1 ? (int)k : 1;
         if (s.cl->limit - next < k)
             k = s.cl->limit - next;
 #endif
         *s.gk = k > 1 ? (int)k : 1;
-#ifdef TWINS_ASTRA
-        s.cl->k = *s.gk;
-#endif
     }
 #ifdef RDMA_PROF
     s.ev[18] += s.ev[16];
@@ -3515,9 +3525,14 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
             h_wake = s.hs[bi.base].wake;
         __syncthreads();
     }
-    const Params &WPw = s.Pw[s.h_world[h]];
-    const int64_t wlen = k * s.P.delay;
-    int nsl = sparse && (WPw.cc != 1 || (wlen <= WPw.alpha_int && wlen <= WPw.dec_int && wlen <= WPw.rp_int)) ? k : 1;
+    int nsl = 1;
+    if (sparse)
+    {
+        const Params &WPw = s.Pw[s.h_world[h]];
+        const int64_t wlen = k * s.P.delay;
+        if (WPw.cc != 1 || (wlen <= WPw.alpha_int && wlen <= WPw.dec_int && wlen <= WPw.rp_int))
+            nsl = k;
+    }
     for (int j = 0; j < k; j++)
     {
         if (sparse)
@@ -4042,8 +4057,12 @@ __global__ void closed_apply(int n, int64_t limit, int64_t cap, int single, unsi
     c.cap = cap;
     c.seen = seen;
     c.floor = floor;
-    if (single && s.gwin)
-        *s.gk = 1; // (a flow fired since the horizons were read)
+    if (s.gwin)
+    {
+        // (a flow fired since the horizons were read: one slot)
+        const int64_t room = limit - *s.slot;
+        *s.gk = single || c.k <= 1 || room <= 1 ? 1 : (int)(c.k < room ? c.k : room);
+    }
 }
 
 // a timer against a completion of its time and lead: their chains decide (in cl->cmp)

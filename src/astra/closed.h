@@ -191,6 +191,7 @@ struct Closed : astra::Network
         unsigned long long seen = 0;
         int64_t S = 0;
         int k = 1;
+        bool busy = true;
         // (before the first launch: the bounds the setup could not know)
         ClCtl c0 = {};
         c0.limit = span;
@@ -199,7 +200,9 @@ struct Closed : astra::Network
         for (;;)
         {
             auto a = now();
-            launch(k);
+            // (few launches, up to the limit, while completions keep coming; else many: without any
+            // the GPU moves the limit itself)
+            launch(busy ? k : 1);
             CK(cudaGetLastError());
             ClCtl ctl;
             CK(hipMemcpyAsync(&ctl, s.cl, sizeof(ctl), hipMemcpyDeviceToHost, st));
@@ -209,6 +212,7 @@ struct Closed : astra::Network
             t_gpu += sec(a, b);
             syncs++;
             k = ctl.k;
+            busy = ctl.head != seen;
             // a run that will start again with more room (see main) stops here
             if (syncs % 1024 == 0 && (stop_d || stop_t))
             {
