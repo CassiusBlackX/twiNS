@@ -2097,6 +2097,20 @@ int main(int argc, char **argv)
         CK(hipMemcpyFromSymbol(gp, HIP_SYMBOL(g_prof), sizeof(gp)));
         printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu), walk steps %llu by leads, %llu others, walks' cycles %.3f G; walks cut short %llu\n", gp[0], gp[3], gp[1], gp[4], gp[2], gp[5], gp[6] * 1e-9, gp[7]);
     }
+    {
+        unsigned long long v[24];
+        CK(hipMemcpyFromSymbol(v, HIP_SYMBOL(g_pv), sizeof(v)));
+        auto per = [](unsigned long long c, unsigned long long n) { return n ? (double)c / n : 0.0; };
+        printf("pv: launches %llu, slots in them %llu (%.2f per launch), of one slot %llu\n", v[0], v[1], per(v[1], v[0]), v[2]);
+        printf("pv: host steps: empty %llu at %.0f cycles, with events %llu at %.0f cycles; events %llu (%.2f per step, %.0f cycles each)\n", v[4],
+               per(v[5], v[4]), v[6], per(v[7], v[6]), v[8], per(v[8], v[6]), per(v[7], v[8]));
+        printf("pv: switch slots: idle %llu at %.0f cycles, busy without an event %llu at %.0f, with events %llu at %.0f; arrivals %llu\n", v[9],
+               per(v[10], v[9]), v[11], per(v[12], v[11]), v[13], per(v[14], v[13]), v[15]);
+        printf("pv: switch windows as one step %llu at %.0f cycles, fell back %llu\n", v[16], per(v[18], v[16]), v[17]);
+        printf("pv: NVSwitches' horizons: busy %llu, NVLink queue pairs running %llu, fired to start %llu\n", v[20], v[21], v[22]);
+        printf("pv: lane 0's cycles: hosts empty %.2f G, with events %.2f G; switches idle %.2f G, busy without an event %.2f G, with events %.2f G\n", v[5] * 1e-9,
+               v[7] * 1e-9, v[10] * 1e-9, v[12] * 1e-9, v[14] * 1e-9);
+    }
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);

@@ -140,6 +140,14 @@ __device__ __forceinline__ int ring_add(int a, int b, int n)
     return x >= n ? x - n : x;
 }
 
+// a ring's index past its end, perhaps by several turns (a window can be longer than a link's ring)
+__device__ __forceinline__ int ring_wrap(int a, int n)
+{
+    while (a >= n)
+        a -= n;
+    return a;
+}
+
 // DataRate(d) from a double (DataRate(uint64_t), truncation)
 __device__ __forceinline__ uint64_t rate_of(double d) { return (uint64_t)d; }
 
@@ -166,6 +174,14 @@ struct Memo
 __device__ Memo g_memo;
 #ifdef RDMA_PROF
 __device__ unsigned long long g_prof[8]; // ccmp calls, walks, walk steps, memo hits, inserts
+// launches, their slots, those of one slot, slots jumped; host steps empty, with events: count,
+// cycles; host events; switch slots idle (no step), busy without an event, with events: count,
+// cycles; switch arrivals
+// switch windows run as one step, those that fell back, their cycles, their arrivals
+__device__ unsigned long long g_pv[24];
+#endif
+#ifdef RDMA_PROF
+#define PV_ADD(i, v) atomicAdd(&g_pv[i], (unsigned long long)(v))
 #endif
 
 // a chain's hash after one more code: of its lead only (splitmix64's finalizer). Ordinals decide
@@ -1476,30 +1492,64 @@ constexpr int HHINTS = 1 + 2 * MAXD;
 // ND: the most devices a host of this kind has (1: one NIC, its state stays in registers)
 template <int ND>
 __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int64_t slot, int64_t *wake, int lane, int lanes, HArr *pool, int *hints,
-                                          struct Due *due)
+                                          struct Due *due, int nsl = 1, const unsigned *wdev = nullptr, unsigned wdag = 0)
 {
     const int h = bi.e;
-    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
+    // nsl > 1: a global window's slots as one step (see host_block); wdev: per device, the slots with
+    // arrivals; wdag: those with DAG messages. If they do not fit, hints[0] > HPOOL and nothing changed.
+    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + nsl * D;
     const Params &WP = s.Pw[s.h_world[h]];
     const int nd = ND == 1 ? 1 : bi.deg;
     (void)t0;
     if (lane == 0)
     {
         int total = 0;
-        for (int d = 0; d < nd; d++)
+        if (nsl > 1)
         {
-            uint32_t base;
-            int n = bucket(s, d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d], slot, &base);
-            hints[1 + 2 * d] = (int)base;
-            hints[2 + 2 * d] = n;
-            total += n;
+            for (int d = 0; d < nd; d++)
+            {
+                const LinkInfo &l = s.li[d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d]];
+                int n = 0;
+                for (unsigned m = wdev[d]; m; m &= m - 1)
+                {
+                    const int b = (int)fmod(l.fnb, slot + __builtin_ctz(m));
+                    const int c = (int)(s.msg_cnt[l.coff + b] & 0xFFFF);
+                    const uint32_t base = (uint32_t)(l.moff + (uint64_t)b * l.cap);
+                    for (int i = 0; i < c; i++, n++)
+                        if (total + n < HPOOL)
+                            pool[total + n].frame = base + i;
+                }
+                hints[2 + 2 * d] = n;
+                total += n;
+                if (WP.cc == 1)
+                {
+                    // (the timers due in the window must fit in the list)
+                    const Host &st = s.hs[bi.base + d];
+                    if (st.due_min < t1 && st.qp_n * 3 > MAX_DUE)
+                        total = HPOOL + 1;
+                }
+            }
+            hints[HHINTS] = 0;
+        }
+        else
+        {
+            for (int d = 0; d < nd; d++)
+            {
+                uint32_t base;
+                int n = bucket(s, d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d], slot, &base);
+                hints[1 + 2 * d] = (int)base;
+                hints[2 + 2 * d] = n;
+                total += n;
+            }
+            // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
+            // the host has no event in it
+            hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)]) && s.hs[bi.base].wake >= t1;
         }
         hints[0] = total;
-        // nothing arrives, no DAG message, and its own earliest event (wake) lies beyond the slot:
-        // the host has no event in it
-        hints[HHINTS] = total == 0 && !(s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)]) && s.hs[bi.base].wake >= t1;
     }
     __syncthreads();
+    if (nsl > 1 && hints[0] > HPOOL)
+        return false;
     if (hints[HHINTS])
     {
         *wake = s.hs[bi.base].wake;
@@ -1514,7 +1564,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             while (k >= hints[2 + 2 * d])
                 k -= hints[2 + 2 * d++];
             int link_in = d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d];
-            uint32_t fi = (uint32_t)hints[1 + 2 * d] + k;
+            uint32_t fi = nsl > 1 ? pool[j].frame : (uint32_t)hints[1 + 2 * d] + k;
             const LFrame &f = s.msg[fi];
             HArr &a = pool[j];
             a.ts = f.ts;
@@ -1526,7 +1576,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
     __syncthreads();
     // (with FAST_REACT every ACK of a QP calls UpdateRateHp, which stores its hops; without it,
     // only those that end an RTT do)
-    if (pooled && WP.cc == 3 && WP.fast_react && !WP.sample_feedback)
+    if (pooled && nsl == 1 && WP.cc == 3 && WP.fast_react && !WP.sample_feedback)
         for (int j = lane; j < total; j += lanes)
         {
             HArr &a = pool[j];
@@ -1626,9 +1676,9 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
     // one this is becomes ready, to start at the latest of them (in ns-3's order)
     int *dyn = s.dag ? s.dyn + (size_t)h * s.dyn_cap : nullptr;
     int ndyn = s.dag ? s.dyn_n[h] : 0;
-    if (s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, slot)])
+    for (unsigned hm = !s.dag ? 0u : nsl > 1 ? wdag : 1u; hm; hm &= hm - 1)
     {
-        int b = (int)fmod(s.fnbi, slot);
+        int b = (int)fmod(s.fnbi, slot + __builtin_ctz(hm));
         unsigned int nx = s.hhead[(size_t)h * s.nbi + b];
         s.hhead[(size_t)h * s.nbi + b] = 0;
         for (; nx; nx = s.dmsg[(size_t)b * s.dcap + nx - 1].next)
@@ -1786,6 +1836,9 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                 }
         if (bk < 0)
             break;
+#ifdef RDMA_PROF
+        PV_ADD(8, 1);
+#endif
         if (bt < t0)
             atomicAdd(&s.ev[32], 1ull); // an event of a slot not run (a bug: reported)
         c.now = bt;
@@ -2366,13 +2419,18 @@ __device__ __forceinline__ int block_exscan(const int *in, int *out, int n, int 
 
 // WIDE: the switches of rdma_slot_big (more than SAFE_LANES ports); the narrow ones' code (in
 // rdma_slot) leaves out their path, whose registers would otherwise spill the safe slots'
+//
+// nsl > 1: a global window's slots as one safe step: nothing another entity does lands in them, and
+// all that a safe slot asks holds for all of them, the arrivals of all of them staying. Egress ports
+// stay independent, so their events are simply run up to the window's end. Returns 2, having changed
+// nothing, if that cannot be: the slots then run one by one.
 template <bool WIDE>
-__device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
-                                            int *shared_int, int K)
+__device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, int64_t slot, SwPortLds *w, ArrLds *pool, int *pidx, int lane, int lanes,
+                                           int *shared_int, int K, int nsl = 1)
 {
     const int x = bi.e;
     Chain *tcs = s.p_tc + bi.base;
-    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + D;
+    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + nsl * D;
     const int node = s.H + x, deg = bi.deg;
     const Params &WP = s.Pw[s.s_world[x]];
     Port *gp = s.ps + bi.base;
@@ -2401,12 +2459,32 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         const PortStatic ps = s.pst[bi.base + p];
         q.link_in = ps.link_in;
         link_open(q.ob, ps.link_out, s.li[ps.link_out], q.pt.ob_last);
+        if (nsl == 1)
         {
             // bucket(), from the port's copy of its link's ring
             int b = (int)fmod(ps.in_fnb, slot);
             long long v = s.msg_cnt[ps.in_coff + b];
             q.abase = ps.in_moff + (uint32_t)b * ps.in_cap;
             q.an = (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;
+        }
+        else
+        {
+            // the window's buckets: their number here, and which ones (in ai: no fallback cursor)
+            const int b0 = (int)fmod(ps.in_fnb, slot);
+            int n = 0;
+            unsigned m = 0;
+            for (int j = 0; j < nsl; j++)
+            {
+                const int b = ring_wrap(b0 + j, ps.in_nb);
+                const long long v = s.msg_cnt[ps.in_coff + b];
+                if ((v >> 16) == slot + j && (v & 0xFFFF) > 0)
+                {
+                    n += (int)(v & 0xFFFF);
+                    m |= 1u << j;
+                }
+            }
+            q.an = n;
+            q.ai = (int)m;
         }
         q.in_delay = ps.in_delay;
         q.out_delay = ps.out_delay;
@@ -2434,6 +2512,38 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         for (int p = 0; p < deg; p++)
             total += cnt[p];
     bool pooled = total <= POOL;
+    // a window's frames: their places in s.msg, by arrival index, past the sort's indices (at most LK)
+    uint32_t *flist = (uint32_t *)pidx + LK;
+    if (nsl > 1)
+    {
+        if (total > LK || deg > lanes || (!WIDE && deg > SAFE_LANES) || s.serial || nsl * D > 65535)
+            return 2;
+        for (int p = lane; p < deg; p += lanes)
+        {
+            unsigned m = (unsigned)w[p].ai;
+            if (!m)
+                continue;
+            int at = 0;
+            if (WIDE)
+                at = first[p];
+            else
+                for (int r = 0; r < p; r++)
+                    at += cnt[r];
+            const PortStatic ps = s.pst[bi.base + p];
+            const int b0 = (int)fmod(ps.in_fnb, slot);
+            while (m)
+            {
+                const int j = __builtin_ctz(m);
+                m &= m - 1;
+                const int b = ring_wrap(b0 + j, ps.in_nb);
+                const int n = (int)(s.msg_cnt[ps.in_coff + b] & 0xFFFF);
+                const uint32_t base = ps.in_moff + (uint32_t)b * ps.in_cap;
+                for (int i = 0; i < n; i++)
+                    flist[at++] = base + i;
+            }
+        }
+        __syncthreads();
+    }
     if (pooled)
         for (int j = lane; j < total; j += lanes)
         {
@@ -2457,7 +2567,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
                 while (j - base >= cnt[p])
                     base += cnt[p++];
             int k = j - base;
-            uint32_t fi = w[p].abase + k;
+            uint32_t fi = nsl > 1 ? flist[j] : w[p].abase + k;
             const LFrame &f = s.msg[fi];
             ArrLds &a = pool[j];
             a.ts = f.ts;
@@ -2493,7 +2603,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = pooled && total <= LK && D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
+    bool safe = pooled && total <= LK && nsl * D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
     // (the ports' sums and checks by their lanes: a wide switch's ports, one after the other, cost
     // more than its events)
     __shared__ unsigned long long sw_sum;
@@ -2534,6 +2644,8 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
         }
         safe = !__syncthreads_or(bad);
     }
+    if (nsl > 1 && !safe)
+        return 2;
     bool act = false;
     if (safe)
     {
@@ -3175,7 +3287,7 @@ __device__ __forceinline__ bool switch_step(const Sim &s, const BlockInfo &bi, i
             act = true;
         gp[p] = w[p].pt;
     }
-    return act;
+    return act ? 1 : 0;
 }
 
 // ------------------------------------------------------------------ the slot kernel
@@ -3192,6 +3304,12 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     if (ticket != (unsigned int)(s.H + s.S) - 1)
         return;
     __threadfence();
+#ifdef RDMA_PROF
+    PV_ADD(0, 1);
+    PV_ADD(1, nsl);
+    if (nsl == 1)
+        PV_ADD(2, 1);
+#endif
     unsigned int fd = atomicAdd(s.flows_done, 0u);
 #ifdef TWINS_ASTRA
     (void)fd; // (the host ends the run: the system layer has the last word)
@@ -3329,6 +3447,8 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
     return k;
 }
 
+// The most slots a window's mask of slots with arrivals covers (longer windows step every slot).
+constexpr int WIN_MASK = 32;
 template <int ND>
 __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int gk)
 {
@@ -3361,10 +3481,90 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
         return;
     }
     bool act = false;
+    // A window as one step, when something happens in it. Nothing another entity does in this launch
+    // lands in the window (its frames take a link's delay, its messages send_lat), so what arrives
+    // in it is known here, a lane per slot. The host's own events run in their order as in any
+    // slot; so do the timers, if a timer set in the window cannot fall due in it. If the window's
+    // frames do not fit in the pool, its slots with an event run one by one.
+    const bool sparse = !s.any_win && k > 1 && k <= WIN_MASK;
+    __shared__ unsigned h_dev[MAXD], h_dag;
+    __shared__ int64_t h_wake;
+    if (sparse)
+    {
+        if (lane == 0)
+        {
+            for (int d = 0; d < MAXD; d++)
+                h_dev[d] = 0;
+            h_dag = 0;
+        }
+        __syncthreads();
+        const int nd = ND == 1 ? 1 : bi.deg;
+        for (int j = lane; j < k; j += lanes)
+        {
+            const int64_t sl = slot + j;
+            if (s.dag && s.hhead[(size_t)h * s.nbi + fmod(s.fnbi, sl)])
+                atomicOr(&h_dag, 1u << j);
+            for (int d = 0; d < nd; d++)
+            {
+                uint32_t base;
+                if (bucket(s, d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d], sl, &base) > 0)
+                    atomicOr(&h_dev[d], 1u << j);
+            }
+        }
+        if (lane == 0)
+            h_wake = s.hs[bi.base].wake;
+        __syncthreads();
+    }
+    const Params &WPw = s.Pw[s.h_world[h]];
+    const int64_t wlen = k * s.P.delay;
+    int nsl = sparse && (WPw.cc != 1 || (wlen <= WPw.alpha_int && wlen <= WPw.dec_int && wlen <= WPw.rp_int)) ? k : 1;
     for (int j = 0; j < k; j++)
     {
+        if (sparse)
+        {
+            unsigned all = h_dag;
+            for (int d = 0; d < MAXD; d++)
+                all |= h_dev[d];
+            const unsigned r = all >> j;
+            int nx = r ? j + __builtin_ctz(r) : k;
+            const int64_t wk = h_wake;
+            if (wk < (slot + nx) * s.P.delay)
+                nx = wk < (slot + j + 1) * s.P.delay ? j : (int)((int64_t)fdiv(s.fD, (unsigned long long)wk) - slot);
+            if (nx >= k)
+            {
+                w = wk;
+                break;
+            }
+            if (nsl == 1)
+                j = nx;
+        }
         w = INT64_MAX;
-        act |= host_step<ND>(s, bi, slot + j, &w, lane, lanes, pool, hints, due);
+#ifdef RDMA_PROF
+        long long c0 = clock64();
+#endif
+        act |= host_step<ND>(s, bi, slot + j, &w, lane, lanes, pool, hints, due, nsl, h_dev, h_dag);
+        if (nsl > 1 && hints[0] > HPOOL)
+        {
+            nsl = 1;
+            j = -1;
+            continue;
+        }
+        if (sparse)
+        {
+            if (lane == 0)
+                h_wake = w;
+            __syncthreads();
+        }
+#ifdef RDMA_PROF
+        if (lane == 0)
+        {
+            const int e = hints[HHINTS] ? 0 : 1;
+            PV_ADD(4 + e * 2, 1);
+            PV_ADD(5 + e * 2, clock64() - c0);
+        }
+#endif
+        if (nsl > 1)
+            break;
     }
 #ifdef RDMA_PROF
     if (lane == 0)
@@ -3408,14 +3608,87 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
         return;
     }
     int any_act = 0;
+    // A window's slots without an event are not stepped: its arrivals are known here (see
+    // host_block), and its TransmitCompletes are the ports'. A step without an event changes nothing.
+    const bool sparse = !s.any_win && k > 1 && k <= WIN_MASK;
+    __shared__ unsigned sw_mask;
+    __shared__ unsigned long long sw_tc;
+    if (sparse)
+    {
+        if (lane == 0)
+        {
+            sw_mask = 0;
+            sw_tc = ~0ull;
+        }
+        __syncthreads();
+        const int busy = s.sw_busy[x];
+        any_act = busy; // (it stays so without an event)
+        unsigned m = 0;
+        unsigned long long tc = ~0ull;
+        for (int p = lane; p < bi.deg; p += lanes)
+        {
+            const PortStatic &ps = s.pst[bi.base + p];
+            const int b0 = (int)fmod(ps.in_fnb, slot);
+            for (int j = 0; j < k; j++)
+            {
+                const int b = ring_wrap(b0 + j, ps.in_nb);
+                const long long v = s.msg_cnt[ps.in_coff + b];
+                if ((v >> 16) == slot + j && (v & 0xFFFF) > 0)
+                    m |= 1u << j;
+            }
+            if (busy)
+            {
+                const int64_t t = s.ps[bi.base + p].tc_at;
+                if (t >= 0 && (unsigned long long)t < tc)
+                    tc = (unsigned long long)t;
+            }
+        }
+        if (m)
+            atomicOr(&sw_mask, m);
+        if (tc != ~0ull)
+            atomicMin(&sw_tc, tc);
+        __syncthreads();
+    }
+    // all of the window as one step, if something happens in it; if that cannot be, slot by slot
+    int nsl = sparse ? k : 1;
     for (int j = 0; j < k; j++)
     {
+        if (sparse)
+        {
+            const unsigned r = sw_mask >> j;
+            int nx = r ? j + __builtin_ctz(r) : k;
+            const unsigned long long tc = sw_tc;
+            if (tc != ~0ull && (int64_t)tc < (slot + nx) * s.P.delay)
+                nx = (int64_t)tc < (slot + j + 1) * s.P.delay ? j : (int)((int64_t)fdiv(s.fD, tc) - slot);
+            if (nx >= k)
+                break;
+            if (nsl == 1)
+                j = nx;
+        }
         const int64_t sl = slot + j;
         if (lane == 0)
             blk_act = 0;
         __syncthreads();
         // an idle switch (nothing queued or in transmission) without arrivals has no events: skip it
-        bool run = s.sw_busy[x];
+#ifdef RDMA_PROF
+        int pv_hv = 0;
+        for (int p = lane; p < bi.deg; p += lanes)
+        {
+            const PortStatic &ps = s.pst[bi.base + p];
+            long long v = s.msg_cnt[ps.in_coff + (int)fmod(ps.in_fnb, sl)];
+            if ((v >> 16) == sl && (v & 0xFFFF) > 0)
+            {
+                pv_hv = 1;
+                PV_ADD(15, v & 0xFFFF);
+            }
+            int64_t tc = s.ps[bi.base + p].tc_at;
+            if (tc >= 0 && tc < (sl + 1) * s.P.delay)
+                pv_hv = 1;
+        }
+        pv_hv = __syncthreads_or(pv_hv);
+        long long c0 = clock64();
+#endif
+        bool run = sparse || s.sw_busy[x];
         if (!run)
         {
             const int deg = bi.deg;
@@ -3428,12 +3701,57 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
             }
             run = __syncthreads_or(any);
         }
-        if (run && switch_step<WIDE>(s, bi, sl, w, pool, pidx, lane, lanes, ints, kl))
+        const int rs = run ? switch_step<WIDE>(s, bi, sl, w, pool, pidx, lane, lanes, ints, kl, nsl) : 0;
+        if (rs == 1)
             blk_act = 1; // (any lane: the ports are spread over them)
         __syncthreads();
+        if (rs == 2)
+        {
+            nsl = 1;
+            j = -1;
+#ifdef RDMA_PROF
+            if (lane == 0)
+                PV_ADD(17, 1);
+#endif
+            continue;
+        }
         if (lane == 0)
             s.sw_busy[x] = blk_act;
         any_act |= blk_act;
+#ifdef RDMA_PROF
+        if (lane == 0)
+        {
+            if (nsl > 1)
+            {
+                PV_ADD(16, 1);
+                PV_ADD(18, clock64() - c0);
+            }
+            else
+            {
+                const int e = pv_hv ? 2 : run ? 1 : 0;
+                PV_ADD(9 + e * 2, 1);
+                PV_ADD(10 + e * 2, clock64() - c0);
+            }
+        }
+#endif
+        if (nsl > 1)
+            break;
+        if (sparse)
+        {
+            // the ports' next TransmitComplete
+            if (lane == 0)
+                sw_tc = ~0ull;
+            __syncthreads();
+            unsigned long long tc = ~0ull;
+            for (int p = lane; p < bi.deg; p += lanes)
+            {
+                const int64_t t = w[p].pt.tc_at;
+                if (t >= 0 && (unsigned long long)t < tc)
+                    tc = (unsigned long long)t;
+            }
+            if (tc != ~0ull)
+                atomicMin(&sw_tc, tc);
+        }
         if (k > 1)
             __syncthreads(); // (blk_act is reset for the next slot)
     }
@@ -3466,6 +3784,14 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
                 }
                 hz = lo < end ? (unsigned long long)s.srv_rs[lo] : ~0ull;
             }
+#ifdef RDMA_PROF
+            if (s.sw_busy[x])
+                PV_ADD(20, 1);
+            if (s.srv_fact[x])
+                PV_ADD(21, 1);
+            if (s.dag && s.srv_fpend[x])
+                PV_ADD(22, 1);
+#endif
             atomicMin(s.gk_hz, hz);
         }
         slot_end(s, slot, any_act, ~0ull, s.gwin ? k : 1);
