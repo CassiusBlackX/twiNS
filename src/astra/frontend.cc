@@ -96,6 +96,8 @@ Frontend::Frontend(const std::string &topo, const std::string &workload, Network
     for (int i = gpu_num; i < nodes_num; i++)
         nvs.push_back(i);
     MockNcclLog::set_log_name("SimAI.log");
+    // (SimAI's switch: a dump of every flow, read by nothing here: 9% of the system layer's time)
+    setenv("SIMAI_DUMP_DETAILED_FLOWS", "0", 0);
     for (int j = 0; j < nodes_num; j++)
     {
         auto *net_j = new Net(j, this);
