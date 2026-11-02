@@ -3851,7 +3851,9 @@ __device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, 
     int fin = *s.finished;
     *gk = s.gwin ? *s.gk : 1;
     // (keeps the loads above the branch: issued together, not one after the other)
+#if defined(TWINS_USE_HIP)
     asm volatile("" ::"v"(bi->e), "v"(bi->deg), "v"(bi->base), "v"(bi->link0), "v"((int)*slot), "v"((int)(*slot >> 32)), "v"(*gk));
+#endif
 #ifdef TWINS_ASTRA
     return !fin && *slot < s.cl->limit;
 #else

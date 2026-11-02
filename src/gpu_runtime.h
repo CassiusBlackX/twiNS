@@ -85,6 +85,9 @@ inline cudaError_t hipGraphInstantiate(cudaGraphExec_t *exec, cudaGraph_t graph,
 #define hipDeviceAttributeClockRate cudaDevAttrClockRate
 // (no wall-clock counter attribute in CUDA: clock64() counts SM cycles)
 #define hipDeviceAttributeWallClockRate cudaDevAttrClockRate
+// (GCC's bit builtins do not reach CUDA's device code; they are used there alone)
+#define __builtin_ctz(x) (__ffs(x) - 1)
+#define __shfl_up(x, o) __shfl_up_sync(0xffffffffu, x, o)
 
 #endif
 

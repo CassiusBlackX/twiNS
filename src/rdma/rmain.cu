@@ -1924,7 +1924,7 @@ int main(int argc, char **argv)
     // joins cost launches tens of us); the next 64 slots run with it while the last ones' wide
     // switches met ties their prefixes left open (ev[34]: about a chain walk each, on the slot's
     // critical path) at more than one in 4 slots
-    auto capture = [&](bool ranks, hipGraphExec_t *ge, int gs = GS) {
+    auto capture = [&](bool ranks, hipGraphExec_t *ge, int gs) {
     hipGraph_t graph;
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
     for (int i = 0; i < gs; i++)
@@ -1962,13 +1962,13 @@ int main(int argc, char **argv)
     };
     CK(hipMemcpyToSymbol(HIP_SYMBOL(c_sim), &s, sizeof(Sim))); // (the kernels' Sim: it does not change from here)
     hipGraphExec_t g_plain, g_rank = nullptr;
-    capture(false, &g_plain);
+    capture(false, &g_plain, GS);
 #ifdef TWINS_ASTRA
     hipGraphExec_t g_win = nullptr;
     capture(false, &g_win, GS_win);
 #endif
     if (ranks)
-        capture(true, &g_rank);
+        capture(true, &g_rank, GS);
     bool use_rank = false;
     unsigned long long open_ties = 0;
     // persistent: when all H + S blocks are resident at once (the barrier needs every one running).
