@@ -14,11 +14,13 @@ These runs replay SimAI's recordings. `whatif.md` runs the same workloads with n
     at 1024 GPUs);
   - 1024-GPU AlibabaHPN, whose switches have 248 ports.
 - Against SimAI on one core, TwiNS on an RX 9060 XT is:
-  - 4–55× faster on collectives;
-  - 6–13× faster on 128-GPU training;
-  - 15–28× faster on 512- and 1024-GPU training.
+  - 11–122× faster on collectives;
+  - 6–16× faster on 128-GPU training;
+  - 15–44× faster on 512- and 1024-GPU training.
 - SimAI's single-threaded runs take up to 6.5 h (GPT-3 175B probe at 1024 GPUs); TwiNS's take
-  14 min.
+  10 min.
+- These times are the simulation loop, without start-up (about 0.5 s at 128 GPUs, 1.4 s at 1024), which
+  matters only for the smallest runs.
 
 ## Workloads
 
@@ -59,68 +61,69 @@ parallel groups and communication pattern, with fewer layers.
 
 ## Results
 
-TwiNS at `00743b5` (global windows on), RX 9060 XT. "Speedup" is against the untraced time where
-there is one, else the traced one.
+TwiNS at `9829a00`, RX 9060 XT; GPT-3 175B probe at 1024 GPUs with `--dcap=8192`, which it needs to fit
+(`whatif.md`, "Limits"). "Speedup" is against the untraced time where there is one, else the traced one.
 
 | run | messages | identical | simulated (ms) | SimAI traced (s) | SimAI untraced (s) | SimAI peak (GB) | TwiNS (s) | speedup |
 |---|---|---|---|---|---|---|---|---|
-| c_allgather_512m_hpn128 | 1920 | 1920 | 23.37 | 54.7 | 54.4 | — | 11.6 | 4.7× |
-| c_allgather_64m_hpn128 | 1920 | 1920 | 2.63 | 10.9 | 10.2 | — | 1.3 | 7.6× |
-| c_allgather_8m_hpn128 | 1920 | 1920 | 0.40 | 5.4 | 4.8 | — | 0.2 | 26.1× |
-| c_allreduce_512m_hpn128 | 3840 | 3840 | 55.66 | 102.6 | 102.7 | — | 25.7 | 4.0× |
-| c_allreduce_64m_hpn128 | 3840 | 3840 | 5.25 | 17.1 | 16.6 | — | 2.7 | 6.2× |
-| c_allreduce_8m_hpn128 | 3840 | 3840 | 0.80 | 6.4 | 6.2 | — | 0.4 | 17.3× |
-| c_reducescatter_512m_hpn128 | 1920 | 1920 | 23.37 | 54.0 | 55.2 | — | 11.4 | 4.8× |
-| c_reducescatter_64m_hpn128 | 1920 | 1920 | 2.63 | 11.0 | 10.2 | — | 1.3 | 7.7× |
-| c_reducescatter_8m_hpn128 | 1920 | 1920 | 0.40 | 5.5 | 4.8 | — | 0.2 | 26.3× |
-| gpt3_13b_probe_hpn128 | 42240 | 42240 | 56.37 | 517.8 | — | — | 86.1 | 6.0× |
-| gpt3_175b_probe_hpn128 | 1385344 | 1385344 | 189.25 | 2125.2 | — | 7.5 | 166.8 | 12.7× |
-| llama_65b_probe_hpn128 | 439168 | 439168 | 81.35 | 620.4 | — | — | 60.4 | 10.3× |
-| c_allgather_512m_hpn512 | 32256 | 32256 | 27.80 | 294.9 | 258.1 | 7.4 | 23.6 | 10.9× |
-| c_allgather_64m_hpn512 | 32256 | 32256 | 3.01 | 44.6 | 39.4 | 7.4 | 2.7 | 14.4× |
-| c_allgather_8m_hpn512 | 32256 | 32256 | 0.67 | 13.0 | 13.0 | 7.4 | 0.4 | 34.1× |
-| c_allreduce_512m_hpn512 | 64512 | 64512 | 108.05 | 533.7 | 490.0 | 7.5 | 75.8 | 6.5× |
-| c_allreduce_64m_hpn512 | 64512 | 64512 | 6.02 | 84.7 | 74.1 | 7.5 | 5.5 | 13.3× |
-| c_allreduce_8m_hpn512 | 64512 | 64512 | 1.35 | 21.2 | 19.0 | 7.5 | 0.8 | 23.9× |
-| c_reducescatter_512m_hpn512 | 32256 | 32256 | 27.75 | 268.5 | 250.8 | 7.4 | 23.7 | 10.6× |
-| c_reducescatter_64m_hpn512 | 32256 | 32256 | 3.01 | 45.4 | 38.7 | 7.4 | 2.8 | 13.7× |
-| c_reducescatter_8m_hpn512 | 32256 | 32256 | 0.67 | 14.5 | 12.9 | 7.4 | 0.4 | 34.0× |
-| c_allgather_512m_hpn1024 | 130048 | 130048 | 29.95 | 738.0 | 542.8 | 10.6 | 30.7 | 17.7× |
-| c_allgather_64m_hpn1024 | 130048 | 130048 | 3.37 | 133.7 | 92.4 | 10.6 | 3.6 | 25.7× |
-| c_allgather_8m_hpn1024 | 130048 | 130048 | 1.02 | 44.1 | 34.2 | 10.5 | 0.6 | 54.5× |
-| c_allreduce_512m_hpn1024 | 260096 | 260096 | 172.60 | 1163.3 | 1079.0 | 10.8 | 129.2 | 8.4× |
-| c_allreduce_64m_hpn1024 | 260096 | 260096 | 6.75 | 247.9 | 171.6 | 10.8 | 7.3 | 23.6× |
-| c_allreduce_8m_hpn1024 | 260096 | 260096 | 2.04 | 67.6 | 53.2 | 10.8 | 1.2 | 42.7× |
-| c_reducescatter_512m_hpn1024 | 130048 | 130048 | 43.90 | 733.9 | 530.5 | 10.6 | 37.7 | 14.1× |
-| c_reducescatter_64m_hpn1024 | 130048 | 130048 | 3.38 | 133.0 | 86.4 | 10.6 | 3.6 | 23.9× |
-| c_reducescatter_8m_hpn1024 | 130048 | 130048 | 1.02 | 46.3 | 32.1 | 10.6 | 0.6 | 50.9× |
-| gpt3_13b_full_hpn128 | 120064 | 120064 | 557.97 | 5220.5 | — | 5.6 | 824.3 | 6.3× |
-| llama_65b_full_hpn128 | 4797312 | 4797312 | 904.12 | 6673.1 | — | 12.7 | 639.0 | 10.4× |
-| gpt3_175b_full_hpn128 | 5972864 | 5972864 | 734.78 | 6384.6 | — | 14.5 | 566.2 | 11.3× |
-| gpt3_13b_probe_hpn512 | 562176 | 562176 | 73.74 | 2986.5 | — | 8.9 | 189.6 | 15.8× |
-| llama_65b_probe_hpn512 | 1781248 | 1781248 | 153.75 | 3526.2 | — | 10.1 | 170.1 | 20.7× |
-| llama_65b_mid_hpn512 | 2698752 | 2698752 | 244.28 | 5380.8 | — | 11.5 | 260.4 | 20.7× |
-| gpt3_13b_probe_hpn1024 | 2172928 | 2172928 | 80.32 | 6139.4 | — | 16.5 | 334.1 | 18.4× |
-| gpt3_13b_mid_hpn1024 | 2271232 | 2271232 | 184.44 | 16032.2 | — | 16.8 | 736.6 | 21.8× |
-| llama_65b_mid_hpn1024 | 5463040 | 5463040 | 338.37 | 12517.3 | — | 18.8 | 446.0 | 28.1× |
-| gpt3_175b_probe_hpn1024 | 11197440 | 11197440 | 527.91 | 23325.9 | — | 27.7 | 844.8 | 27.6× |
-| gpt3_13b_mid_hpn512 | 611328 | 611328 | 175.93 | 7156.8 | — | 9.1 | 474.7 | 15.1× |
-| llama_65b_probe_hpn1024 | 3628032 | 3628032 | 183.12 | 7026.8 | — | 16.0 | 273.1 | 25.7× |
+| c_allgather_512m_hpn128 | 1920 | 1920 | 23.37 | 54.7 | 54.4 | — | 4.2 | 13.0× |
+| c_allgather_64m_hpn128 | 1920 | 1920 | 2.63 | 10.9 | 10.2 | — | 0.48 | 21.3× |
+| c_allgather_8m_hpn128 | 1920 | 1920 | 0.40 | 5.4 | 4.8 | — | 0.08 | 62.3× |
+| c_allreduce_512m_hpn128 | 3840 | 3840 | 55.66 | 102.6 | 102.7 | — | 9.2 | 11.1× |
+| c_allreduce_64m_hpn128 | 3840 | 3840 | 5.25 | 17.1 | 16.6 | — | 0.94 | 17.7× |
+| c_allreduce_8m_hpn128 | 3840 | 3840 | 0.80 | 6.4 | 6.2 | — | 0.14 | 44.6× |
+| c_reducescatter_512m_hpn128 | 1920 | 1920 | 23.37 | 54.0 | 55.2 | — | 4.1 | 13.5× |
+| c_reducescatter_64m_hpn128 | 1920 | 1920 | 2.63 | 11.0 | 10.2 | — | 0.48 | 21.1× |
+| c_reducescatter_8m_hpn128 | 1920 | 1920 | 0.40 | 5.5 | 4.8 | — | 0.08 | 61.5× |
+| gpt3_13b_probe_hpn128 | 42240 | 42240 | 56.37 | 517.8 | — | — | 86.4 | 6.0× |
+| gpt3_175b_probe_hpn128 | 1385344 | 1385344 | 189.25 | 2125.2 | — | 7.5 | 130.0 | 16.3× |
+| llama_65b_probe_hpn128 | 439168 | 439168 | 81.35 | 620.4 | — | — | 41.3 | 15.0× |
+| c_allgather_512m_hpn512 | 32256 | 32256 | 27.80 | 294.9 | 258.1 | 7.4 | 6.8 | 38.0× |
+| c_allgather_64m_hpn512 | 32256 | 32256 | 3.01 | 44.6 | 39.4 | 7.4 | 0.83 | 47.5× |
+| c_allgather_8m_hpn512 | 32256 | 32256 | 0.67 | 13.0 | 13.0 | 7.4 | 0.14 | 93.5× |
+| c_allreduce_512m_hpn512 | 64512 | 64512 | 108.05 | 533.7 | 490.0 | 7.5 | 20.4 | 24.0× |
+| c_allreduce_64m_hpn512 | 64512 | 64512 | 6.02 | 84.7 | 74.1 | 7.5 | 1.6 | 45.5× |
+| c_allreduce_8m_hpn512 | 64512 | 64512 | 1.35 | 21.2 | 19.0 | 7.5 | 0.27 | 71.7× |
+| c_reducescatter_512m_hpn512 | 32256 | 32256 | 27.75 | 268.5 | 250.8 | 7.4 | 6.9 | 36.5× |
+| c_reducescatter_64m_hpn512 | 32256 | 32256 | 3.01 | 45.4 | 38.7 | 7.4 | 0.83 | 46.8× |
+| c_reducescatter_8m_hpn512 | 32256 | 32256 | 0.67 | 14.5 | 12.9 | 7.4 | 0.14 | 90.8× |
+| c_allgather_512m_hpn1024 | 130048 | 130048 | 29.95 | 738.0 | 542.8 | 10.6 | 11.6 | 46.7× |
+| c_allgather_64m_hpn1024 | 130048 | 130048 | 3.37 | 133.7 | 92.4 | 10.6 | 1.5 | 62.9× |
+| c_allgather_8m_hpn1024 | 130048 | 130048 | 1.02 | 44.1 | 34.2 | 10.5 | 0.28 | 122.1× |
+| c_allreduce_512m_hpn1024 | 260096 | 260096 | 172.60 | 1163.3 | 1079.0 | 10.8 | 39.9 | 27.0× |
+| c_allreduce_64m_hpn1024 | 260096 | 260096 | 6.75 | 247.9 | 171.6 | 10.8 | 2.9 | 58.8× |
+| c_allreduce_8m_hpn1024 | 260096 | 260096 | 2.04 | 67.6 | 53.2 | 10.8 | 0.55 | 97.3× |
+| c_reducescatter_512m_hpn1024 | 130048 | 130048 | 43.90 | 733.9 | 530.5 | 10.6 | 13.2 | 40.1× |
+| c_reducescatter_64m_hpn1024 | 130048 | 130048 | 3.38 | 133.0 | 86.4 | 10.6 | 1.5 | 58.5× |
+| c_reducescatter_8m_hpn1024 | 130048 | 130048 | 1.02 | 46.3 | 32.1 | 10.6 | 0.28 | 113.8× |
+| gpt3_13b_full_hpn128 | 120064 | 120064 | 557.97 | 5220.5 | — | 5.6 | 822.0 | 6.4× |
+| llama_65b_full_hpn128 | 4797312 | 4797312 | 904.12 | 6673.1 | — | 12.7 | 425.6 | 15.7× |
+| gpt3_175b_full_hpn128 | 5972864 | 5972864 | 734.78 | 6384.6 | — | 14.5 | 404.2 | 15.8× |
+| gpt3_13b_probe_hpn512 | 562176 | 562176 | 73.74 | 2986.5 | — | 8.9 | 194.1 | 15.4× |
+| llama_65b_probe_hpn512 | 1781248 | 1781248 | 153.75 | 3526.2 | — | 10.1 | 103.9 | 33.9× |
+| llama_65b_mid_hpn512 | 2698752 | 2698752 | 244.28 | 5380.8 | — | 11.5 | 155.9 | 34.5× |
+| gpt3_13b_probe_hpn1024 | 2172928 | 2172928 | 80.32 | 6139.4 | — | 16.5 | 335.5 | 18.3× |
+| gpt3_13b_mid_hpn1024 | 2271232 | 2271232 | 184.44 | 16032.2 | — | 16.8 | 738.8 | 21.7× |
+| llama_65b_mid_hpn1024 | 5463040 | 5463040 | 338.37 | 12517.3 | — | 18.8 | 284.8 | 44.0× |
+| gpt3_175b_probe_hpn1024 | 11197440 | 11197440 | 527.91 | 23325.9 | — | 27.7 | 614.5 | 38.0× |
+| gpt3_13b_mid_hpn512 | 611328 | 611328 | 175.93 | 7156.8 | — | 9.1 | 477.1 | 15.0× |
+| llama_65b_probe_hpn1024 | 3628032 | 3628032 | 183.12 | 7026.8 | — | 16.0 | 186.1 | 37.8× |
 
 ## What sets the speedup
 
-TwiNS advances in 25 ns slots, the NVLink delay. A launch costs a nearly fixed 30–50 µs, set by its
-slowest entity. SimAI's cost grows with its events.
+TwiNS advances in 25 ns slots, the NVLink delay. A launch's cost is set by its slowest entity. SimAI's
+cost grows with its events. `speed.md` has the measurements.
 - **More GPUs and smaller messages mean more events per slot**, so a higher speedup. AllGather of
-  8 MB is 26× at 128 GPUs and 55× at 1024.
+  8 MB is 62× at 128 GPUs and 122× at 1024.
 - **Large messages are a few long flows in steady state.** Before global windows they reached only
-  1.3–1.6× at 128 GPUs; now they reach 4–4.8×.
+  1.3–1.6× at 128 GPUs; now they reach 11–14×.
 - **Global windows** (`--gwin`, default; `00743b5`). While no NVLink is busy, every link that can
   carry a frame takes at least 500 ns, so one launch runs up to 20 slots for every entity. The
-  512 MB AllGather at 128 GPUs goes from 934 528 launches to 46 784: 33.8 → 11.6 s.
+  512 MB AllGather at 128 GPUs goes from 934 528 launches to 46 784: 33.8 → 11.6 s. Since `6c2763b` an
+  entity runs only the slots with something in them: 4.2 s.
 - **Training alternates.** TP traffic over NVLink needs single slots; DP gradient phases leave
   NVLink quiet and run in windows. Full GPT-3 13B (TP 2) runs 19.1 M launches over 22.3 M slots;
-  LLaMA 65B runs 8.2 M over 36.2 M.
+  LLaMA 65B runs 8.2 M over 36.2 M. So GPT-3 13B stays at 6–22×, as it was before `6c2763b`.
 
 ## SimAI multi-threaded
 
@@ -129,14 +132,14 @@ same collectives, one run at a time.
 
 | run | sequential (s) | `-t 16` (s) | `-t 32` (s) | `-t 64` (s) | messages that differ from sequential | TwiNS (s) |
 |---|---|---|---|---|---|---|
-| c_allreduce_64m_hpn128 | 16.5 | 9.0 | 7.8 | 11.9 | 53 of 3840 | 2.7 |
-| c_allgather_512m_hpn128 | 54.4 | 20.2 | 18.9 | 32.4 | 298 of 1920 | 11.6 |
-| c_allreduce_64m_hpn512 | 74.0 | 27.6 | 28.6 | 52.0 | 25 of 64512 | 5.5 |
-| c_allgather_512m_hpn512 | 258.0 | 70.9 | 60.1, aborted: 31719 of 32256 done | 115.5 | 756 of 32256 | 23.6 |
-| c_allreduce_64m_hpn1024 | 171.6 | 68.1 | 84.7 | 184.4 | 739 of 260096 | 7.3 |
-| c_allgather_512m_hpn1024 | 542.7 | 144.7 | 133.4 | 228.0 | 2467 of 130048 | 30.7 |
+| c_allreduce_64m_hpn128 | 16.5 | 9.0 | 7.8 | 11.9 | 53 of 3840 | 0.94 |
+| c_allgather_512m_hpn128 | 54.4 | 20.2 | 18.9 | 32.4 | 298 of 1920 | 4.2 |
+| c_allreduce_64m_hpn512 | 74.0 | 27.6 | 28.6 | 52.0 | 25 of 64512 | 1.6 |
+| c_allgather_512m_hpn512 | 258.0 | 70.9 | 60.1, aborted: 31719 of 32256 done | 115.5 | 756 of 32256 | 6.8 |
+| c_allreduce_64m_hpn1024 | 171.6 | 68.1 | 84.7 | 184.4 | 739 of 260096 | 2.9 |
+| c_allgather_512m_hpn1024 | 542.7 | 144.7 | 133.4 | 228.0 | 2467 of 130048 | 11.6 |
 
-- **Speed.** Threads gain 1.8–4.1× at `-t 16/32`; `-t 64` is slower. TwiNS stays 1.6–9.3×
+- **Speed.** Threads gain 1.8–4.1× at `-t 16/32`; `-t 64` is slower. TwiNS is 4.5–23×
   faster than SimAI's best thread count.
 - **Results differ from sequential SimAI.** The same messages differ at every thread count, so
   this is Unison's event order (see `phase0-notes.md`), not noise. One run aborted and lost 537
@@ -180,13 +183,16 @@ The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
 - `00743b5`: global windows. Each NVSwitch files its server's NVLink horizon. An NVLink flow that
   starts during a launch forces the next launch to one slot: a race that `g_sx16_ring` and
   `d_sx16_ring` exposed, now fixed.
+- `6c2763b`: a global window runs as one step for each entity.
+- `056db5b`: a switch marked busy with nothing to come takes a step in its window.
 
 ## Two TwiNS fixes from the large runs
 
 - **DAG messages per slot.** A slot held at most 4096 DAG messages. LLaMA 65B (PP 2) and the GPT-3
   175B probe at 1024 GPUs fire more in one slot. The extra messages were dropped (reported, rc 3),
   their flows never started, and the run went on through empty slots up to its stop time.
-  - `--dcap` (default 4096) now sets the room. On an overflow, the run starts again with 4×.
+  - `--dcap` now sets the room (default 16384 since `75d050b`, 4096 before). On an overflow, the run
+    starts again with 4×.
   - A quiescent run (nothing ran, nothing is due, nothing is on its way) now ends where it
     stands.
   - `47f122e`.
@@ -202,3 +208,5 @@ The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
   1.01–1.12×.
 - **Per-entity windows (`--win`).** They gain about 10%: the NVSwitches keep one-slot windows, so
   the launches stay one per slot.
+- **More, in `speed.md`:** larger global windows, NVLink frame trains, server islands, active-set
+  dispatch and lane-0-only hosts.
