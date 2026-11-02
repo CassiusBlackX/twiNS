@@ -8,8 +8,8 @@
 - On all 42 runs of the SimAI paper's workloads, up to 1024 GPUs, the same holds.
 - Replaying a recorded DAG on another configuration is not exact, with makespan errors up to 26%. That
   is why the closed loop is needed.
-- On the SimAI paper's workloads, it is 3–12× faster than SimAI on one core for collectives, 5–8× for
-  128-GPU training, and 9–18× for 512- and 1024-GPU training.
+- On the SimAI paper's workloads, it is 6–28× faster than SimAI on one core for collectives, 6–14× for
+  128-GPU training, and 14–29× for 512- and 1024-GPU training. See `speed.md`.
 
 ## Why replay is not enough
 
@@ -74,9 +74,12 @@ siblings counts.
 stub network with no congestion, which gives the same (source, destination, size) multiset as SimAI on
 every run here. `--flows-cache=F` keeps that list for other configurations of the workload.
 
-**What is not moved to the GPU.** astra-sim runs unmodified, except the two lines SimAI's sequential
-build also needs (`src/astra/fetch.sh`). SimAI's code stays out of this repository: the script fetches
-it at the validated commit.
+**What is not moved to the GPU.** astra-sim runs with the two lines SimAI's sequential build also needs,
+and with edits for speed only: no copies of structures it only reads, per-channel lists in `StreamInit`,
+counters instead of scans of its free packets, `-O3`, tcmalloc. Its detailed-flow dump is off, through
+SimAI's own switch. `src/astra/fetch.sh` applies all of this. The line-by-line DAG comparison checks that
+its behaviour is unchanged. SimAI's code stays out of this repository: the script fetches it at the
+validated commit.
 
 ## Exactness
 
@@ -133,9 +136,8 @@ What the cells therefore show:
 | microAllReduce, MoE | 0 | 0 | 0 | all |
 
 **On the paper's workloads** (`validation/simai/check_closed.sh validation/simai/jobs_paper.txt`):
-all 42 runs are identical, messages and DAG lines. GPT-3 175B probe at 1024 GPUs needs options of its
-own (see "Limits"): all 11197440 messages are identical, with no line of the DAG differing, and no
-undecided ties or lost tails.
+all 42 runs are identical, messages and DAG lines, with no undecided ties or lost tails, including GPT-3
+175B probe at 1024 GPUs (11197440 messages).
 
 GPT-3 175B full at 128 GPUs first showed 165 messages and most DAG lines differing. Its reference was
 32-bit SimAI, and the run passes 2^32 events (see `paper.md`): compared by (source, destination, size,
@@ -146,74 +148,75 @@ recording carries its own numbering.
 
 ## Speed
 
-RX 9060 XT at `2e156c4`, SimAI on one core of a87 (untraced where measured, as in `paper.md`). twins-ai's
-time is one pass: GPU, system layer, sync and stub. Reruns for more room are not counted; 9 happened.
-With `--flows-cache` the stub column drops out. The machine drifts by 10–15% between runs, so small
-differences between rows or from earlier builds mean little.
+RX 9060 XT at `9829a00`, SimAI on one core of a87 (untraced where measured, as in `paper.md`). twins-ai's
+time and the speedup are wall clock, with start-up; no run started over. GPU, system layer, sync and stub
+are its parts. Replay is the simulation loop alone, without start-up. The machine drifts by 10–15% between
+runs, so small differences between rows mean little. `speed.md` compares these with the code before.
 
 | run | messages | simulated (ms) | SimAI (s) | replay (s) | twins-ai (s) | GPU | system layer | sync | stub | speedup |
 |---|---|---|---|---|---|---|---|---|---|---|
-| c_allgather_512m_hpn128 | 1920 | 23.37 | 54.4 | 11.6 | 15.7 | 15.2 | 0.0 | 0.5 | 0.0 | 3.5× |
-| c_allgather_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 2.0 | 1.8 | 0.0 | 0.1 | 0.0 | 5.0× |
-| c_allgather_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.5 | 0.4 | 0.0 | 0.1 | 0.0 | 9.4× |
-| c_allreduce_512m_hpn128 | 3840 | 55.66 | 102.7 | 25.7 | 36.5 | 35.4 | 0.1 | 1.0 | 0.1 | 2.8× |
-| c_allreduce_64m_hpn128 | 3840 | 5.25 | 16.6 | 2.7 | 4.0 | 3.7 | 0.0 | 0.2 | 0.1 | 4.1× |
-| c_allreduce_8m_hpn128 | 3840 | 0.80 | 6.2 | 0.4 | 0.9 | 0.7 | 0.0 | 0.1 | 0.1 | 7.1× |
-| c_reducescatter_512m_hpn128 | 1920 | 23.37 | 55.2 | 11.4 | 15.9 | 15.3 | 0.0 | 0.5 | 0.0 | 3.5× |
-| c_reducescatter_64m_hpn128 | 1920 | 2.63 | 10.2 | 1.3 | 2.1 | 1.9 | 0.0 | 0.1 | 0.0 | 4.8× |
-| c_reducescatter_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.2 | 0.5 | 0.3 | 0.0 | 0.1 | 0.0 | 10.6× |
-| gpt3_13b_probe_hpn128 | 42240 | 56.37 | 517.8 | 86.1 | 94.5 | 90.3 | 0.9 | 2.5 | 0.7 | 5.5× |
-| gpt3_175b_probe_hpn128 | 1385344 | 189.25 | 2125.2 | 166.8 | 259.5 | 217.7 | 17.5 | 9.9 | 14.5 | 8.2× |
-| llama_65b_probe_hpn128 | 439168 | 81.35 | 620.4 | 60.4 | 85.5 | 73.3 | 4.8 | 3.0 | 4.3 | 7.3× |
-| c_allgather_512m_hpn512 | 32256 | 27.80 | 258.1 | 23.6 | 31.1 | 28.7 | 0.6 | 1.1 | 0.7 | 8.3× |
-| c_allgather_64m_hpn512 | 32256 | 3.01 | 39.4 | 2.7 | 5.3 | 3.6 | 0.6 | 0.4 | 0.7 | 7.5× |
-| c_allgather_8m_hpn512 | 32256 | 0.67 | 13.0 | 0.4 | 2.5 | 0.9 | 0.6 | 0.4 | 0.7 | 5.2× |
-| c_allreduce_512m_hpn512 | 64512 | 108.05 | 490.0 | 75.8 | 99.8 | 94.0 | 1.4 | 3.2 | 1.2 | 4.9× |
-| c_allreduce_64m_hpn512 | 64512 | 6.02 | 74.1 | 5.5 | 10.0 | 6.9 | 1.2 | 0.7 | 1.2 | 7.4× |
-| c_allreduce_8m_hpn512 | 64512 | 1.35 | 19.0 | 0.8 | 4.9 | 1.9 | 1.2 | 0.6 | 1.2 | 3.8× |
-| c_reducescatter_512m_hpn512 | 32256 | 27.75 | 250.8 | 23.7 | 31.3 | 28.8 | 0.6 | 1.1 | 0.7 | 8.0× |
-| c_reducescatter_64m_hpn512 | 32256 | 3.01 | 38.7 | 2.8 | 5.4 | 3.6 | 0.6 | 0.5 | 0.7 | 7.2× |
-| c_reducescatter_8m_hpn512 | 32256 | 0.67 | 12.9 | 0.4 | 2.6 | 0.9 | 0.6 | 0.4 | 0.7 | 5.0× |
-| c_allgather_512m_hpn1024 | 130048 | 29.95 | 542.8 | 30.7 | 45.7 | 36.4 | 3.4 | 2.1 | 3.8 | 11.9× |
-| c_allgather_64m_hpn1024 | 130048 | 3.37 | 92.4 | 3.6 | 13.6 | 5.5 | 3.4 | 1.0 | 3.8 | 6.8× |
-| c_allgather_8m_hpn1024 | 130048 | 1.02 | 34.2 | 0.6 | 9.8 | 1.4 | 3.5 | 1.2 | 3.8 | 3.5× |
-| c_allreduce_512m_hpn1024 | 260096 | 172.60 | 1079.0 | 129.2 | 183.6 | 162.4 | 7.3 | 6.5 | 7.4 | 5.9× |
-| c_allreduce_64m_hpn1024 | 260096 | 6.75 | 171.6 | 7.3 | 27.9 | 11.8 | 7.0 | 1.8 | 7.2 | 6.2× |
-| c_allreduce_8m_hpn1024 | 260096 | 2.04 | 53.2 | 1.2 | 20.4 | 2.6 | 7.7 | 2.2 | 7.9 | 2.6× |
-| c_reducescatter_512m_hpn1024 | 130048 | 43.90 | 530.5 | 37.7 | 57.1 | 46.7 | 3.8 | 2.5 | 4.1 | 9.3× |
-| c_reducescatter_64m_hpn1024 | 130048 | 3.38 | 86.4 | 3.6 | 16.9 | 7.6 | 3.8 | 1.3 | 4.2 | 5.1× |
-| c_reducescatter_8m_hpn1024 | 130048 | 1.02 | 32.1 | 0.6 | 10.8 | 1.4 | 3.9 | 1.4 | 4.1 | 3.0× |
-| gpt3_13b_full_hpn128 | 120064 | 557.97 | 5220.5 | 824.3 | 884.2 | 866.7 | 2.3 | 13.6 | 1.7 | 5.9× |
-| llama_65b_full_hpn128 | 4797312 | 904.12 | 6673.1 | 639.0 | 971.1 | 824.0 | 61.2 | 31.5 | 54.4 | 6.9× |
-| gpt3_175b_full_hpn128 | 5972864 | 734.78 | 6384.6 | 566.2 | 832.2 | 677.5 | 66.7 | 29.8 | 58.2 | 7.7× |
-| gpt3_13b_probe_hpn512 | 562176 | 73.74 | 2986.5 | 189.6 | 248.1 | 194.5 | 23.3 | 6.9 | 23.5 | 12.0× |
-| llama_65b_probe_hpn512 | 1781248 | 153.75 | 3526.2 | 170.1 | 252.6 | 200.1 | 23.1 | 9.1 | 20.3 | 14.0× |
-| llama_65b_mid_hpn512 | 2698752 | 244.28 | 5380.8 | 260.4 | 388.1 | 308.3 | 35.5 | 13.2 | 31.2 | 13.9× |
-| gpt3_13b_probe_hpn1024 | 2172928 | 80.32 | 6139.4 | 334.1 | 661.5 | 335.1 | 156.3 | 14.5 | 155.7 | 9.3× |
-| gpt3_13b_mid_hpn1024 | 2271232 | 184.44 | 16032.2 | 736.6 | 1077.5 | 740.6 | 159.1 | 21.6 | 156.2 | 14.9× |
-| llama_65b_mid_hpn1024 | 5463040 | 338.37 | 12517.3 | 446.0 | 694.3 | 522.5 | 79.6 | 25.3 | 66.9 | 18.0× |
-| gpt3_13b_mid_hpn512 | 611328 | 175.93 | 7156.8 | 474.7 | 540.5 | 479.7 | 24.6 | 12.2 | 24.0 | 13.2× |
-| llama_65b_probe_hpn1024 | 3628032 | 183.12 | 7026.8 | 273.1 | 428.8 | 314.6 | 52.6 | 16.9 | 44.7 | 16.4× |
-| gpt3_175b_probe_hpn1024 | 11197440 | 527.91 | 23325.9 | 844.8 | 1575.5 | 1164.4 | 187.2 | 73.7 | 150.2 | 14.8× |
+| c_allgather_512m_hpn128 | 1920 | 23.37 | 54.4 | 4.2 | 5.5 | 4.7 | 0.0 | 0.3 | 0.0 | 9.9× |
+| c_allgather_64m_hpn128 | 1920 | 2.63 | 10.2 | 0.5 | 1.1 | 0.5 | 0.0 | 0.1 | 0.0 | 9.3× |
+| c_allgather_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.1 | 0.7 | 0.1 | 0.0 | 0.0 | 0.0 | 6.9× |
+| c_allreduce_512m_hpn128 | 3840 | 55.66 | 102.7 | 9.2 | 12.2 | 11.1 | 0.0 | 0.5 | 0.0 | 8.4× |
+| c_allreduce_64m_hpn128 | 3840 | 5.25 | 16.6 | 0.9 | 1.7 | 1.0 | 0.0 | 0.1 | 0.0 | 9.8× |
+| c_allreduce_8m_hpn128 | 3840 | 0.80 | 6.2 | 0.1 | 0.8 | 0.1 | 0.0 | 0.1 | 0.0 | 7.8× |
+| c_reducescatter_512m_hpn128 | 1920 | 23.37 | 55.2 | 4.1 | 5.5 | 4.7 | 0.0 | 0.2 | 0.0 | 10.0× |
+| c_reducescatter_64m_hpn128 | 1920 | 2.63 | 10.2 | 0.5 | 1.2 | 0.5 | 0.0 | 0.1 | 0.0 | 8.5× |
+| c_reducescatter_8m_hpn128 | 1920 | 0.40 | 4.8 | 0.1 | 0.7 | 0.1 | 0.0 | 0.0 | 0.0 | 6.9× |
+| gpt3_13b_probe_hpn128 | 42240 | 56.37 | 517.8 | 86.4 | 89.9 | 86.6 | 0.4 | 2.0 | 0.3 | 5.8× |
+| gpt3_175b_probe_hpn128 | 1385344 | 189.25 | 2125.2 | 130.0 | 154.2 | 132.3 | 7.3 | 5.5 | 6.8 | 13.8× |
+| llama_65b_probe_hpn128 | 439168 | 81.35 | 620.4 | 41.3 | 49.9 | 42.4 | 2.3 | 2.0 | 2.2 | 12.4× |
+| c_allgather_512m_hpn512 | 32256 | 27.80 | 258.1 | 6.8 | 10.4 | 8.2 | 0.2 | 0.8 | 0.3 | 24.8× |
+| c_allgather_64m_hpn512 | 32256 | 3.01 | 39.4 | 0.8 | 2.6 | 0.9 | 0.2 | 0.3 | 0.3 | 15.2× |
+| c_allgather_8m_hpn512 | 32256 | 0.67 | 13.0 | 0.1 | 1.7 | 0.2 | 0.2 | 0.1 | 0.3 | 7.6× |
+| c_allreduce_512m_hpn512 | 64512 | 108.05 | 490.0 | 20.4 | 35.2 | 31.0 | 0.5 | 2.2 | 0.5 | 13.9× |
+| c_allreduce_64m_hpn512 | 64512 | 6.02 | 74.1 | 1.6 | 4.2 | 1.8 | 0.4 | 0.5 | 0.5 | 17.6× |
+| c_allreduce_8m_hpn512 | 64512 | 1.35 | 19.0 | 0.3 | 2.5 | 0.4 | 0.4 | 0.3 | 0.5 | 7.6× |
+| c_reducescatter_512m_hpn512 | 32256 | 27.75 | 250.8 | 6.9 | 10.6 | 8.4 | 0.2 | 0.8 | 0.3 | 23.7× |
+| c_reducescatter_64m_hpn512 | 32256 | 3.01 | 38.7 | 0.8 | 2.6 | 0.9 | 0.2 | 0.3 | 0.3 | 14.9× |
+| c_reducescatter_8m_hpn512 | 32256 | 0.67 | 12.9 | 0.1 | 1.7 | 0.2 | 0.2 | 0.2 | 0.3 | 7.6× |
+| c_allgather_512m_hpn1024 | 130048 | 29.95 | 542.8 | 11.6 | 19.6 | 13.9 | 1.0 | 1.9 | 1.3 | 27.7× |
+| c_allgather_64m_hpn1024 | 130048 | 3.37 | 92.4 | 1.5 | 6.2 | 1.7 | 1.0 | 0.7 | 1.3 | 14.9× |
+| c_allgather_8m_hpn1024 | 130048 | 1.02 | 34.2 | 0.3 | 4.8 | 0.4 | 1.0 | 0.6 | 1.3 | 7.1× |
+| c_allreduce_512m_hpn1024 | 260096 | 172.60 | 1079.0 | 39.9 | 72.1 | 60.5 | 2.4 | 5.1 | 2.4 | 15.0× |
+| c_allreduce_64m_hpn1024 | 260096 | 6.75 | 171.6 | 2.9 | 11.3 | 3.6 | 2.3 | 1.4 | 2.4 | 15.2× |
+| c_allreduce_8m_hpn1024 | 260096 | 2.04 | 53.2 | 0.5 | 8.7 | 0.9 | 2.4 | 1.3 | 2.4 | 6.1× |
+| c_reducescatter_512m_hpn1024 | 130048 | 43.90 | 530.5 | 13.2 | 22.3 | 16.3 | 1.1 | 2.1 | 1.3 | 23.8× |
+| c_reducescatter_64m_hpn1024 | 130048 | 3.38 | 86.4 | 1.5 | 6.4 | 1.7 | 1.0 | 0.8 | 1.4 | 13.5× |
+| c_reducescatter_8m_hpn1024 | 130048 | 1.02 | 32.1 | 0.3 | 5.2 | 0.4 | 1.2 | 0.7 | 1.3 | 6.2× |
+| gpt3_13b_full_hpn128 | 120064 | 557.97 | 5220.5 | 822.0 | 835.3 | 821.7 | 1.0 | 11.0 | 0.8 | 6.2× |
+| llama_65b_full_hpn128 | 4797312 | 904.12 | 6673.1 | 425.6 | 503.1 | 427.9 | 25.7 | 19.1 | 23.7 | 13.3× |
+| gpt3_175b_full_hpn128 | 5972864 | 734.78 | 6384.6 | 404.2 | 499.9 | 407.8 | 31.9 | 22.2 | 29.6 | 12.8× |
+| gpt3_13b_probe_hpn512 | 562176 | 73.74 | 2986.5 | 194.1 | 214.2 | 194.5 | 6.1 | 6.0 | 5.9 | 13.9× |
+| llama_65b_probe_hpn512 | 1781248 | 153.75 | 3526.2 | 103.9 | 153.7 | 121.6 | 10.9 | 7.9 | 10.4 | 22.9× |
+| llama_65b_mid_hpn512 | 2698752 | 244.28 | 5380.8 | 155.9 | 227.3 | 179.7 | 16.5 | 11.3 | 15.6 | 23.7× |
+| gpt3_13b_probe_hpn1024 | 2172928 | 80.32 | 6139.4 | 335.5 | 409.4 | 336.3 | 27.6 | 13.7 | 26.7 | 15.0× |
+| gpt3_13b_mid_hpn1024 | 2271232 | 184.44 | 16032.2 | 738.8 | 823.0 | 741.3 | 29.2 | 19.6 | 27.6 | 19.5× |
+| llama_65b_mid_hpn1024 | 5463040 | 338.37 | 12517.3 | 284.8 | 434.6 | 332.0 | 38.1 | 23.0 | 33.2 | 28.8× |
+| gpt3_175b_probe_hpn1024 | 11197440 | 527.91 | 23325.9 | 614.5 | 887.4 | 677.5 | 83.9 | 41.0 | 68.5 | 26.3× |
+| gpt3_13b_mid_hpn512 | 611328 | 175.93 | 7156.8 | 477.1 | 504.0 | 478.8 | 6.9 | 10.1 | 6.2 | 14.2× |
+| llama_65b_probe_hpn1024 | 3628032 | 183.12 | 7026.8 | 186.1 | 279.5 | 210.7 | 25.0 | 15.6 | 22.4 | 25.1× |
 
 **What sets the speedup.**
 - GPU time is close to replay's: the rounds add little, except `rdma_rank`, which the loop leaves out.
-- The system layer costs 3–13 µs per callback on one CPU core, and the stub about the same again. Small
-  messages at scale spend most of their time there: 8 MB AllReduce at 1024 GPUs is 2.6× instead of
-  replay's 43×.
+- **Runs of about 1 s are start-up.** It costs about 0.5 s at 128 GPUs and 1.4 s at 1024.
+- **The CPU limits small messages at scale.** 8 MB AllReduce at 1024 GPUs is 6.1×, against replay's 97×:
+  GPU time is 0.9 of its 8.7 s.
+- **GPT-3 13B is limited by the GPU.** With NVLink almost always busy, it runs single-slot launches, and
+  is 5.8× at 128 GPUs, and 6.0× in replay.
 
-Replay still works after these changes: `twins-rdma`, built from the same sources, reproduces 41 of the
-42 paper runs message for message (`gpt3_175b_full_hpn128` on its 64-bit DAG). The other,
-`gpt3_175b_probe_hpn1024`, was left out for its memory use; its identical result in `paper.md` comes
-from an earlier build. Those runs were on `bb6c863`. On `2e156c4`, four replays were rerun, with the same
-output as before.
+Replay still works after these changes: `twins-rdma`, built from the same sources, reproduces all 42 paper
+runs message for message (`gpt3_175b_full_hpn128` on its 64-bit DAG, `gpt3_175b_probe_hpn1024` with
+`--dcap=8192`; see "Limits").
 
 ## Limits
 
-- **GPT-3 175B probe, 1024 GPUs (11.2 M messages) needs `--dcap=16384 --tail=25`.** `--tail=26` does not
-  fit the GPU's 16 GB next to 11 M flows, and the automatic reruns would reach it. The run peaks at 18.3 GB
-  of host memory and 3.1 GB of swap, with about 11 GB of GPU driver and kernel memory on top, outside the
-  process's cgroup. Forbidding swap on a 31 GB machine ends in an out-of-memory kill.
+- **GPT-3 175B probe, 1024 GPUs (11.2 M messages) is near the GPU's 16 GB.** The closed loop sizes its
+  tails to what is free and needs no options. Replaying it runs out of memory with the default DAG room:
+  use `--dcap=8192`. A closed-loop run has peaked at 18.3 GB of host memory and 3.1 GB of swap, with about
+  11 GB of GPU driver and kernel memory on top, outside the process's cgroup. Forbidding swap on a 31 GB
+  machine ends in an out-of-memory kill.
 - Only what these workloads use has been compared: ring collectives, and all-to-all. Tree, NVLS and PAT
   are not covered.
 - A uniform send_lat is assumed (`SEND_LAT_NS`, SimAI's `AS_SEND_LAT`). Windows rely on it, and so does
