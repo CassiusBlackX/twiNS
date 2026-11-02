@@ -18,7 +18,7 @@
 // twins-ai: --astra=WORKLOAD: no flows or recording, astra-sim's system layer runs on the host
 // (src/astra/closed.h); --dag-out=F: its actions as a traced DAG; --flows-cache=F: its flows, kept
 // (they depend on the workload and the GPUs only: the runs of other configurations skip the stub)
-// --dcap=N: DAG messages a slot holds (default 4096; when they overflow, the run starts again with
+// --dcap=N: DAG messages a slot holds (default 16384; when they overflow, the run starts again with
 // 4x, unless --dcap was given)
 // --rank: wide switches' simultaneous arrivals are ranked this many slots ahead (default 2; 0: off)
 // --persist=0: always a graph of launches per slot (default: one persistent launch for many slots
@@ -26,9 +26,9 @@
 // (--rank-every=G: one ranking every G launches, of G slots, default 8; --rank-join=M: it joins M
 // launches later, default 1; --rank-bs: its block size, default 512)
 //
-// --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB); ties decided on an
-// overwritten tail are reported as "on lost tails", and the run starts again with more room (log2
-// 26, then 27: the most a GPU of 16 GB leaves for it on the largest runs) unless --tail was given
+// --tail: the ring of chain tails holds 2^log2 nodes (default 24, 400 MB; 27, 3.2 GB, from 2 million
+// flows, or what the GPU leaves); ties decided on an overwritten tail are reported as "on lost
+// tails", and the run starts again with more room (log2 26, then 27) unless --tail was given
 //
 // out: "id start_ns fct_ns" per flow, by id.
 // Exit status: 0 every flow done; 2 some unfinished at the stop time; 3 an error counter (an
@@ -982,10 +982,12 @@ int main(int argc, char **argv)
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
     bool tail_set = false;
+    bool tail_auto = false;
+    int tail_max = 27; // (the most it may be: less if the GPU has no more room)
 #ifdef TWINS_ASTRA_HOST
     string astra_wl, astra_dag, astra_cache;
 #endif
-    int dcap = 4096, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
+    int dcap = 16384, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -1023,7 +1025,10 @@ int main(int argc, char **argv)
             tail_set = true;
         }
         else if (k == "--tail-auto") // (a rerun's: it may ask for more again)
+        {
             tail_log2 = atoi(v.c_str());
+            tail_auto = true;
+        }
         else if (k == "--spread")
             spread = std::max(1, std::min(BLOCK, atoi(v.c_str())));
         else if (k == "--serial")
@@ -1796,14 +1801,6 @@ int main(int argc, char **argv)
     }
     s.ev = dev_alloc<unsigned long long>(40);
     {
-        TailPool tp;
-        uint64_t cap = 1ull << tail_log2;
-        tp.n = dev_alloc<TailNode>(cap);
-        tp.cnt = dev_alloc<unsigned long long>(1);
-        tp.mask = cap - 1;
-        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
-    }
-    {
         Memo m;
         uint64_t cap = 1ull << 22; // 32 MB
         m.t = dev_alloc<unsigned long long>(cap);
@@ -1832,6 +1829,26 @@ int main(int argc, char **argv)
     // wide switches whose ports exceed LDS keep them in global memory (rdma_slot_big<true>)
     const bool gw = s.ns_b && per_sw(s.kb) > 64 * 1024;
     s.swws = gw ? dev_alloc<SwPortLds>((size_t)s.ns_b * s.kb) : nullptr;
+    {
+        // The tails' ring, last: as much as a run of this size asks for and the GPU leaves. A run that
+        // loses tails starts again from nothing, so a large one starts with room (F: every run with
+        // lost tails had 2.7 million flows or more; only such runs pay for zeroing the most room)
+        if (!tail_set && !tail_auto && F >= 2000000)
+            tail_log2 = 27;
+        size_t mem_free = 0, mem_total = 0;
+        CK(cudaMemGetInfo(&mem_free, &mem_total));
+        while (!tail_set && tail_log2 > 24 && (sizeof(TailNode) << tail_log2) + (512ull << 20) > mem_free)
+        {
+            tail_log2--;
+            tail_max = tail_log2;
+        }
+        TailPool tp;
+        uint64_t cap = 1ull << tail_log2;
+        tp.n = dev_alloc<TailNode>(cap);
+        tp.cnt = dev_alloc<unsigned long long>(1);
+        tp.mask = cap - 1;
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
+    }
     if (per_sw(s.ks) > 64 * 1024 || sw_ints(s.kb) * sizeof(int) > 64 * 1024)
     {
         fprintf(stderr, "a switch's workspace (%zu bytes for %d ports) exceeds LDS\n", per_sw(s.kb), s.kb);
@@ -1965,7 +1982,7 @@ int main(int argc, char **argv)
     if (g_cl)
     {
         g_cl->stop_d = !dcap_set && dcap < (1 << 20);
-        g_cl->stop_t = !tail_set && tail_log2 < 27;
+        g_cl->stop_t = !tail_set && tail_log2 < tail_max;
         g_cl->run(s, sa, D, [&](int k) {
             if (persist)
                 persist_k<<<s.n1 + s.ns_s + s.nm, BS, lds, sa>>>(PS);
@@ -2145,10 +2162,10 @@ int main(int argc, char **argv)
     // a slot's DAG messages overflowed (more firings in one slot than dcap), or a tie met an
     // overwritten tail: the run is not exact; it starts again with more room, the same arguments
     // otherwise
-    const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set && tail_log2 < 27;
+    const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set && tail_log2 < tail_max;
     if (redo_d || redo_t)
     {
-        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail-auto=" + std::to_string(tail_log2 < 26 ? 26 : 27);
+        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27));
         fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
         fflush(stdout);
         fflush(stderr);
