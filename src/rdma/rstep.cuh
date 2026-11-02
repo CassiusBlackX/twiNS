@@ -3676,7 +3676,15 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
             if (tc != ~0ull && (int64_t)tc < (slot + nx) * s.P.delay)
                 nx = (int64_t)tc < (slot + j + 1) * s.P.delay ? j : (int)((int64_t)fdiv(s.fD, tc) - slot);
             if (nx >= k)
-                break;
+            {
+                // busy with no TransmitComplete to come: its last frame has gone, or what it holds
+                // waits for a resume. Only a step can tell (a run's end hangs on that: never idle
+                // and nothing to wake it up), and one without an event changes nothing else.
+                if (j != 0 || !any_act || sw_tc != ~0ull)
+                    break;
+                any_act = 0;
+                nx = 0;
+            }
             if (nsl == 1)
                 j = nx;
         }

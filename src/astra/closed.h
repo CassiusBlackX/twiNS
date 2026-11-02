@@ -224,7 +224,7 @@ struct Closed : astra::Network
                     return;
             }
             if (progress && syncs % 2000 == 0)
-                fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync);
+                fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s; idle %d cap %lld limit %lld timer %d pool %zu ready %zu\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync, ctl.idle, (long long)ctl.cap, (long long)ctl.limit, (int)fe->has_timer(), pool.size(), ready.size());
             // the completions recorded, as a contiguous range of the ring
             if (ctl.head - seen > (unsigned long long)cev_mask)
             {
