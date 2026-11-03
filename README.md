@@ -51,7 +51,8 @@ cmake --build build -j
 ```
 
 - The default architecture is `gfx1200`. Set another with `-DCMAKE_HIP_ARCHITECTURES=gfx...`.
-- `-DTWINS_GPU_BACKEND=CUDA` selects the CUDA build. It has not been tested on NVIDIA GPUs yet.
+- `-DTWINS_GPU_BACKEND=CUDA -DCMAKE_CUDA_ARCHITECTURES=120` selects the CUDA build (here for an
+  RTX 5090). Every validation set gives identical results on it; see [docs/nvidia.md](docs/nvidia.md).
 - The build turns off FMA contraction (`-ffp-contract=off`, `--fmad=false`). Exactness depends
   on it.
 
