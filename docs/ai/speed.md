@@ -194,9 +194,12 @@ NVLink behaviour (QPs paced at line rate within their window, an ACK per frame, 
 per egress port, a chain pushed per event), fed the 13B run's recorded flows within servers. It is
 not exact, but it does the same work: 503.5 M events against the GPU's 509.9 M, and it ends at
 56.372 ms against 56.374. On this machine's i5-7500 it takes 0.141 µs per event on one thread and
-0.177 µs with 4 threads (71.1 s and 22.5 s for the 16 servers). An exact engine also compares chains
+0.177 µs with 4 threads (71.1 s and 22.5 s for the 16 servers). On the 5090 host's Ryzen 9950X
+(shared with another user's jobs, load about 2): 0.068 µs on one thread, 0.076 µs with 16 (2.7 s for
+the 16 servers). An exact engine also compares chains
 at ties; at 0.2 µs, the table gives 33–48 s for the 13B run on these 4 cores (1.9–2.7×) and 17–28 s
-on 16 (3.2–5.4×).
+on 16 (3.2–5.4×). On the 9950X the servers' part shrinks to a few seconds, and the GPU's part, 14 s on the
+RX 9060 XT, sets the time: about 17 s against 90 (5×).
 
 **Not built yet: the exact engine.** It has to make the same completions, chains included, as the GPU.
 The safe way is the same code: rstep.cuh's host and switch steps run with one lane (switches serial,
