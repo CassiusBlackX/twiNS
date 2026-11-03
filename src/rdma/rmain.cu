@@ -55,8 +55,11 @@
 #include <unistd.h>
 #include <vector>
 #include "rstep.cuh"
-#if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__)
+#if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__) && !defined(TWINS_ISLAND)
 #define TWINS_ASTRA_HOST
+#endif
+#ifdef TWINS_CPU
+thread_local twins_dim3 threadIdx, blockIdx, blockDim, gridDim;
 #endif
 
 using namespace rdma;
@@ -234,6 +237,9 @@ struct World
 
 #ifdef TWINS_ASTRA_HOST
 #include "astra/closed.h"
+#endif
+#ifdef TWINS_ISLAND
+#include "rdma/island.h"
 #endif
 
 // a traced DAG (docs/ai/dag.md): its actions by cause; main's, and their timers', expanded here
@@ -674,6 +680,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.base_rtt = max_rtt;
     const int has_win = cfg.u32("HAS_WIN", 1);
     P.win = has_win ? (uint32_t)max_bdp : 0;
+    // (twins-island: a server alone, with the whole cluster's maxRtt and maxBdp, which SimAI's
+    // GLOBAL_T gives every flow)
+    if (cfg.u32("NVL_BASE_RTT", 0))
+        P.base_rtt = cfg.u32("NVL_BASE_RTT", 0);
+    if (cfg.u32("NVL_WIN", 0) && has_win)
+        P.win = cfg.u32("NVL_WIN", 0);
 
     // ---- switch ports: headroom, pfc_a_shift (from 3, one less per halving of the rate above the
     // NIC rate, which is host 0's first link's), ECN thresholds by rate
@@ -800,6 +812,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
 #ifdef TWINS_ASTRA_HOST
         if (g_cl)
             g_cl->world(w, (int64_t)cfg.num("SEND_LAT_NS", 3000));
+#endif
+#ifdef TWINS_ISLAND
+        island_world(w);
 #endif
         if (!ons.empty() && !traced_dag(w, ons, !deps.empty(), (int64_t)cfg.num("SEND_LAT_NS", 3000)))
             return false;
@@ -1075,6 +1090,14 @@ int main(int argc, char **argv)
             kw = std::max(1, std::min(255, atoi(v.c_str())));
             gwin = 0; // (per-entity windows instead)
         }
+#ifdef TWINS_ISLAND
+        else if (k == "--isl-in")
+            g_isl_in = v;
+        else if (k == "--isl-map")
+            g_isl_map = v;
+        else if (k == "--isl-out")
+            g_isl_out = v;
+#endif
         else if (k == "--gwin")
             gwin = std::max(0, std::min(255, atoi(v.c_str())));
 #ifdef TWINS_ASTRA_HOST
@@ -1577,6 +1600,8 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
                     if (!g_nvl_oracle.empty() && fi[g].fast)
                         continue; // (its completions come from the recording)
+                    if (!g_nvl_record.empty() && fi[g].fast)
+                        g_nvl_pre.push_back({g, p.ts, dep_c[g]});
 #endif
                     if (dyn_n[h] >= dyn_cap)
                     {
@@ -1636,6 +1661,9 @@ int main(int argc, char **argv)
         s.tchain = dev_alloc<Chain>(T);
         s.ttime = dev_alloc<int64_t>(T);
         s.tnext = dev_alloc<int>(T);
+#ifdef TWINS_ISLAND
+        island_setup(s);
+#endif
         s.srv_fpend = dev_copy(srv_fpend);
         s.pnic = dev_copy(pnic);
         s.pcnt = dev_copy(pcnt);
@@ -1952,6 +1980,7 @@ int main(int argc, char **argv)
     // (sb is not used: HIP gives streams hardware queues in turn, and with the default 4 queues sa
     // and sc made one after the other shared one, which ran rdma_slot and rdma_slot_big in turn,
     // 1.5x slower)
+#ifndef TWINS_ISLAND
     hipStream_t sa, sb, sc;
     CK(hipStreamCreate(&sa));
     CK(hipStreamCreate(&sb));
@@ -2099,6 +2128,9 @@ int main(int argc, char **argv)
         use_rank = g_rank && (ot - open_ties) * 4 > (unsigned long long)GS;
         open_ties = ot;
     }
+#else
+    island_run(s, D);
+#endif
     CK(cudaDeviceSynchronize());
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
