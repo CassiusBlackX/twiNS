@@ -1097,6 +1097,14 @@ int main(int argc, char **argv)
 #ifdef TWINS_ISLAND
         else if (k == "--isl-shm")
             g_isl_shm = v;
+        else if (k == "--isl-rings") // the tail rings' names: PREFIX0, PREFIX1, ...
+            g_isl_rings = v;
+        else if (k == "--isl-nrings")
+            g_isl_nrings = atoi(v.c_str());
+        else if (k == "--isl-ringlog")
+            g_isl_ringlog = atoi(v.c_str());
+        else if (k == "--isl-side") // this island's side byte (its index + 1)
+            g_isl_side = atoi(v.c_str());
         else if (k == "--isl-in")
             g_isl_in = v;
         else if (k == "--isl-map")

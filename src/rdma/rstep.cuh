@@ -161,6 +161,35 @@ __host__ __device__ __forceinline__ uint32_t ccode(int64_t lead, int ord)
 }
 
 __device__ TailPool g_tail;
+// Tail nodes made elsewhere (--nvl-islands): a pos's top byte names its maker, 0 the GPU, k + 1
+// island k. The GPU reads the islands' rings in mapped host memory; an island reads the others'
+// in shared memory, and the GPU's from the copies it was sent (src/rdma/island.h).
+constexpr int TAIL_SIDE = 56;
+#ifdef TWINS_CPU
+const TailNode &island_remote(uint64_t p); // (island.h)
+extern uint64_t g_tail_side;               // this island's top byte, shifted
+#else
+struct RemoteRings
+{
+    const TailNode *n[64];
+    uint64_t mask[64];
+};
+__device__ const RemoteRings *g_remote;
+#endif
+__device__ __forceinline__ const TailNode &tail_at(uint64_t p)
+{
+#ifdef TWINS_CPU
+    if ((p >> TAIL_SIDE) != (g_tail_side >> TAIL_SIDE))
+        return island_remote(p);
+#else
+    if (p >> TAIL_SIDE)
+    {
+        const int k = (int)(p >> TAIL_SIDE) - 1;
+        return g_remote->n[k][(p - 1) & g_remote->mask[k]];
+    }
+#endif
+    return g_tail.n[(p - 1) & g_tail.mask];
+}
 // remembered comparisons (see ccmp): key | result, open addressing
 struct Memo
 {
@@ -290,7 +319,7 @@ struct RunCursor
             code = 0;
             return;
         }
-        const TailNode &n = g_tail.n[(node - 1) & g_tail.mask];
+        const TailNode &n = tail_at(node);
         if (n.pos != node)
         {
             lost = true;
@@ -312,7 +341,7 @@ struct RunCursor
             }
         }
         else
-            node = g_tail.n[(node - 1) & g_tail.mask].next;
+            node = tail_at(node).next;
         load();
     }
 };
@@ -689,14 +718,12 @@ __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI
         cpush(&c, ccode(s.send_lat, 0), x);
         if (s.nvl_xc)
         {
-            const unsigned long long i = atomicAdd(s.nvl_xn, 1ull);
-            if (i < s.nvl_xcap)
-            {
-                s.nvl_xc[i] = c;
-                s.nvl_xh[i].t = ts;
-                s.nvl_xh[i].flow = f;
-                s.nvl_xa[i] = a;
-            }
+            // (a ring, read every sync: nvl_xcap a power of two, more in one sync is reported there)
+            const unsigned long long i = atomicAdd(s.nvl_xn, 1ull) & (s.nvl_xcap - 1);
+            s.nvl_xc[i] = c;
+            s.nvl_xh[i].t = ts;
+            s.nvl_xh[i].flow = f;
+            s.nvl_xa[i] = a;
         }
         if (s.nvl_oracle)
             return;
@@ -4244,7 +4271,7 @@ __global__ void nvl_walk_par(const Chain *base, const uint32_t *idx, int n, Tail
     if (e >= n)
         return;
     uint64_t p = base[idx[e]].tail;
-    for (int d = 0; p && d < depth_max; d++)
+    for (int d = 0; p && !(p >> TAIL_SIDE) && d < depth_max; d++)
     {
         const uint64_t slot = (p - 1) & g_tail.mask;
         const TailNode t = g_tail.n[slot];

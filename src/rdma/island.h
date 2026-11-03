@@ -13,7 +13,28 @@
 #include <unordered_map>
 #include "rdma/isl_shm.h"
 
-static string g_isl_in, g_isl_map, g_isl_out, g_isl_shm;
+static string g_isl_in, g_isl_map, g_isl_out, g_isl_shm, g_isl_rings;
+static int g_isl_side = 0, g_isl_nrings = 0, g_isl_ringlog = 22;
+// the GPU's tail nodes this island was sent, by their pos there; the other islands' rings
+static std::unordered_map<uint64_t, TailNode> g_isl_copies;
+static vector<const TailNode *> g_isl_ring;
+static TailNode g_isl_none = {};
+namespace rdma
+{
+uint64_t g_tail_side = 0;
+const TailNode &island_remote(uint64_t p)
+{
+    const int k = (int)(p >> TAIL_SIDE);
+    if (k == 0)
+    {
+        auto it = g_isl_copies.find(p);
+        return it != g_isl_copies.end() ? it->second : g_isl_none; // (not sent: lost, if reached)
+    }
+    if (k <= (int)g_isl_ring.size() && g_isl_ring[k - 1])
+        return g_isl_ring[k - 1][(p - 1) & ((1ull << g_isl_ringlog) - 1)];
+    return g_isl_none;
+}
+} // namespace rdma
 
 // every flow waits for one message; nothing else starts it
 static void island_world(World &w)
@@ -40,15 +61,6 @@ struct Island
     int64_t D;
     vector<int> glob;                   // local flow -> global
     std::unordered_map<int, int> loc;   // and back
-    struct Node
-    {
-        uint32_t code, cnt;
-        uint64_t next;
-    };
-    std::unordered_map<uint64_t, Node> rnodes;    // the sender's tail nodes, by its pos
-    std::unordered_map<uint64_t, uint64_t> mine;  // the sender's pos -> pos here
-    std::unordered_map<uint64_t, uint64_t> theirs; // and back (nodes rebuilt here)
-    std::unordered_map<uint64_t, char> sent;      // nodes here already sent out
     unsigned long long seen = 0;
     const BlockInfo *tab;
     int nb;
@@ -72,50 +84,14 @@ struct Island
         fclose(f);
         blockDim.x = 1;
         threadIdx.x = 0;
-    }
-    // a chain's tail in the sender's numbering, rebuilt here (oldest first) as far as known
-    uint64_t rebuild(uint64_t p)
-    {
-        if (!p)
-            return 0;
-        vector<uint64_t> todo;
-        for (uint64_t q = p; q && !mine.count(q);)
-        {
-            auto it = rnodes.find(q);
-            if (it == rnodes.end())
-                break;
-            todo.push_back(q);
-            q = it->second.next;
-        }
-        TailPool &tp = g_tail;
-        for (size_t i = todo.size(); i-- > 0;)
-        {
-            const Node &n = rnodes[todo[i]];
-            const uint64_t pos = ++*tp.cnt;
-            uint64_t nx = 0;
-            if (n.next)
-            {
-                auto it = mine.find(n.next);
-                nx = it != mine.end() ? it->second : (1ull << 62); // (not known: lost, if reached)
-            }
-            tp.n[(pos - 1) & tp.mask] = TailNode{n.code, n.cnt, nx, pos};
-            mine[todo[i]] = pos;
-            theirs[pos] = todo[i];
-        }
-        auto it = mine.find(p);
-        return it != mine.end() ? it->second : (1ull << 62);
+        // (offline: this ring as it is, the side 0's numbering; with twins-ai: the shared rings)
     }
     // an item from the sender; false: a start for another island's flow
     bool take(const NvlRec &r)
     {
         if (r.tag == 0)
         {
-            rnodes[r.n.pos] = Node{r.n.code, r.n.cnt, r.n.next};
-            return true;
-        }
-        if (r.tag == 4)
-        {
-            mine[r.n.pos] = r.n.next; // (one of ours: the sender's pos for it)
+            g_isl_copies[r.n.pos] = r.n; // (a GPU node)
             return true;
         }
         auto it = loc.find(r.h.flow);
@@ -127,7 +103,6 @@ struct Island
             // main's: ready at the start, as rmain files them
             s.dep_t[f] = r.h.t;
             s.dep_c[f] = r.c;
-            s.dep_c[f].tail = rebuild(r.c.tail);
             s.dyn[(size_t)h * s.dyn_cap + s.dyn_n[h]++] = f;
             return true;
         }
@@ -147,7 +122,6 @@ struct Island
         }
         DMsg &m = s.dmsg[(size_t)b * s.dcap + n];
         m.c = r.c;
-        m.c.tail = rebuild(r.c.tail);
         m.ts = r.h.t;
         m.flow = f;
         m.next = s.hhead[(size_t)h * s.nbi + b];
@@ -167,49 +141,20 @@ struct Island
         }
         steps++;
     }
-    // the completions made since the last call, with the tail nodes their chains reach, sent once
+    // the completions made since the last call (their chains' tails are this island's own nodes, read
+    // where they are, or nodes others made)
     template <typename F>
     void completions(F &&emit)
     {
         ClCtl &cl = *s.cl;
-        TailPool &tp = g_tail;
         for (; seen < cl.head; seen++)
         {
             const unsigned long long j = seen & s.cev_mask;
-            const Chain &c = s.cev_c[j];
-            vector<TailNode> nn;
             NvlRec r = {};
-            for (uint64_t p = c.tail; p && !sent.count(p);)
-            {
-                auto th = theirs.find(p);
-                if (th != theirs.end())
-                {
-                    // a node the receiver sent: its own pos, no copy
-                    r.tag = 4;
-                    r.n.pos = p;
-                    r.n.next = th->second;
-                    emit(r);
-                    sent[p] = 1;
-                    break;
-                }
-                const TailNode &t = tp.n[(p - 1) & tp.mask];
-                if (t.pos != p)
-                    break;
-                nn.push_back(t);
-                sent[p] = 1;
-                p = t.next;
-            }
-            for (size_t i = nn.size(); i-- > 0;)
-            {
-                r.tag = 0;
-                r.n = nn[i];
-                emit(r);
-            }
-            r = {};
             r.tag = 1;
             r.h = s.cev_h[j];
             r.h.flow = glob[r.h.flow];
-            r.c = c;
+            r.c = s.cev_c[j];
             emit(r);
         }
         cl.seen = cl.floor = cl.head;
@@ -220,6 +165,8 @@ struct Island
 static void island_offline(Island &is)
 {
     Sim &s = is.s;
+    g_tail_side = 1ull << TAIL_SIDE; // (this island's nodes apart from the recording's)
+    *g_tail.cnt = g_tail_side;
     struct Start
     {
         int64_t made;
@@ -282,6 +229,31 @@ static void island_live(Island &is)
     {
         fprintf(stderr, "island: cannot open %s\n", g_isl_shm.c_str());
         exit(1);
+    }
+    {
+        const size_t bytes = sizeof(TailNode) << g_isl_ringlog;
+        g_isl_ring.assign(g_isl_nrings, nullptr);
+        for (int k = 0; k < g_isl_nrings; k++)
+        {
+            const string name = g_isl_rings + std::to_string(k);
+            int fd = shm_open(name.c_str(), k + 1 == g_isl_side ? O_RDWR : O_RDONLY, 0600);
+            void *p = fd < 0 ? MAP_FAILED : mmap(nullptr, bytes, k + 1 == g_isl_side ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, 0);
+            if (fd >= 0)
+                close(fd);
+            if (p == MAP_FAILED)
+            {
+                fprintf(stderr, "island: cannot map %s\n", name.c_str());
+                exit(1);
+            }
+            g_isl_ring[k] = static_cast<const TailNode *>(p);
+            if (k + 1 == g_isl_side)
+            {
+                g_tail.n = static_cast<TailNode *>(p);
+                g_tail.mask = (1ull << g_isl_ringlog) - 1;
+                *g_tail.cnt = (uint64_t)g_isl_side << TAIL_SIDE;
+            }
+        }
+        g_tail_side = (uint64_t)g_isl_side << TAIL_SIDE;
     }
     uint32_t seq = 0;
     vector<NvlRec> pend; // what did not fit out[]

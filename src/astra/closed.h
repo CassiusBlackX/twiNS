@@ -67,14 +67,9 @@ struct NvlIslands
     vector<string> names;
     vector<vector<NvlRec>> queue;    // items for an island's next command
     vector<std::unordered_set<uint64_t>> sent; // GPU nodes an island has
-    vector<std::unordered_map<uint64_t, uint64_t>> gpos; // an island's node -> GPU's
     std::unordered_map<uint64_t, Node> gnodes; // the GPU's nodes the walks found
-    struct Orig
-    {
-        int k;
-        uint64_t pos;
-    };
-    std::unordered_map<uint64_t, Orig> orig; // a GPU node copied from an island's: that island and its pos
+    vector<void *> rings;            // the islands' tail rings (shared memory, mapped for the GPU)
+    static constexpr int RING_LOG = 24;
     long long live = 0;              // flows given to islands and not complete
     int64_t slot = 0;                // where the islands are
     int64_t sent_limit = 0;          // the limit of the last run
@@ -137,6 +132,37 @@ struct NvlIslands
             string d = self;
             island_bin = d.substr(0, d.rfind('/')) + "/twins-island";
         }
+        // the islands' tail rings, readable by the GPU (a pos with top byte k + 1 is island k's)
+        const string ring_prefix = "/twins-isl-" + std::to_string(getpid()) + "-ring";
+        RemoteRings rr = {};
+        if (n > 64)
+        {
+            fprintf(stderr, "nvl: at most 64 islands\n");
+            exit(1);
+        }
+        for (int k = 0; k < n; k++)
+        {
+            const string name = ring_prefix + std::to_string(k);
+            const size_t bytes = sizeof(TailNode) << RING_LOG;
+            int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+            void *p = fd >= 0 && !ftruncate(fd, bytes) ? mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+            if (fd >= 0)
+                close(fd);
+            if (p == MAP_FAILED)
+            {
+                fprintf(stderr, "nvl: cannot make %s\n", name.c_str());
+                exit(1);
+            }
+            CK(hipHostRegister(p, bytes, hipHostRegisterMapped));
+            void *dp;
+            CK(hipHostGetDevicePointer(&dp, p, 0));
+            rr.n[k] = static_cast<const TailNode *>(dp);
+            rr.mask[k] = (1ull << RING_LOG) - 1;
+            rings.push_back(p);
+            names.push_back(name);
+        }
+        const RemoteRings *drr = dev_copy(vector<RemoteRings>{rr});
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_remote), &drr, sizeof(drr)));
         for (int k = 0; k < n; k++)
         {
             string pd = dir + "/p" + std::to_string(k);
@@ -196,7 +222,9 @@ struct NvlIslands
             names.push_back(name);
             // the island: the config and every KEY=VALUE given here, the cluster's RTT and window
             vector<string> args = {island_bin, g_argv[1], "--batch=" + pd + ".jobs", "--outdir=" + pd, "--isl-map=" + pd + ".map",
-                                   "--isl-shm=" + name, "--tail=22", "NVL_BASE_RTT=" + std::to_string(s.P.base_rtt),
+                                   "--isl-shm=" + name, "--tail=16", "--isl-rings=" + ring_prefix, "--isl-nrings=" + std::to_string(n),
+                                   "--isl-ringlog=" + std::to_string(RING_LOG), "--isl-side=" + std::to_string(k + 1),
+                                   "NVL_BASE_RTT=" + std::to_string(s.P.base_rtt),
                                    "NVL_WIN=" + std::to_string(s.P.win)};
             for (int i = 2; i < g_argc; i++)
                 if (g_argv[i][0] != '-' && strchr(g_argv[i], '='))
@@ -220,7 +248,6 @@ struct NvlIslands
         }
         queue.assign(n, {});
         sent.assign(n, {});
-        gpos.assign(n, {});
         static vector<string> *to_unlink = &names;
         atexit([] {
             for (auto &x : *to_unlink)
@@ -295,48 +322,17 @@ struct NvlIslands
                               unsigned long long mask, P &&pending)
     {
         auto t0 = std::chrono::steady_clock::now();
-        TailPool tp;
-        CK(hipMemcpyFromSymbol(&tp, HIP_SYMBOL(g_tail), sizeof(tp)));
-        unsigned long long tcnt;
-        CK(hipMemcpy(&tcnt, tp.cnt, sizeof(tcnt), hipMemcpyDeviceToHost));
-        const unsigned long long t0n = tcnt;
-        vector<TailNode> nodes;
         vector<CEvH> hs;
         vector<Chain> cs;
         for (int k = 0; k < n; k++)
             for (auto &r : out[k])
-            {
-                if (r.tag == 4)
+                if (r.tag == 1)
                 {
-                    gpos[k][r.n.pos] = r.n.next; // (the island's copy of a GPU node: that node)
-                    continue;
+                    hs.push_back(r.h);
+                    cs.push_back(r.c); // (its tail: the island's nodes, which the GPU reads where they are)
+                    if (r.h.kind == 0)
+                        live--;
                 }
-                if (r.tag == 0)
-                {
-                    TailNode nd = r.n;
-                    nd.pos = ++tcnt;
-                    auto it = gpos[k].find(r.n.next);
-                    nd.next = !r.n.next ? 0 : it != gpos[k].end() ? it->second : (1ull << 62);
-                    gpos[k][r.n.pos] = nd.pos;
-                    orig[nd.pos] = Orig{k, r.n.pos};
-                    nodes.push_back(nd);
-                    continue;
-                }
-                Chain c = r.c;
-                auto it = gpos[k].find(c.tail);
-                c.tail = !c.tail ? 0 : it != gpos[k].end() ? it->second : (1ull << 62);
-                hs.push_back(r.h);
-                cs.push_back(c);
-                if (r.h.kind == 0)
-                    live--;
-            }
-        for (size_t q = 0; q < nodes.size();)
-        {
-            const uint64_t sl = (t0n + q) & tp.mask, m = std::min<uint64_t>(nodes.size() - q, tp.mask + 1 - sl);
-            CK(hipMemcpyAsync(tp.n + sl, &nodes[q], m * sizeof(TailNode), hipMemcpyHostToDevice, st));
-            q += m;
-        }
-        CK(hipMemcpyAsync(tp.cnt, &tcnt, sizeof(tcnt), hipMemcpyHostToDevice, st));
         for (size_t q = 0; q < hs.size();)
         {
             const unsigned long long j = (head + q) & mask, c = std::min<unsigned long long>(hs.size() - q, mask + 1 - j);
@@ -357,9 +353,9 @@ struct NvlIslands
     {
         unsigned long long xn;
         CK(hipMemcpy(&xn, s.nvl_xn, sizeof(xn), hipMemcpyDeviceToHost));
-        if (xn > s.nvl_xcap)
+        if (xn - xn_seen > s.nvl_xcap)
         {
-            fprintf(stderr, "nvl: more than %llu messages for islands\n", s.nvl_xcap);
+            fprintf(stderr, "nvl: more than %llu messages for islands in a sync\n", s.nvl_xcap);
             exit(1);
         }
         if (xn == xn_seen)
@@ -388,7 +384,7 @@ struct NvlIslands
         }
         vector<uint32_t> idx(m);
         for (int e = 0; e < m; e++)
-            idx[e] = (uint32_t)(xn_seen + e);
+            idx[e] = (uint32_t)((xn_seen + e) & (s.nvl_xcap - 1));
         CK(hipMemcpyAsync(d_idx, idx.data(), m * sizeof(uint32_t), hipMemcpyHostToDevice, st));
         CK(hipMemsetAsync(d_k, 0, sizeof(unsigned), st));
         nvl_walk_par<<<(m + 63) / 64, 64, 0, st>>>(s.nvl_xc, d_idx, m, d_out, cap, d_k, d_mark, NVL_ISL_DEPTH);
@@ -408,9 +404,14 @@ struct NvlIslands
         vector<Chain> cs(m);
         vector<CEvH> hs(m);
         vector<int64_t> as(m);
-        CK(hipMemcpy(cs.data(), s.nvl_xc + xn_seen, m * sizeof(Chain), hipMemcpyDeviceToHost));
-        CK(hipMemcpy(hs.data(), s.nvl_xh + xn_seen, m * sizeof(CEvH), hipMemcpyDeviceToHost));
-        CK(hipMemcpy(as.data(), s.nvl_xa + xn_seen, m * sizeof(int64_t), hipMemcpyDeviceToHost));
+        for (int q = 0; q < m;)
+        {
+            const unsigned long long j = (xn_seen + q) & (s.nvl_xcap - 1), c = std::min<unsigned long long>(m - q, s.nvl_xcap - j);
+            CK(hipMemcpy(cs.data() + q, s.nvl_xc + j, c * sizeof(Chain), hipMemcpyDeviceToHost));
+            CK(hipMemcpy(hs.data() + q, s.nvl_xh + j, c * sizeof(CEvH), hipMemcpyDeviceToHost));
+            CK(hipMemcpy(as.data() + q, s.nvl_xa + j, c * sizeof(int64_t), hipMemcpyDeviceToHost));
+            q += c;
+        }
         for (int e = 0; e < m; e++)
         {
             const int k = island_of_flow(fi[hs[e].flow], h_srv);
@@ -430,20 +431,8 @@ struct NvlIslands
     void send_tail(int k, uint64_t p)
     {
         vector<uint64_t> todo;
-        while (p && !sent[k].count(p))
+        while (p && !(p >> TAIL_SIDE) && !sent[k].count(p)) // (an island's node: the island reads it where it is)
         {
-            auto o = orig.find(p);
-            if (o != orig.end() && o->second.k == k)
-            {
-                // the island's own node: an alias, no copy
-                NvlRec r = {};
-                r.tag = 4;
-                r.n.pos = p;
-                r.n.next = o->second.pos;
-                queue[k].push_back(r);
-                sent[k].insert(p);
-                break;
-            }
             auto it = gnodes.find(p);
             if (it == gnodes.end())
                 break; // (overwritten in the GPU's ring before it was found: lost, if reached)
@@ -509,8 +498,9 @@ struct NvlIslands
                 if (f)
                     fclose(f);
             }
-            shm_unlink(names[k].c_str());
         }
+        for (auto &x : names)
+            shm_unlink(x.c_str());
         if (!dir.empty())
         {
             string cmd = "rm -rf '" + dir + "'";
@@ -884,7 +874,7 @@ struct Closed : astra::Network
                         auto it = opos.find(nd.next);
                         // (not recorded: overwritten in the recording's ring, or beyond NVL_DEPTH; a pos no
                         // node will have, so that a comparison reaching it counts as on a lost tail)
-                        nd.next = !nd.next ? 0 : it != opos.end() ? it->second : (1ull << 62);
+                        nd.next = !nd.next ? 0 : it != opos.end() ? it->second : (1ull << 55);
                         opos[r.n.pos] = nd.pos;
                         nodes.push_back(nd);
                         continue;
@@ -892,7 +882,7 @@ struct Closed : astra::Network
                     const unsigned long long j = head & cev_mask;
                     Chain c = r.c;
                     auto it = opos.find(c.tail);
-                    c.tail = !c.tail ? 0 : it != opos.end() ? it->second : (1ull << 62);
+                    c.tail = !c.tail ? 0 : it != opos.end() ? it->second : (1ull << 55);
                     CK(hipMemcpyAsync(dev_h + j, &r.h, sizeof(CEvH), hipMemcpyHostToDevice, st));
                     CK(hipMemcpyAsync(s.cev_c + j, &c, sizeof(Chain), hipMemcpyHostToDevice, st));
                     pool.push_back(Pending{r.h.t, (uint32_t)j, r.h, 0});
@@ -1111,9 +1101,9 @@ struct Closed : astra::Network
     {
         unsigned long long xn;
         CK(hipMemcpy(&xn, s.nvl_xn, sizeof(xn), hipMemcpyDeviceToHost));
-        if (xn > s.nvl_xcap)
+        if (xn - st_seen > s.nvl_xcap)
         {
-            fprintf(stderr, "nvl: more than %llu messages to record\n", s.nvl_xcap);
+            fprintf(stderr, "nvl: more than %llu messages to record in a sync\n", s.nvl_xcap);
             exit(1);
         }
         if (xn == st_seen)
@@ -1121,7 +1111,7 @@ struct Closed : astra::Network
         const int n = (int)(xn - st_seen), cap = 1 << 22;
         vector<uint32_t> idx(n);
         for (int e = 0; e < n; e++)
-            idx[e] = (uint32_t)(st_seen + e);
+            idx[e] = (uint32_t)((st_seen + e) & (s.nvl_xcap - 1));
         static uint32_t *d_idx = nullptr;
         static int *d_seg = nullptr, *d_k = nullptr, d_n = 0;
         static TailNode *d_out = nullptr;
@@ -1163,9 +1153,14 @@ struct Closed : astra::Network
         vector<Chain> cs(n);
         vector<CEvH> hs(n);
         vector<int64_t> as(n);
-        CK(hipMemcpy(cs.data(), s.nvl_xc + st_seen, n * sizeof(Chain), hipMemcpyDeviceToHost));
-        CK(hipMemcpy(hs.data(), s.nvl_xh + st_seen, n * sizeof(CEvH), hipMemcpyDeviceToHost));
-        CK(hipMemcpy(as.data(), s.nvl_xa + st_seen, n * sizeof(int64_t), hipMemcpyDeviceToHost));
+        for (int q = 0; q < n;)
+        {
+            const unsigned long long j = (st_seen + q) & (s.nvl_xcap - 1), c = std::min<unsigned long long>(n - q, s.nvl_xcap - j);
+            CK(hipMemcpy(cs.data() + q, s.nvl_xc + j, c * sizeof(Chain), hipMemcpyDeviceToHost));
+            CK(hipMemcpy(hs.data() + q, s.nvl_xh + j, c * sizeof(CEvH), hipMemcpyDeviceToHost));
+            CK(hipMemcpy(as.data() + q, s.nvl_xa + j, c * sizeof(int64_t), hipMemcpyDeviceToHost));
+            q += c;
+        }
         for (int e = 0; e < n; e++)
         {
             NvlRec r = {};
