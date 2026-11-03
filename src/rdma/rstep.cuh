@@ -677,12 +677,31 @@ __host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip,
 // start; a traced DAG's timers can put tI later).
 __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
 {
-#ifdef TWINS_ASTRA
-    if (s.nvl_oracle && s.fi[f].fast)
-        return; // (its completions come from the recording)
-#endif
     int64_t ts = tI + s.send_lat;
     int64_t a = (int64_t)fdiv(s.fD, tE + s.send_lat);
+#if defined(TWINS_ASTRA) && !defined(TWINS_CPU)
+    if ((s.nvl_xc || s.nvl_oracle) && s.fi[f].fast)
+    {
+        // a flow within a server: its message for the recording or for its island (--nvl-record,
+        // --nvl-islands); not run here with --nvl-oracle or --nvl-islands
+        Chain x, c;
+        cpush(&x, ccode(0, ord), E);
+        cpush(&c, ccode(s.send_lat, 0), x);
+        if (s.nvl_xc)
+        {
+            const unsigned long long i = atomicAdd(s.nvl_xn, 1ull);
+            if (i < s.nvl_xcap)
+            {
+                s.nvl_xc[i] = c;
+                s.nvl_xh[i].t = ts;
+                s.nvl_xh[i].flow = f;
+                s.nvl_xa[i] = a;
+            }
+        }
+        if (s.nvl_oracle)
+            return;
+    }
+#endif
     int b = (int)fmod(s.fnbi, a);
     unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
     if (n >= (unsigned)s.dcap)
@@ -697,19 +716,6 @@ __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI
     m.ts = ts;
     m.flow = f;
     const FlowInfo &cf = s.fi[f];
-#if defined(TWINS_ASTRA) && !defined(TWINS_CPU)
-    if (s.nvl_xc && cf.fast)
-    {
-        const unsigned long long i = atomicAdd(s.nvl_xn, 1ull);
-        if (i < s.nvl_xcap)
-        {
-            s.nvl_xc[i] = m.c;
-            s.nvl_xh[i].t = ts;
-            s.nvl_xh[i].flow = f;
-            s.nvl_xa[i] = a;
-        }
-    }
-#endif
     m.next = atomicExch(&s.hhead[(size_t)cf.src * s.nbi + b], n + 1);
     if (cf.fast)
         atomicAdd(&s.srv_fpend[s.h_srv[cf.src]], 1); // (no quiet windows in its server until it starts)
@@ -4197,14 +4203,15 @@ constexpr int NVL_DEPTH = 1024; // tail nodes of a chain recorded (beyond: lost,
 // chain's newest first (seg[e] its first in out); mark[slot] is the pos recorded there. err: 1 a tail
 // overwritten, 2 more than cap nodes
 #ifndef TWINS_CPU
-__global__ void nvl_walk(const Chain *base, const uint32_t *idx, int n, TailNode *out, int cap, int *seg, int *nout, uint64_t *mark, int *err)
+__global__ void nvl_walk(const Chain *base, const uint32_t *idx, int n, TailNode *out, int cap, int *seg, int *nout, uint64_t *mark, int *err,
+                         int depth_max)
 {
     int k = 0;
     for (int e = 0; e < n; e++)
     {
         seg[e] = k;
         uint64_t p = base[idx[e]].tail;
-        for (int depth = 0; p && depth < NVL_DEPTH; depth++)
+        for (int depth = 0; p && depth < depth_max; depth++)
         {
             const uint64_t slot = (p - 1) & g_tail.mask;
             if (mark[slot] == p)
@@ -4224,6 +4231,32 @@ __global__ void nvl_walk(const Chain *base, const uint32_t *idx, int n, TailNode
     }
     seg[n] = k;
     *nout = k;
+}
+#endif
+
+#ifndef TWINS_CPU
+// --nvl-islands: the tail nodes of chains base[idx[e]] not found before, a thread a chain (each node
+// once: mark[slot] holds the pos taken there), up to depth_max of a chain; their order is any
+__global__ void nvl_walk_par(const Chain *base, const uint32_t *idx, int n, TailNode *out, int cap, unsigned int *nout,
+                             unsigned long long *mark, int depth_max)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n)
+        return;
+    uint64_t p = base[idx[e]].tail;
+    for (int d = 0; p && d < depth_max; d++)
+    {
+        const uint64_t slot = (p - 1) & g_tail.mask;
+        const TailNode t = g_tail.n[slot];
+        if (t.pos != p)
+            break; // (overwritten)
+        if (atomicExch(&mark[slot], (unsigned long long)p) == p)
+            break; // (taken: by an earlier walk, or another thread now)
+        const unsigned int i = atomicAdd(nout, 1u);
+        if (i < (unsigned)cap)
+            out[i] = t;
+        p = t.next;
+    }
 }
 #endif
 

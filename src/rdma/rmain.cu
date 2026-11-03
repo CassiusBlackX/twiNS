@@ -235,6 +235,8 @@ struct World
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
 
+static int g_argc;
+static char **g_argv;
 #ifdef TWINS_ASTRA_HOST
 #include "astra/closed.h"
 #endif
@@ -1020,6 +1022,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
 
 int main(int argc, char **argv)
 {
+    g_argc = argc;
+    g_argv = argv;
     if (argc < 2)
     {
         fprintf(stderr, "usage: twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns] [KEY=VALUE ...]\n"
@@ -1091,6 +1095,8 @@ int main(int argc, char **argv)
             gwin = 0; // (per-entity windows instead)
         }
 #ifdef TWINS_ISLAND
+        else if (k == "--isl-shm")
+            g_isl_shm = v;
         else if (k == "--isl-in")
             g_isl_in = v;
         else if (k == "--isl-map")
@@ -1111,6 +1117,8 @@ int main(int argc, char **argv)
             g_nvl_record = v;
         else if (k == "--nvl-oracle") // those flows not run: their completions from such a file
             g_nvl_oracle = v;
+        else if (k == "--nvl-islands") // those flows run by a twins-island per server, on CPU cores
+            g_nvl_islands = atoi(v.c_str());
 #endif
         else if (k == "--dcap")
         {
@@ -1598,10 +1606,10 @@ int main(int argc, char **argv)
                     dep_c[g] = p.c;
                     dep_c[g].root += fbase[wi];
 #ifdef TWINS_ASTRA_HOST
-                    if (!g_nvl_oracle.empty() && fi[g].fast)
-                        continue; // (its completions come from the recording)
-                    if (!g_nvl_record.empty() && fi[g].fast)
+                    if ((!g_nvl_record.empty() || g_nvl_islands) && fi[g].fast)
                         g_nvl_pre.push_back({g, p.ts, dep_c[g]});
+                    if ((!g_nvl_oracle.empty() || g_nvl_islands) && fi[g].fast)
+                        continue; // (its completions come from the recording, or from its island)
 #endif
                     if (dyn_n[h] >= dyn_cap)
                     {
@@ -1652,7 +1660,7 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
         if (g_cl)
         {
-            g_cl->setup(s, send_lat_slots(s.send_lat, D), fi);
+            g_cl->setup(s, send_lat_slots(s.send_lat, D), fi, h_srv);
             s.tchain = dev_alloc<Chain>(Closed::TCAP);
             g_cl->init_timers(s.tchain);
         }

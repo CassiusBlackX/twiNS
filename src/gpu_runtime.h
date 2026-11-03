@@ -150,6 +150,8 @@ inline hipError_t twinsGraphInstantiate(hipGraphExec_t *exec, hipGraph_t graph, 
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipMalloc cudaMalloc
 #define hipMemset cudaMemset
+#define hipMemsetAsync cudaMemsetAsync
+#define hipFree cudaFree
 #define hipMemcpy cudaMemcpy
 #define hipMemcpyAsync cudaMemcpyAsync
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice

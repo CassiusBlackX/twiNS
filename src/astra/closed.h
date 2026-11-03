@@ -25,6 +25,7 @@ static int send_lat_slots(int64_t send_lat, int64_t D) { return (int)((send_lat 
 // GPU reaches their times, as if it had made them. Same completions, same chains: the system layer
 // must do exactly what it did. What is left on the GPU is the network between the servers.
 static string g_nvl_record, g_nvl_oracle;
+static int g_nvl_islands = 0;
 struct NvlPre
 {
     int g;
@@ -38,13 +39,487 @@ static int g_nvl_nsw = 0;
 // reach it, and after the older node it points to; a completion (tag 1) can be put in once the
 // GPU has passed avail (the slot the recording run had reached when it read it), which is before
 // its time.
-struct NvlRec
+#include "rdma/isl_shm.h"
+#include <unordered_set>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <csignal>
+
+// --nvl-islands: the flows between GPUs of one server run on CPU cores, a twins-island process per
+// server (src/rdma/island.h), alongside the GPU. Each sync the islands get the messages starting
+// their flows and run to the GPU's limit; their completions go into the GPU's ring of completions,
+// as the GPU's own. Chains cross both ways with the tail nodes they reach (each sent once to each
+// side), renumbered in the receiver's ring.
+constexpr int NVL_ISL_DEPTH = 64; // the GPU's tail nodes of a chain sent to an island (beyond: lost, if reached)
+struct NvlIslands
 {
-    uint32_t tag, pad;
-    int64_t avail;
-    CEvH h;
-    Chain c;
-    TailNode n;
+    struct Node
+    {
+        uint32_t code, cnt;
+        uint64_t next;
+    };
+    int n = 0;
+    vector<int> of_sw;               // a switch's island, or -1
+    vector<IslShm *> shm;
+    vector<pid_t> pid;
+    vector<string> names;
+    vector<vector<NvlRec>> queue;    // items for an island's next command
+    vector<std::unordered_set<uint64_t>> sent; // GPU nodes an island has
+    vector<std::unordered_map<uint64_t, uint64_t>> gpos; // an island's node -> GPU's
+    std::unordered_map<uint64_t, Node> gnodes; // the GPU's nodes the walks found
+    struct Orig
+    {
+        int k;
+        uint64_t pos;
+    };
+    std::unordered_map<uint64_t, Orig> orig; // a GPU node copied from an island's: that island and its pos
+    long long live = 0;              // flows given to islands and not complete
+    int64_t slot = 0;                // where the islands are
+    int64_t sent_limit = 0;          // the limit of the last run
+    string dir;
+    double t_wait = 0, t_xfer = 0;
+    unsigned long long xn_seen = 0, items_in = 0, items_out = 0;
+
+    // the files, segments and processes: servers spread over P processes (--nvl-islands=P), each
+    // running its servers as a batch of worlds
+    vector<vector<int>> wsw;         // a process's servers, in its job order
+    vector<vector<vector<int>>> wflows; // and their flows (global ids)
+    void start(Sim &s, const vector<FlowInfo> &fi, const vector<int> &h_srv, const string &topo, int64_t D, int P)
+    {
+        const int S = s.S;
+        of_sw.assign(S, -1);
+        vector<vector<int>> flows(S);
+        for (size_t g = 0; g < fi.size(); g++)
+            if (fi[g].fast)
+                flows[h_srv[fi[g].src]].push_back((int)g);
+        vector<int> xs;
+        for (int x = 0; x < S; x++)
+            if (!flows[x].empty())
+                xs.push_back(x);
+        n = std::max(1, std::min(P, (int)xs.size()));
+        if (xs.empty())
+        {
+            n = 0;
+            return;
+        }
+        wsw.assign(n, {});
+        wflows.assign(n, {});
+        for (size_t i = 0; i < xs.size(); i++)
+        {
+            wsw[i % n].push_back(xs[i]);
+            of_sw[xs[i]] = (int)(i % n);
+        }
+        // the topology's lines: header, switch ids, links (SimAI's format)
+        std::ifstream tf(topo);
+        string head, ids, line;
+        std::getline(tf, head);
+        std::getline(tf, ids);
+        vector<string> links;
+        while (std::getline(tf, line))
+            links.push_back(line);
+        const int H = s.H;
+        char tmpl[] = "/dev/shm/twins-isl-XXXXXX";
+        if (!mkdtemp(tmpl))
+        {
+            fprintf(stderr, "nvl: cannot make a directory in /dev/shm\n");
+            exit(1);
+        }
+        dir = tmpl;
+        const char *bin = getenv("TWINS_ISLAND");
+        string island_bin = bin ? bin : "";
+        if (island_bin.empty())
+        {
+            char self[4096];
+            ssize_t k = readlink("/proc/self/exe", self, sizeof(self) - 1);
+            self[k > 0 ? k : 0] = 0;
+            string d = self;
+            island_bin = d.substr(0, d.rfind('/')) + "/twins-island";
+        }
+        for (int k = 0; k < n; k++)
+        {
+            string pd = dir + "/p" + std::to_string(k);
+            mkdir(pd.c_str(), 0700);
+            FILE *jf = fopen((pd + ".jobs").c_str(), "w");
+            FILE *mf = fopen((pd + ".map").c_str(), "w");
+            for (int x : wsw[k])
+            {
+                // its GPUs, by host id; its links to the NVSwitch (node H + x)
+                vector<int> gpus;
+                for (int h = 0; h < H; h++)
+                    if (h_srv[h] == x)
+                        gpus.push_back(h);
+                std::map<int, int> lid;
+                for (size_t i = 0; i < gpus.size(); i++)
+                    lid[gpus[i]] = (int)i;
+                const int ng = gpus.size();
+                string base = pd + "/s" + std::to_string(x);
+                FILE *f = fopen((base + ".topo").c_str(), "w");
+                fprintf(f, "%d %d 1 0 %d H100\n%d\n", ng + 1, ng, ng, ng);
+                for (auto &l : links)
+                {
+                    std::istringstream ls(l);
+                    int a, b;
+                    if (!(ls >> a >> b))
+                        continue;
+                    string rest;
+                    std::getline(ls, rest);
+                    if (b == H + x && lid.count(a))
+                        fprintf(f, "%d %d%s\n", lid[a], ng, rest.c_str());
+                    else if (a == H + x && lid.count(b))
+                        fprintf(f, "%d %d%s\n", lid[b], ng, rest.c_str());
+                }
+                fclose(f);
+                f = fopen((base + ".dag").c_str(), "w");
+                for (size_t i = 0; i < flows[x].size(); i++)
+                {
+                    const FlowInfo &y = fi[flows[x][i]];
+                    fprintf(f, "flow %zu %d %d %llu\n", i, lid[y.src], lid[y.dst], (unsigned long long)y.size);
+                }
+                fclose(f);
+                for (int g : flows[x])
+                    fprintf(mf, "%d\n", g);
+                wflows[k].push_back(flows[x]);
+                fprintf(jf, "s%d %s.topo %s.dag\n", x, base.c_str(), base.c_str());
+            }
+            fclose(jf);
+            fclose(mf);
+            string name = "/twins-isl-" + std::to_string(getpid()) + "-" + std::to_string(k);
+            IslShm *m = isl_map(name.c_str(), true, 1 << 18, 1 << 18);
+            if (!m)
+            {
+                fprintf(stderr, "nvl: cannot make %s\n", name.c_str());
+                exit(1);
+            }
+            shm.push_back(m);
+            names.push_back(name);
+            // the island: the config and every KEY=VALUE given here, the cluster's RTT and window
+            vector<string> args = {island_bin, g_argv[1], "--batch=" + pd + ".jobs", "--outdir=" + pd, "--isl-map=" + pd + ".map",
+                                   "--isl-shm=" + name, "--tail=22", "NVL_BASE_RTT=" + std::to_string(s.P.base_rtt),
+                                   "NVL_WIN=" + std::to_string(s.P.win)};
+            for (int i = 2; i < g_argc; i++)
+                if (g_argv[i][0] != '-' && strchr(g_argv[i], '='))
+                    args.push_back(g_argv[i]);
+            pid_t p = fork();
+            if (p == 0)
+            {
+                prctl(PR_SET_PDEATHSIG, SIGKILL); // (it ends with twins-ai, whatever happens)
+                FILE *lg = freopen((pd + ".log").c_str(), "w", stdout);
+                (void)lg;
+                dup2(fileno(stdout), 2);
+                vector<char *> av;
+                for (auto &a : args)
+                    av.push_back(const_cast<char *>(a.c_str()));
+                av.push_back(nullptr);
+                execv(av[0], av.data());
+                fprintf(stderr, "cannot run %s\n", av[0]);
+                _exit(127);
+            }
+            pid.push_back(p);
+        }
+        queue.assign(n, {});
+        sent.assign(n, {});
+        gpos.assign(n, {});
+        static vector<string> *to_unlink = &names;
+        atexit([] {
+            for (auto &x : *to_unlink)
+                shm_unlink(x.c_str());
+        });
+        printf("nvl: %zu servers on %d islands (%s)\n", xs.size(), n, dir.c_str());
+    }
+    int island_of_flow(const FlowInfo &y, const vector<int> &h_srv) const { return of_sw[h_srv[y.src]]; }
+    // a command to an island (its queue first, in pieces if needed); waits only for the pieces
+    void command(int k, uint32_t cmd, int64_t limit)
+    {
+        IslShm *m = shm[k];
+        auto &q = queue[k];
+        size_t at = 0;
+        do
+        {
+            const uint64_t c = std::min<uint64_t>(q.size() - at, m->in_cap);
+            memcpy((void *)m->in(), q.data() + at, c * sizeof(NvlRec));
+            m->in_n = c;
+            at += c;
+            items_in += c;
+            const bool last = at == q.size();
+            m->cmd = last ? cmd : ISL_LOAD;
+            m->limit = limit;
+            const uint32_t d = m->done_seq.load(std::memory_order_acquire);
+            isl_wake(m->cmd_seq);
+            if (!last)
+                isl_wait(m->done_seq, d);
+            else
+                break;
+        } while (true);
+        q.clear();
+    }
+    vector<uint32_t> done_at;
+    void go(int64_t limit)
+    {
+        done_at.assign(n, 0);
+        for (int k = 0; k < n; k++)
+        {
+            done_at[k] = shm[k]->done_seq.load(std::memory_order_acquire);
+            command(k, ISL_RUN, limit);
+        }
+        sent_limit = limit;
+    }
+    // each island's answer: what it made, in order
+    void collect(vector<vector<NvlRec>> &out)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        out.assign(n, {});
+        for (int k = 0; k < n; k++)
+        {
+            IslShm *m = shm[k];
+            isl_wait(m->done_seq, done_at[k]);
+            for (;;)
+            {
+                out[k].insert(out[k].end(), m->out(), m->out() + m->out_n);
+                items_out += m->out_n;
+                if (!m->more)
+                    break;
+                const uint32_t d = m->done_seq.load(std::memory_order_acquire);
+                m->cmd = ISL_MORE;
+                isl_wake(m->cmd_seq);
+                isl_wait(m->done_seq, d);
+            }
+            slot = m->slot;
+        }
+        t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // the islands' items into the GPU's rings: nodes renumbered, completions after the GPU's own
+    template <typename P>
+    unsigned long long inject(Sim &s, hipStream_t st, vector<vector<NvlRec>> &out, CEvH *dev_h, unsigned long long head,
+                              unsigned long long mask, P &&pending)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        TailPool tp;
+        CK(hipMemcpyFromSymbol(&tp, HIP_SYMBOL(g_tail), sizeof(tp)));
+        unsigned long long tcnt;
+        CK(hipMemcpy(&tcnt, tp.cnt, sizeof(tcnt), hipMemcpyDeviceToHost));
+        const unsigned long long t0n = tcnt;
+        vector<TailNode> nodes;
+        vector<CEvH> hs;
+        vector<Chain> cs;
+        for (int k = 0; k < n; k++)
+            for (auto &r : out[k])
+            {
+                if (r.tag == 4)
+                {
+                    gpos[k][r.n.pos] = r.n.next; // (the island's copy of a GPU node: that node)
+                    continue;
+                }
+                if (r.tag == 0)
+                {
+                    TailNode nd = r.n;
+                    nd.pos = ++tcnt;
+                    auto it = gpos[k].find(r.n.next);
+                    nd.next = !r.n.next ? 0 : it != gpos[k].end() ? it->second : (1ull << 62);
+                    gpos[k][r.n.pos] = nd.pos;
+                    orig[nd.pos] = Orig{k, r.n.pos};
+                    nodes.push_back(nd);
+                    continue;
+                }
+                Chain c = r.c;
+                auto it = gpos[k].find(c.tail);
+                c.tail = !c.tail ? 0 : it != gpos[k].end() ? it->second : (1ull << 62);
+                hs.push_back(r.h);
+                cs.push_back(c);
+                if (r.h.kind == 0)
+                    live--;
+            }
+        for (size_t q = 0; q < nodes.size();)
+        {
+            const uint64_t sl = (t0n + q) & tp.mask, m = std::min<uint64_t>(nodes.size() - q, tp.mask + 1 - sl);
+            CK(hipMemcpyAsync(tp.n + sl, &nodes[q], m * sizeof(TailNode), hipMemcpyHostToDevice, st));
+            q += m;
+        }
+        CK(hipMemcpyAsync(tp.cnt, &tcnt, sizeof(tcnt), hipMemcpyHostToDevice, st));
+        for (size_t q = 0; q < hs.size();)
+        {
+            const unsigned long long j = (head + q) & mask, c = std::min<unsigned long long>(hs.size() - q, mask + 1 - j);
+            CK(hipMemcpyAsync(dev_h + j, &hs[q], c * sizeof(CEvH), hipMemcpyHostToDevice, st));
+            CK(hipMemcpyAsync(s.cev_c + j, &cs[q], c * sizeof(Chain), hipMemcpyHostToDevice, st));
+            q += c;
+        }
+        for (size_t i = 0; i < hs.size(); i++, head++)
+            pending(hs[i], (uint32_t)(head & mask));
+        CK(hipMemcpyAsync(&s.cl->head, &head, sizeof(head), hipMemcpyHostToDevice, st));
+        CK(hipStreamSynchronize(st));
+        t_xfer += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return head;
+    }
+    // the messages the GPU made for islands' flows (closed_apply, dag_msg), with the GPU's tail nodes
+    // their chains reach that the island does not have, onto its queue
+    void take_starts(Sim &s, hipStream_t st, const vector<FlowInfo> &fi, const vector<int> &h_srv, int64_t made)
+    {
+        unsigned long long xn;
+        CK(hipMemcpy(&xn, s.nvl_xn, sizeof(xn), hipMemcpyDeviceToHost));
+        if (xn > s.nvl_xcap)
+        {
+            fprintf(stderr, "nvl: more than %llu messages for islands\n", s.nvl_xcap);
+            exit(1);
+        }
+        if (xn == xn_seen)
+            return;
+        auto t0 = std::chrono::steady_clock::now();
+        const int m = (int)(xn - xn_seen), cap = 1 << 23;
+        static uint32_t *d_idx = nullptr;
+        static int d_n = 0;
+        static unsigned int *d_k = nullptr;
+        static TailNode *d_out = nullptr;
+        static unsigned long long *d_mark = nullptr;
+        if (!d_out)
+        {
+            TailPool tp;
+            CK(hipMemcpyFromSymbol(&tp, HIP_SYMBOL(g_tail), sizeof(tp)));
+            d_mark = dev_alloc<unsigned long long>(tp.mask + 1);
+            d_out = dev_alloc<TailNode>(cap);
+            d_k = dev_alloc<unsigned int>(1);
+        }
+        if (m > d_n)
+        {
+            if (d_idx)
+                CK(hipFree(d_idx));
+            d_n = std::max(m, 2 * d_n);
+            d_idx = dev_alloc<uint32_t>(d_n);
+        }
+        vector<uint32_t> idx(m);
+        for (int e = 0; e < m; e++)
+            idx[e] = (uint32_t)(xn_seen + e);
+        CK(hipMemcpyAsync(d_idx, idx.data(), m * sizeof(uint32_t), hipMemcpyHostToDevice, st));
+        CK(hipMemsetAsync(d_k, 0, sizeof(unsigned), st));
+        nvl_walk_par<<<(m + 63) / 64, 64, 0, st>>>(s.nvl_xc, d_idx, m, d_out, cap, d_k, d_mark, NVL_ISL_DEPTH);
+        unsigned kk;
+        CK(hipMemcpyAsync(&kk, d_k, sizeof(kk), hipMemcpyDeviceToHost, st));
+        CK(hipStreamSynchronize(st));
+        if (kk > (unsigned)cap)
+        {
+            fprintf(stderr, "nvl: more than %d new tail nodes in a sync\n", cap);
+            exit(1);
+        }
+        vector<TailNode> nodes(kk);
+        if (kk)
+            CK(hipMemcpy(nodes.data(), d_out, kk * sizeof(TailNode), hipMemcpyDeviceToHost));
+        for (auto &t : nodes)
+            gnodes[t.pos] = Node{t.code, t.cnt, t.next};
+        vector<Chain> cs(m);
+        vector<CEvH> hs(m);
+        vector<int64_t> as(m);
+        CK(hipMemcpy(cs.data(), s.nvl_xc + xn_seen, m * sizeof(Chain), hipMemcpyDeviceToHost));
+        CK(hipMemcpy(hs.data(), s.nvl_xh + xn_seen, m * sizeof(CEvH), hipMemcpyDeviceToHost));
+        CK(hipMemcpy(as.data(), s.nvl_xa + xn_seen, m * sizeof(int64_t), hipMemcpyDeviceToHost));
+        for (int e = 0; e < m; e++)
+        {
+            const int k = island_of_flow(fi[hs[e].flow], h_srv);
+            send_tail(k, cs[e].tail);
+            NvlRec r = {};
+            r.tag = 2;
+            r.avail = as[e];
+            r.h = hs[e];
+            r.c = cs[e];
+            r.n.pos = (uint64_t)made;
+            queue[k].push_back(r);
+        }
+        xn_seen = xn;
+        t_xfer += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // the GPU's nodes of a tail the island lacks, oldest first, onto its queue
+    void send_tail(int k, uint64_t p)
+    {
+        vector<uint64_t> todo;
+        while (p && !sent[k].count(p))
+        {
+            auto o = orig.find(p);
+            if (o != orig.end() && o->second.k == k)
+            {
+                // the island's own node: an alias, no copy
+                NvlRec r = {};
+                r.tag = 4;
+                r.n.pos = p;
+                r.n.next = o->second.pos;
+                queue[k].push_back(r);
+                sent[k].insert(p);
+                break;
+            }
+            auto it = gnodes.find(p);
+            if (it == gnodes.end())
+                break; // (overwritten in the GPU's ring before it was found: lost, if reached)
+            todo.push_back(p);
+            p = it->second.next;
+        }
+        for (size_t i = todo.size(); i-- > 0;)
+        {
+            const Node &nd = gnodes[todo[i]];
+            NvlRec r = {};
+            r.tag = 0;
+            r.n = TailNode{nd.code, nd.cnt, nd.next, todo[i]};
+            queue[k].push_back(r);
+            sent[k].insert(todo[i]);
+        }
+    }
+    // main's flows within servers, ready at the start (their chains are main's: no tails)
+    void pre(const vector<NvlPre> &ps, const vector<FlowInfo> &fi, const vector<int> &h_srv)
+    {
+        for (auto &p : ps)
+        {
+            NvlRec r = {};
+            r.tag = 3;
+            r.h.t = p.ts;
+            r.h.flow = p.g;
+            r.c = p.c;
+            queue[island_of_flow(fi[p.g], h_srv)].push_back(r);
+            live++;
+        }
+        for (int k = 0; k < n; k++)
+        {
+            done_at.assign(n, 0);
+            const uint32_t d = shm[k]->done_seq.load(std::memory_order_acquire);
+            command(k, ISL_LOAD, 0);
+            isl_wait(shm[k]->done_seq, d);
+        }
+    }
+    // the end: the islands write their flows' completion times; these, by global id
+    void finish(vector<int64_t> &start, vector<int64_t> &fct, unsigned &done)
+    {
+        double busy = 0;
+        for (int k = 0; k < n; k++)
+        {
+            const uint32_t d = shm[k]->done_seq.load(std::memory_order_acquire);
+            busy += shm[k]->busy_s;
+            shm[k]->cmd = ISL_QUIT;
+            isl_wake(shm[k]->cmd_seq);
+            isl_wait(shm[k]->done_seq, d);
+            int st;
+            waitpid(pid[k], &st, 0);
+            for (size_t w = 0; w < wsw[k].size(); w++)
+            {
+                FILE *f = fopen((dir + "/p" + std::to_string(k) + "/s" + std::to_string(wsw[k][w]) + ".fct").c_str(), "r");
+                long long i, a, b;
+                const vector<int> &mp = wflows[k][w];
+                while (f && fscanf(f, "%lld %lld %lld", &i, &a, &b) == 3)
+                    if (i >= 0 && i < (long long)mp.size() && fct[mp[i]] < 0)
+                    {
+                        start[mp[i]] = a;
+                        fct[mp[i]] = b;
+                        done++;
+                    }
+                if (f)
+                    fclose(f);
+            }
+            shm_unlink(names[k].c_str());
+        }
+        if (!dir.empty())
+        {
+            string cmd = "rm -rf '" + dir + "'";
+            if (system(cmd.c_str()))
+                fprintf(stderr, "nvl: could not remove %s\n", dir.c_str());
+        }
+        printf("nvl: islands busy %.3f s in all; twins-ai waited %.3f s for them, %.3f s moving items; %llu items in, %llu out\n", busy,
+               t_wait, t_xfer, items_in, items_out);
+    }
 };
 
 struct Closed : astra::Network
@@ -158,7 +633,11 @@ struct Closed : astra::Network
     size_t onext = 0;
     FILE *rec_f = nullptr;
     unsigned long long injected = 0, recorded = 0;
-    void setup(Sim &s, int span_slots, const vector<FlowInfo> &fi)
+    NvlIslands isl;
+    vector<FlowInfo> fi_host;
+    vector<int> h_srv_host;
+    int64_t isl_lim = 0;
+    void setup(Sim &s, int span_slots, const vector<FlowInfo> &fi, const vector<int> &h_srv)
     {
         fast.resize(fi.size());
         for (size_t g = 0; g < fi.size(); g++)
@@ -191,7 +670,20 @@ struct Closed : astra::Network
                 fwrite(&r, sizeof(r), 1, st_f);
             }
         }
-        if (s.nvl_oracle)
+        if (g_nvl_islands)
+        {
+            s.nvl_oracle = 1; // (the GPU does not run them)
+            s.nvl_xcap = 1 << 20;
+            s.nvl_xc = dev_alloc<Chain>(s.nvl_xcap);
+            s.nvl_xh = dev_alloc<CEvH>(s.nvl_xcap);
+            s.nvl_xa = dev_alloc<int64_t>(s.nvl_xcap);
+            s.nvl_xn = dev_alloc<unsigned long long>(1);
+            fi_host = fi;
+            h_srv_host = h_srv;
+            isl.start(s, fi, h_srv, topo, s.P.delay, g_nvl_islands);
+            isl.pre(g_nvl_pre, fi, h_srv);
+        }
+        if (!g_nvl_oracle.empty())
         {
             FILE *f = fopen(g_nvl_oracle.c_str(), "rb");
             if (!f)
@@ -243,6 +735,8 @@ struct Closed : astra::Network
             t = std::min(t, p.t);
         if (onext < orecs.size())
             t = std::min(t, orecs[onext].avail); // (no later item of the recording is due before it)
+        if (isl.n && isl.live > 0)
+            return std::min(t / (D ? D : 25), isl.slot); // (the islands may complete a flow any time)
         return t == INT64_MAX ? INT64_MAX : (D ? t / D : t / 25);
     }
     unsigned long long oldest(unsigned long long head) const
@@ -276,8 +770,12 @@ struct Closed : astra::Network
         c0.limit = span;
         c0.cap = next_cap();
         CK(hipMemcpy(dev_cl, &c0, sizeof(c0), hipMemcpyHostToDevice));
+        isl_lim = span;
+        vector<vector<NvlRec>> isl_out, isl_more;
         for (;;)
         {
+            if (isl.n)
+                isl.go(isl_lim); // (the islands run alongside the GPU's launches)
             auto a = now();
             // (few launches, up to the limit, while completions keep coming; else many: without any
             // the GPU moves the limit itself)
@@ -303,7 +801,7 @@ struct Closed : astra::Network
                     return;
             }
             if (progress && syncs % 2000 == 0)
-                fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s; idle %d cap %lld limit %lld timer %d pool %zu ready %zu\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync, ctl.idle, (long long)ctl.cap, (long long)ctl.limit, (int)fe->has_timer(), pool.size(), ready.size());
+                fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s; idle %d cap %lld limit %lld timer %d pool %zu ready %zu; islands wait %.1f s move %.1f s live %lld nodes %zu\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync, ctl.idle, (long long)ctl.cap, (long long)ctl.limit, (int)fe->has_timer(), pool.size(), ready.size(), isl.t_wait, isl.t_xfer, isl.live, isl.gnodes.size());
             // the completions recorded, as a contiguous range of the ring
             if (ctl.head - seen > (unsigned long long)cev_mask)
             {
@@ -344,6 +842,19 @@ struct Closed : astra::Network
             // the due ones in order
             const int64_t reach = S * D;
             rec_reach = reach;
+            if (isl.n)
+            {
+                isl.collect(isl_out);
+                if (S > isl.sent_limit)
+                {
+                    // (the GPU went on alone, with no island flow running: the islands catch up)
+                    isl.go(S);
+                    isl.collect(isl_more);
+                    for (int k = 0; k < isl.n; k++)
+                        isl_out[k].insert(isl_out[k].end(), isl_more[k].begin(), isl_more[k].end());
+                }
+                seen = isl.inject(s, st, isl_out, dev_h, seen, cev_mask, [&](const CEvH &h, uint32_t j) { pool.push_back(Pending{h.t, j, h, 0}); });
+            }
             if (onext < orecs.size() && orecs[onext].avail < reach)
             {
                 // the recording's items the GPU has now passed: tail nodes into this run's ring,
@@ -463,11 +974,14 @@ struct Closed : astra::Network
             if (fe->finished)
                 return;
             // nothing more to come
-            if (ctl.idle && acts.empty() && pool.empty() && ready.empty() && !fe->has_timer() && onext == orecs.size())
+            if (ctl.idle && acts.empty() && pool.empty() && ready.empty() && !fe->has_timer() && onext == orecs.size() && isl.live == 0)
                 return;
             apply(st, S + span, seen);
+            isl_lim = S + span;
             for (int t : tfree_later)
                 tfree.push_back(t);
+            if (isl.n)
+                isl.take_starts(s, st, fi_host, h_srv_host, reach);
             CK(hipStreamSynchronize(st));
             t_sync += sec(e, now());
         }
@@ -484,6 +998,14 @@ struct Closed : astra::Network
                     fprintf(f, "%zu %lld %lld %d %d %llu\n", g, (long long)fi[g].start, (long long)fct[g], fi[g].src, fi[g].dst,
                             (unsigned long long)fi[g].size);
             fclose(f);
+        }
+        if (isl.n)
+        {
+            vector<int64_t> st(fi.size(), -1);
+            isl.finish(st, fct, done);
+            for (size_t g = 0; g < fi.size(); g++)
+                if (st[g] >= 0)
+                    fi[g].start = st[g];
         }
         if (!g_nvl_oracle.empty())
         {
@@ -547,7 +1069,7 @@ struct Closed : astra::Network
             d_seg = dev_alloc<int>(d_n + 1);
         }
         CK(hipMemcpy(d_idx, idx.data(), n * sizeof(uint32_t), hipMemcpyHostToDevice));
-        nvl_walk<<<1, 1, 0, st>>>(s.cev_c, d_idx, n, d_out, cap, d_seg, d_k, d_mark, d_k + 1);
+        nvl_walk<<<1, 1, 0, st>>>(s.cev_c, d_idx, n, d_out, cap, d_seg, d_k, d_mark, d_k + 1, NVL_DEPTH);
         CK(hipStreamSynchronize(st));
         int kk[2];
         CK(hipMemcpy(kk, d_k, sizeof(kk), hipMemcpyDeviceToHost));
@@ -624,7 +1146,7 @@ struct Closed : astra::Network
             d_seg = dev_alloc<int>(d_n + 1);
         }
         CK(hipMemcpy(d_idx, idx.data(), n * sizeof(uint32_t), hipMemcpyHostToDevice));
-        nvl_walk<<<1, 1, 0, st>>>(s.nvl_xc, d_idx, n, d_out, cap, d_seg, d_k, d_mark, d_k + 1);
+        nvl_walk<<<1, 1, 0, st>>>(s.nvl_xc, d_idx, n, d_out, cap, d_seg, d_k, d_mark, d_k + 1, NVL_DEPTH);
         CK(hipStreamSynchronize(st));
         int kk[2];
         CK(hipMemcpy(kk, d_k, sizeof(kk), hipMemcpyDeviceToHost));
@@ -672,7 +1194,12 @@ struct Closed : astra::Network
         if (!acts.empty())
             CK(hipMemcpyAsync(dev_act, acts.data(), acts.size() * sizeof(CAct), hipMemcpyHostToDevice, st));
         for (auto &x : acts)
-            single |= !(x.child & DACT_TIMER) && !(!orecs.empty() && fast[x.child]); // (oracle: no flow of a server's own)
+        {
+            const bool own = !(x.child & DACT_TIMER) && fast[x.child] && (!orecs.empty() || isl.n);
+            single |= !(x.child & DACT_TIMER) && !own; // (a flow of a server's own: elsewhere)
+            if (own && isl.n)
+                isl.live++; // (counted before next_cap: no idle jump past what the islands may make)
+        }
         closed_apply<<<1, 1, 0, st>>>((int)acts.size(), limit, next_cap(), single, seen, oldest(seen));
         single = false;
     }
