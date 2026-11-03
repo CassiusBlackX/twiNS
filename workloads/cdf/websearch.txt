@@ -1,0 +1,14 @@
+# DCTCP web search (Alizadeh et al., SIGCOMM 2010), as in HPCC's traffic_gen (DCTCP_distribution.txt)
+# columns: flow size (bytes), cumulative percent
+0 0
+10000 15
+20000 20
+30000 30
+50000 40
+80000 53
+200000 60
+1000000 70
+2000000 80
+5000000 90
+10000000 97
+30000000 100

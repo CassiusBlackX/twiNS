@@ -34,7 +34,24 @@ def sample_cdf(rng, cdf):
     return s0 + (s1 - s0) * (u - p0) / (p1 - p0)
 
 
+def read_cdf(path):
+    # "size probability" lines (bytes; a fraction, or a percent if the last value exceeds 1);
+    # "#" starts a comment
+    pts = []
+    for line in open(path):
+        line = line.split("#")[0].split()
+        if len(line) >= 2:
+            pts.append((float(line[0]), float(line[1])))
+    scale = 100.0 if pts[-1][1] > 1.5 else 1.0
+    return [(s, p / scale) for s, p in pts]
+
+
 def flow_size(rng, args):
+    if args.size == "cdf":
+        b = sample_cdf(rng, args.cdf_pts)
+        if args.align == "byte":
+            return max(1, int(b))
+        return max(1, math.ceil(b / MSS)) * MSS
     if args.size == "fixed":
         pkts = args.mean_pkts
     elif args.size == "exp":
@@ -69,7 +86,8 @@ def main():
     ap.add_argument("--hosts", type=int, default=0, help="host count for other topologies (instead of --k)")
     ap.add_argument("--active", type=float, default=1.0, help="fraction of host pairs carrying traffic")
     ap.add_argument("--bidir", type=int, default=1, help="1: both directions of an active pair send")
-    ap.add_argument("--size", choices=["fixed", "exp", "websearch", "uniform"], default="exp")
+    ap.add_argument("--size", choices=["fixed", "exp", "websearch", "uniform", "cdf"], default="exp")
+    ap.add_argument("--cdf", help="--size cdf: a flow-size CDF file (workloads/cdf/)")
     ap.add_argument("--min_pkts", type=int, default=1028, help="uniform: smallest flow (packets), 1.5 MB")
     ap.add_argument("--max_pkts", type=int, default=4110, help="uniform: largest flow (packets), 6 MB")
     ap.add_argument("--mean_pkts", type=int, default=1000)
@@ -98,6 +116,10 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.size == "cdf":
+        if not args.cdf:
+            ap.error("--size cdf needs --cdf FILE")
+        args.cdf_pts = read_cdf(args.cdf)
     if not args.k and not args.hosts:
         ap.error("--k or --hosts")
     if args.pattern != "pair":
