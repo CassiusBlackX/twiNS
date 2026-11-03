@@ -6,7 +6,7 @@
 // The network: hosts with one RDMA NIC each (queue pairs paced by rate, a window, go-back-N with
 // NACKs, ACKs in a high-priority queue), switches with a shared-buffer MMU (PFC with dynamic
 // thresholds and headroom, ECN marking at dequeue), PFC pause/resume, and congestion control
-// DCQCN (Mellanox's version, CC_MODE 1) or HPCC (INT, CC_MODE 3). Links have their own rates and
+// DCQCN (Mellanox's version, CC_MODE 1), HPCC (INT, CC_MODE 3) or DCTCP over RDMA (CC_MODE 8). Links have their own rates and
 // delays. Times are nanoseconds (ns-3's resolution).
 //
 // Execution model (as TwiNS's TCP model): slots of the shortest link delay D, the lookahead. A frame
@@ -200,11 +200,25 @@ struct SndQP
     double alpha;
     uint64_t target;
     int64_t t_alpha, t_dec, t_rp; // pending timers (-1: none)
-    // HPCC (hp)
+    // HPCC (hp); DCTCP (dctcp) also uses last_update_seq and alpha, and has the rest of HPCC's room
     uint32_t last_update_seq;
     int32_t inc_stage;
-    uint64_t cur_rate;
-    double u;
+    union
+    {
+        uint64_t cur_rate;
+        struct
+        {
+            uint32_t high_seq, ecn_cnt;
+        };
+    };
+    union
+    {
+        double u;
+        struct
+        {
+            uint32_t batch, ca_state; // m_batchSizeOfAlpha, m_caState
+        };
+    };
     uint64_t hop[MAX_HOP];
     // the last tx time computed for this QP: tx_ns(tx_rate, tx_size) = tx_val (a division saved)
     uint64_t tx_rate;
@@ -336,7 +350,7 @@ struct LinkInfo
 
 struct Params
 {
-    int cc;               // CC_MODE: 1 DCQCN, 3 HPCC
+    int cc;               // CC_MODE: 1 DCQCN, 3 HPCC, 8 DCTCP
     int int_size;         // IntHeader::GetStaticSize: 42 (HPCC) or 0
     uint32_t mtu;         // PACKET_PAYLOAD_SIZE
     uint32_t ack_interval; // L2_ACK_INTERVAL
@@ -360,6 +374,8 @@ struct Params
     int64_t alpha_int, dec_int, rp_int; // ns
     uint32_t rpg_threshold; // FAST_RECOVERY_TIMES
     uint64_t rai, rhai, min_rate;
+    // DCTCP (with g and min_rate)
+    uint64_t dctcp_rai;   // DCTCP_RATE_AI
     // HPCC
     double u_target;
     uint32_t mi_thresh;

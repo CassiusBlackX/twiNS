@@ -356,9 +356,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     Params &P = w.P;
     P = Params{};
     P.cc = cfg.u32("CC_MODE", 1);
-    if (P.cc != 1 && P.cc != 3)
+    if (P.cc != 1 && P.cc != 3 && P.cc != 8)
     {
-        fprintf(stderr, "%s: CC_MODE %d: only 1 (DCQCN) and 3 (HPCC) are modelled\n", w.name.c_str(), P.cc);
+        fprintf(stderr, "%s: CC_MODE %d: only 1 (DCQCN), 3 (HPCC) and 8 (DCTCP) are modelled\n", w.name.c_str(), P.cc);
         return false;
     }
     if (cfg.u32("MULTI_RATE", 1) && P.cc == 3)
@@ -399,6 +399,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.rai = parse_rate(cfg.str("RATE_AI", "5Mb/s"));
     P.rhai = parse_rate(cfg.str("RATE_HAI", "50Mb/s"));
     P.min_rate = parse_rate(cfg.str("MIN_RATE", "100Mb/s"));
+    P.dctcp_rai = parse_rate(cfg.str("DCTCP_RATE_AI", "1000Mb/s"));
     P.u_target = cfg.num("U_TARGET", 0.95);
     P.mi_thresh = cfg.u32("MI_THRESH", 5);
     P.fast_react = cfg.u32("FAST_REACT", 1);
