@@ -189,6 +189,22 @@ engine without ns-3's overheads faster again, but no CPU version of TwiNS's serv
 measure it. So on 16 cores and at 0.4 µs or less, running the servers on the CPU would gain 2.3–3.6×
 for the 13B run and 1.4–2.3× for LLaMA. On 4 cores it gains little, or loses.
 
+**c, measured.** `validation/simai/nvl_island_bench.cc` is a sequential event loop with SimAI's
+NVLink behaviour (QPs paced at line rate within their window, an ACK per frame, the NVSwitch a FIFO
+per egress port, a chain pushed per event), fed the 13B run's recorded flows within servers. It is
+not exact, but it does the same work: 503.5 M events against the GPU's 509.9 M, and it ends at
+56.372 ms against 56.374. On this machine's i5-7500 it takes 0.141 µs per event on one thread and
+0.177 µs with 4 threads (71.1 s and 22.5 s for the 16 servers). An exact engine also compares chains
+at ties; at 0.2 µs, the table gives 33–48 s for the 13B run on these 4 cores (1.9–2.7×) and 17–28 s
+on 16 (3.2–5.4×).
+
+**Not built yet: the exact engine.** It has to make the same completions, chains included, as the GPU.
+The safe way is the same code: rstep.cuh's host and switch steps run with one lane (switches serial,
+which is exact) on a CPU backend of the runtime (allocation, the tails' ring, the memo, the slot
+loop), with a second Sim in the same process for the servers. That is a port of the runtime, weeks
+rather than days. The recording and the oracle are its test: its completions must equal the
+recorded ones, chain for chain.
+
 ## Rejected, with measurements
 
 - **`--win=32` on GPT-3 13B.** 128 GPUs 97.97 s against 87.95 s; 512 GPUs 252 s against 196 s.

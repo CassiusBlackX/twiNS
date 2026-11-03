@@ -449,7 +449,8 @@ struct Closed : astra::Network
             FILE *f = fopen((g_nvl_record + ".fct").c_str(), "w");
             for (size_t g = 0; g < fi.size(); g++)
                 if (fast[g] && fct[g] >= 0)
-                    fprintf(f, "%zu %lld %lld\n", g, (long long)fi[g].start, (long long)fct[g]);
+                    fprintf(f, "%zu %lld %lld %d %d %llu\n", g, (long long)fi[g].start, (long long)fct[g], fi[g].src, fi[g].dst,
+                            (unsigned long long)fi[g].size);
             fclose(f);
         }
         if (!g_nvl_oracle.empty())
@@ -462,7 +463,8 @@ struct Closed : astra::Network
             }
             size_t g;
             long long a, b;
-            while (fscanf(f, "%zu %lld %lld", &g, &a, &b) == 3)
+            char line[256];
+            while (fgets(line, sizeof(line), f) && sscanf(line, "%zu %lld %lld", &g, &a, &b) == 3)
                 if (g < fi.size() && fast[g] && fct[g] < 0)
                 {
                     fi[g].start = a;
