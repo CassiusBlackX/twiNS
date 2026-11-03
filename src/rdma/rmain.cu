@@ -42,6 +42,7 @@
 // and gives every link its own rate and delay.
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -560,12 +561,29 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     // routes (CalculateRoute: BFS from each host over switches, neighbours by id). Next hops
     // through an NVSwitch replace the others: once a node has one, only NVSwitches are added
     auto is_nvs = [&](int n) { return n >= H && w.nvs[n - H]; };
-    vector<vector<vector<int>>> next_hop(S, vector<vector<int>>(H)); // [switch][host] -> next nodes
-    vector<vector<vector<int>>> hnext(H, vector<vector<int>>(H));    // [host][host] -> next nodes
-    vector<vector<int64_t>> hop_n(N, vector<int64_t>(H, -1));         // links from node to host
+    // (the neighbours in nbr's order, as flat lists: the BFS below runs once per host)
+    vector<vector<std::pair<int, int>>> adj(N);
+    for (int n = 0; n < N; n++)
+        adj[n].assign(nbr[n].begin(), nbr[n].end());
+    // a switch's next nodes towards the BFS's host (reused from host to host: no allocations), and
+    // all of them as ports: [x * H + h] -> hn ports from hports[hoff]
+    vector<vector<int>> cur(S);
+    vector<uint32_t> hoff((size_t)S * H);
+    vector<uint8_t> hn((size_t)S * H), hports;
+    auto port_to = [&](int n, int y) { return std::lower_bound(adj[n].begin(), adj[n].end(), std::make_pair(y, INT_MIN))->second; };
+    // [host][host] -> next nodes, kept for hosts with several links only: a host with one link has
+    // that neighbour towards every host it reaches (tables() below)
+    vector<int> mi(H, -1);
+    int HM = 0;
+    for (int h = 0; h < H; h++)
+        if (deg[h] > 1)
+            mi[h] = HM++;
+    vector<vector<vector<int>>> hnext(HM, vector<vector<int>>(H));
+    vector<int32_t> hop_h((size_t)H * H, -1); // links from host i to host h at [h * H + i]
     // CalculateRoute's sums along the path that first reaches a node: pairDelay, pairTxDelay
-    // (one MTU frame per hop) and pairBw (the slowest link), from host i to host h at [i][h]
-    vector<vector<uint64_t>> pdelay(H, vector<uint64_t>(H, 0)), ptx(H, vector<uint64_t>(H, 0)), pbw(H, vector<uint64_t>(H, 0));
+    // (one MTU frame per hop) and pairBw (the slowest link), from host i to host h at [h * H + i]
+    // (a row per BFS)
+    vector<uint64_t> pdelay((size_t)H * H, 0), ptx((size_t)H * H, 0), pbw((size_t)H * H, 0);
     for (int h = 0; h < H; h++)
     {
         vector<int> q = {h}, dis(N, -1);
@@ -575,7 +593,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         for (size_t i = 0; i < q.size(); i++)
         {
             int now = q[i], d = dis[now];
-            for (auto &e : nbr[now])
+            for (auto &e : adj[now])
             {
                 int next = e.first;
                 if (dis[next] < 0)
@@ -588,9 +606,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     if (next >= H)
                         q.push_back(next);
                 }
-                if (d + 1 == dis[next])
+                if (d + 1 == dis[next] && (next >= H || mi[next] >= 0))
                 {
-                    vector<int> &v = next < H ? hnext[next][h] : next_hop[next - H][h];
+                    vector<int> &v = next < H ? hnext[mi[next]][h] : cur[next - H];
                     bool via = false;
                     for (int y : v)
                         via = via || is_nvs(y);
@@ -605,10 +623,20 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 }
             }
         }
-        for (int n = 0; n < N; n++)
-            hop_n[n][h] = dis[n];
         for (int i = 0; i < H; i++)
-            pdelay[i][h] = dl[i], ptx[i][h] = txd[i], pbw[i][h] = bw[i];
+        {
+            size_t ih = (size_t)h * H + i;
+            hop_h[ih] = dis[i];
+            pdelay[ih] = dl[i], ptx[ih] = txd[i], pbw[ih] = bw[i];
+        }
+        for (int x = 0; x < S; x++)
+        {
+            hoff[(size_t)x * H + h] = hports.size();
+            hn[(size_t)x * H + h] = (uint8_t)cur[x].size();
+            for (int y : cur[x])
+                hports.push_back((uint8_t)port_to(H + x, y));
+            cur[x].clear();
+        }
     }
     w.rt.assign((size_t)S * H, Route{});
     for (int x = 0; x < S; x++)
@@ -616,27 +644,25 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         {
             Route &r = w.rt[(size_t)x * H + h];
             r.off = w.rtp.size();
-            r.n = next_hop[x][h].size();
-            for (uint32_t i = 0; i < r.n; i++)
-                w.rtp.push_back((uint8_t)nbr[H + x][next_hop[x][h][i]]);
+            r.n = hn[(size_t)x * H + h];
+            w.rtp.insert(w.rtp.end(), hports.begin() + hoff[(size_t)x * H + h], hports.begin() + hoff[(size_t)x * H + h] + r.n);
         }
     // maxRtt, maxBdp: delay * 2 + txDelay, and its product with the bandwidth, over host pairs
     uint64_t max_rtt = 0, max_bdp = 0;
-    auto pair_rtt = [&](int a, int b) { return pdelay[a][b] * 2 + ptx[a][b]; };
-    auto pair_bdp = [&](int a, int b) { return pair_rtt(a, b) * pbw[a][b] / 1000000000ull / 8; };
+    auto pair_rtt = [&](int a, int b) { return pdelay[(size_t)b * H + a] * 2 + ptx[(size_t)b * H + a]; };
+    auto pair_bdp = [&](int a, int b) { return pair_rtt(a, b) * pbw[(size_t)b * H + a] / 1000000000ull / 8; };
     {
         int64_t far = 0;
-        for (int i = 0; i < H; i++)
-            for (int j = 0; j < H; j++)
-                far = std::max(far, hop_n[i][j]);
+        for (size_t i = 0; i < (size_t)H * H; i++)
+            far = std::max<int64_t>(far, hop_h[i]);
         if (P.cc == 3 && far - 1 > MAX_HOP)
         {
             // the reference's INT header has 5 hops; on longer paths it writes past hp.hop[]
             fprintf(stderr, "%s: HPCC: paths of %lld switches (INT records at most %d)\n", w.name.c_str(), (long long)(far - 1), MAX_HOP);
             return false;
         }
-        for (int i = 0; i < H; i++)
-            for (int j = 0; j < H; j++)
+        for (int j = 0; j < H; j++)
+            for (int i = 0; i < H; i++)
             {
                 max_rtt = std::max<uint64_t>(max_rtt, pair_rtt(i, j));
                 max_bdp = std::max<uint64_t>(max_bdp, pair_bdp(i, j));
@@ -886,7 +912,14 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     {
         auto tables = [&](int a, int b, vector<int> &nv, vector<int> &rt_) {
             nv.clear(), rt_.clear();
-            for (int y : hnext[a][b])
+            if (mi[a] < 0)
+            {
+                // one link: its neighbour (not an NVSwitch: hosts with NVLink have several links)
+                if (a != b && hop_h[(size_t)b * H + a] >= 0)
+                    (is_nvs(adj[a][0].first) ? nv : rt_).push_back(adj[a][0].second);
+                return;
+            }
+            for (int y : hnext[mi[a]][b])
                 (is_nvs(y) ? nv : rt_).push_back(nbr[a][y]);
         };
         auto pick = [&](const vector<int> &v, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
@@ -1909,7 +1942,7 @@ int main(int argc, char **argv)
     // joins cost launches tens of us); the next 64 slots run with it while the last ones' wide
     // switches met ties their prefixes left open (ev[34]: about a chain walk each, on the slot's
     // critical path) at more than one in 4 slots
-    auto capture = [&](bool ranks, hipGraphExec_t *ge, int gs = GS) {
+    auto capture = [&](bool ranks, hipGraphExec_t *ge, int gs) {
     hipGraph_t graph;
     CK(hipStreamBeginCapture(sa, hipStreamCaptureModeGlobal));
     for (int i = 0; i < gs; i++)
@@ -1947,13 +1980,13 @@ int main(int argc, char **argv)
     };
     CK(hipMemcpyToSymbol(HIP_SYMBOL(c_sim), &s, sizeof(Sim))); // (the kernels' Sim: it does not change from here)
     hipGraphExec_t g_plain, g_rank = nullptr;
-    capture(false, &g_plain);
+    capture(false, &g_plain, GS);
 #ifdef TWINS_ASTRA
     hipGraphExec_t g_win = nullptr;
     capture(false, &g_win, GS_win);
 #endif
     if (ranks)
-        capture(true, &g_rank);
+        capture(true, &g_rank, GS);
     bool use_rank = false;
     unsigned long long open_ties = 0;
     // persistent: when all H + S blocks are resident at once (the barrier needs every one running).

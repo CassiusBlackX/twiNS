@@ -107,18 +107,48 @@ inline void advance(const Mat a, uint64_t m, uint64_t nth, int by, uint64_t v[3]
     }
 }
 
+// advance() with the powers A^(2^(by + bit)) computed once (twins-rdma sets one stream per switch
+// port: tens of thousands at k=32)
+struct Powers
+{
+    Mat p[64];
+    Powers(const Mat a, uint64_t m, int by)
+    {
+        Mat x;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                x[i][j] = a[i][j];
+        for (int i = 0; i < by; i++)
+            mat_mul(x, x, x, m);
+        for (int bit = 0; bit < 64; bit++)
+        {
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    p[bit][i][j] = x[i][j];
+            mat_mul(x, x, x, m);
+        }
+    }
+    void advance(uint64_t m, uint64_t nth, uint64_t v[3]) const
+    {
+        for (int bit = 0; bit < 64; bit++)
+            if ((nth >> bit) & 1)
+                mat_vec(p[bit], v, m);
+    }
+};
+
 // the state of UniformRandomVariable::SetStream(stream) under RngSeed seed, RngRun run
 inline State stream_state(uint32_t seed, uint64_t stream, uint64_t run)
 {
     const uint64_t m1 = 4294967087ull, m2 = 4294944443ull;
     const Mat A1 = {{0, 1, 0}, {0, 0, 1}, {m1 - 810728, 1403580, 0}};
     const Mat A2 = {{0, 1, 0}, {0, 0, 1}, {m2 - 1370589, 0, 527612}};
+    static const Powers s1(A1, m1, 127), s2(A2, m2, 127), r1(A1, m1, 76), r2(A2, m2, 76);
     uint64_t v1[3] = {seed, seed, seed}, v2[3] = {seed, seed, seed};
     uint64_t target = (1ull << 63) + stream;
-    advance(A1, m1, target, 127, v1);
-    advance(A2, m2, target, 127, v2);
-    advance(A1, m1, run, 76, v1);
-    advance(A2, m2, run, 76, v2);
+    s1.advance(m1, target, v1);
+    s2.advance(m2, target, v2);
+    r1.advance(m1, run, v1);
+    r2.advance(m2, run, v2);
     State x;
     for (int i = 0; i < 3; i++)
     {

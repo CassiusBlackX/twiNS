@@ -43,6 +43,53 @@ inline hipError_t twinsGraphInstantiate(hipGraphExec_t *exec, hipGraph_t graph, 
 
 #include <cuda_runtime.h>
 
+// twins-rdma uses the hip* names: map them to CUDA's
+#define hipError_t cudaError_t
+#define hipSuccess cudaSuccess
+#define hipGetErrorString cudaGetErrorString
+#define hipGetLastError cudaGetLastError
+#define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipMalloc cudaMalloc
+#define hipMemset cudaMemset
+#define hipMemcpy cudaMemcpy
+#define hipMemcpyAsync cudaMemcpyAsync
+#define hipMemcpyHostToDevice cudaMemcpyHostToDevice
+#define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define hipMemcpyToSymbol cudaMemcpyToSymbol
+#define hipMemcpyFromSymbol cudaMemcpyFromSymbol
+#define HIP_SYMBOL(x) x
+#define hipStream_t cudaStream_t
+#define hipStreamCreate cudaStreamCreate
+#define hipStreamSynchronize cudaStreamSynchronize
+#define hipStreamWaitEvent cudaStreamWaitEvent
+#define hipStreamBeginCapture cudaStreamBeginCapture
+#define hipStreamEndCapture cudaStreamEndCapture
+#define hipStreamCaptureModeGlobal cudaStreamCaptureModeGlobal
+#define hipEvent_t cudaEvent_t
+#define hipEventCreateWithFlags cudaEventCreateWithFlags
+#define hipEventDisableTiming cudaEventDisableTiming
+#define hipEventRecord cudaEventRecord
+#define hipGraph_t cudaGraph_t
+#define hipGraphExec_t cudaGraphExec_t
+#define hipGraphLaunch cudaGraphLaunch
+inline cudaError_t hipGraphInstantiate(cudaGraphExec_t *exec, cudaGraph_t graph, void *, void *, unsigned long long flags)
+{
+    return cudaGraphInstantiate(exec, graph, flags);
+}
+#define hipFuncSetAttribute cudaFuncSetAttribute
+#define hipFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
+#define hipOccupancyMaxActiveBlocksPerMultiprocessor cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define hipGetDevice cudaGetDevice
+#define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipDeviceProp_t cudaDeviceProp
+#define hipDeviceGetAttribute cudaDeviceGetAttribute
+#define hipDeviceAttributeClockRate cudaDevAttrClockRate
+// (no wall-clock counter attribute in CUDA: clock64() counts SM cycles)
+#define hipDeviceAttributeWallClockRate cudaDevAttrClockRate
+// (GCC's bit builtins do not reach CUDA's device code; they are used there alone)
+#define __builtin_ctz(x) (__ffs(x) - 1)
+#define __shfl_up(x, o) __shfl_up_sync(0xffffffffu, x, o)
+
 #endif
 
 #endif // TWINS_GPU_RUNTIME_H
