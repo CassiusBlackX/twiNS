@@ -123,6 +123,72 @@ at 128 GPUs and 1.4 s at 1024.
 - **Training at 1024 GPUs (15–29×).** GPU time is 75–90% of the wall clock. GPT-3 13B again costs the most:
   frames are few and spread out, and NVLink stays busy.
 
+## The bound: the critical path
+
+`-DRDMA_CRIT` (a counting build; results unchanged) gives each event a depth: one more than the
+larger of its scheduler's depth (carried in its chain) and the previous event's at its node. The
+deepest event is the run's critical path, the most any exact execution must do one after another.
+A node's ports count as one entity; the path follows scheduling and per-node order, so it is a lower
+bound. Replays of four paper runs (identical to SimAI):
+
+| run | critical path (events) | events | events per step | dependent events per 25 ns slot | wall | wall per critical event |
+|---|---|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 8.43 M | 656 M | 78 | 3.7 | 89.9 s | 10.7 µs |
+| LLaMA 65B probe, 128 GPUs | 4.16 M | 839 M | 202 | 1.3 | 44.0 s | 10.6 µs |
+| GPT-3 175B probe, 128 GPUs | 12.5 M | 2759 M | 221 | 1.6 | 136.7 s | 11.0 µs |
+| AllReduce 512 MB, 128 GPUs | 1.21 M | 115 M | 95 | 0.5 | 10.2 s | 8.4 µs |
+
+TwiNS's time is about 10 µs per event of the critical path in all four. So it already runs close to
+the bound its event latency sets: another way of running the same events in parallel gains little.
+Only a lower latency per dependent event can. SimAI, on one core of a87, spends about 0.8 µs per
+event (518 s for the 13B run's 656 M events, counted as TwiNS counts them).
+
+**Where the events are.** In the 13B run, 77.7% of the events are inside servers: 258 M at the GPUs'
+NVLink devices and 252 M at the NVSwitches, against 37 M at the NICs and 110 M at ToRs and spines.
+LLaMA 65B: 82.1%. That is 31.9 M events per server (13B), 43.1 M (LLaMA).
+
+## The servers on their own: an oracle
+
+Flows between the GPUs of one server use only the server's NVLinks and NVSwitch, and flows between
+servers never touch them (`FlowInfo::fast`; ports are counted per host pair, so the two kinds never
+share one). They meet only in the system layer, through completions and actions, which the closed
+loop already carries every send_lat. So a server's NVLink part could run elsewhere, on a CPU core,
+exchanging completions with the GPU at each sync.
+
+`twins-ai --nvl-record=F` writes every completion of such a flow with its chain and the tail nodes
+the chain reaches (each once, up to 1024 deep). `--nvl-oracle=F` then does not run those flows: it
+puts the recorded completions into the ring as the GPU passes them, with their tails rebuilt in the
+new run's ring, and NVSwitches no longer force single slots. A comparison that needs a tail deeper
+than recorded counts as on a lost tail.
+
+| run | GPU, closed loop | GPU, oracle | against SimAI (messages, DAG lines) |
+|---|---|---|---|
+| AllReduce 512 MB, 128 GPUs | 11.9 s | 11.5 s | identical (no NVLink flows) |
+| GPT-3 13B probe, 128 GPUs | 90.1 s | 14.3 s | identical; 4096 ties reached a cut tail (reported) |
+| LLaMA 65B probe, 128 GPUs | 45.2 s | 13.2 s | identical, no lost tails |
+
+So the separation holds, and without the NVLinks the GPU does the 13B run's network in a sixth of the
+time. The oracle's own wall time (36 s and 69 s) is mostly copying tens of millions of tail nodes
+into the ring, which running the servers elsewhere would not need.
+
+**What running them on CPU cores would take.** `--nvl-record` also writes each server's count of
+such events per sync (`F.ev`); `validation/simai/nvl_project.py` spreads the servers over P cores
+and charges each window its busiest core (events × c) and a barrier, before the window ends. With
+the oracle's GPU time and the system layer and sync on top:
+
+| run, now | cores | c = 0.2 µs | c = 0.4 µs | c = 0.8 µs |
+|---|---|---|---|---|
+| 13B probe, 89.9 s | 16 | 17–28 s | 25–40 s | 48–62 s |
+| 13B probe | 4 | 33–48 s | 64–78 s | 126–140 s |
+| LLaMA probe, 49.9 s | 16 | 18–27 s | 22–35 s | 39–52 s |
+| LLaMA probe | 4 | 39–52 s | 74–87 s | 143–156 s |
+
+The ranges run from GPU and CPU fully overlapped to one after the other. c is the cost of one event
+on a core: SimAI spends 0.8 µs on a87 (Xeon Gold 5218); a 9950X core is about twice as fast, and an
+engine without ns-3's overheads faster again, but no CPU version of TwiNS's server model exists to
+measure it. So on 16 cores and at 0.4 µs or less, running the servers on the CPU would gain 2.3–3.6×
+for the 13B run and 1.4–2.3× for LLaMA. On 4 cores it gains little, or loses.
+
 ## Rejected, with measurements
 
 - **`--win=32` on GPT-3 13B.** 128 GPUs 97.97 s against 87.95 s; 512 GPUs 252 s against 196 s.

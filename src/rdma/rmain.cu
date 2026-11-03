@@ -74,6 +74,9 @@ using std::vector;
         }                                                                                           \
     } while (0)
 
+#ifdef RDMA_CRIT
+static unsigned long long *g_crit_host;
+#endif
 template <typename T>
 static T *dev_alloc(size_t n)
 {
@@ -1081,6 +1084,10 @@ int main(int argc, char **argv)
             astra_dag = v;
         else if (k == "--flows-cache")
             astra_cache = v;
+        else if (k == "--nvl-record") // the completions of flows within a server, to a file
+            g_nvl_record = v;
+        else if (k == "--nvl-oracle") // those flows not run: their completions from such a file
+            g_nvl_oracle = v;
 #endif
         else if (k == "--dcap")
         {
@@ -1379,6 +1386,37 @@ int main(int argc, char **argv)
             if (g < H && nv == 1)
                 h_srv[g] = srv;
         }
+#ifdef TWINS_ASTRA_HOST
+        if (!g_nvl_record.empty())
+        {
+            // (each node's server and NVLink devices, for counting the events inside servers)
+            vector<uint8_t> mask(H + S, 0);
+            vector<int> srv(H + S, 0);
+            for (int g = 0; g < H + S; g++)
+            {
+                if (g >= H && si[g - H].nvs)
+                    mask[g] = 0x80, srv[g] = g - H;
+                if (g < H && h_srv[g] >= 0)
+                {
+                    srv[g] = h_srv[g];
+                    for (int p = 0; p < deg[g] && p < 7; p++)
+                    {
+                        int from = link_dst[in_link[(size_t)g * K + p] ^ 1];
+                        if (from >= H && si[from - H].nvs)
+                            mask[g] |= 1 << p;
+                    }
+                }
+            }
+            uint32_t *cnt = dev_alloc<uint32_t>(S);
+            const uint8_t *dm = dev_copy(mask);
+            const int *ds = dev_copy(srv);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_cnt), &cnt, sizeof(cnt)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_mask), &dm, sizeof(dm)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_srv), &ds, sizeof(ds)));
+            g_nvl_cnt_host = cnt;
+            g_nvl_nsw = S;
+        }
+#endif
     }
     vector<int> srv_rs_off(S + 1, 0);
     vector<int64_t> srv_rs;
@@ -1536,6 +1574,10 @@ int main(int argc, char **argv)
                     dep_t[g] = p.ts;
                     dep_c[g] = p.c;
                     dep_c[g].root += fbase[wi];
+#ifdef TWINS_ASTRA_HOST
+                    if (!g_nvl_oracle.empty() && fi[g].fast)
+                        continue; // (its completions come from the recording)
+#endif
                     if (dyn_n[h] >= dyn_cap)
                     {
                         fprintf(stderr, "%s: more than %d flows ready at the start on host %d\n", w.name.c_str(), dyn_cap, h);
@@ -1585,7 +1627,7 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
         if (g_cl)
         {
-            g_cl->setup(s, send_lat_slots(s.send_lat, D));
+            g_cl->setup(s, send_lat_slots(s.send_lat, D), fi);
             s.tchain = dev_alloc<Chain>(Closed::TCAP);
             g_cl->init_timers(s.tchain);
         }
@@ -1882,6 +1924,16 @@ int main(int argc, char **argv)
         tp.cnt = dev_alloc<unsigned long long>(1);
         tp.mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
+#ifdef RDMA_CRIT
+        {
+            uint32_t *last = dev_alloc<uint32_t>(N);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_crit_last), &last, sizeof(last)));
+            unsigned long long *cn = dev_alloc<unsigned long long>((size_t)N * 4);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_crit_n), &cn, sizeof(cn)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(c_crit_h), &H, sizeof(H)));
+            g_crit_host = cn;
+        }
+#endif
     }
     if (per_sw(s.ks) > 64 * 1024 || sw_ints(s.kb) * sizeof(int) > 64 * 1024)
     {
@@ -2058,6 +2110,10 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
     if (s.dag) // the DAG flows' start times
         CK(cudaMemcpy(fi.data(), s.fi, F * sizeof(FlowInfo), cudaMemcpyDeviceToHost));
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl)
+        g_cl->nvl_fct(fi, fct, done); // (--nvl-record / --nvl-oracle: the flows within servers)
+#endif
     unsigned long long ev[40];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
     for (int wi = 0; wi < W; wi++)
@@ -2103,6 +2159,24 @@ int main(int argc, char **argv)
             fclose(fo);
         }
     }
+#ifdef RDMA_CRIT
+    {
+        unsigned int cm = 0;
+        unsigned long long ce = 0;
+        CK(hipMemcpyFromSymbol(&cm, HIP_SYMBOL(g_crit_max), sizeof(cm)));
+        CK(hipMemcpyFromSymbol(&ce, HIP_SYMBOL(g_crit_ev), sizeof(ce)));
+        {
+            vector<unsigned long long> cn((size_t)N * 4);
+            CK(cudaMemcpy(cn.data(), g_crit_host, cn.size() * 8, cudaMemcpyDeviceToHost));
+            FILE *fo = fopen("crit_nodes.txt", "w");
+            for (int x = 0; x < N; x++)
+                fprintf(fo, "%d %llu %llu %llu %llu\n", x, cn[x * 4], cn[x * 4 + 1], cn[x * 4 + 2], cn[x * 4 + 3]);
+            fclose(fo);
+        }
+        printf("crit: critical path %u events of %llu (parallelism %.1f), over %lld slots: %.3f dependent events per slot\n", cm, ce,
+               (double)ce / (cm ? cm : 1), (long long)slot_end, (double)cm / (slot_end ? slot_end : 1));
+    }
+#endif
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);
 #ifdef TWINS_ASTRA_HOST

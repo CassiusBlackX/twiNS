@@ -214,7 +214,11 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
         c.root = par.root;
         c.tail = par.tail;
         c.hash = chash(par.hash, code);
+#ifdef RDMA_CRIT
+        c.pad = par.pad; // (the scheduler's depth)
+#else
         c.pad = 0;
+#endif
         if (par.r[RUNS - 1].code)
         {
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
@@ -607,7 +611,27 @@ __device__ __forceinline__ bool before(const Sim &s, int64_t ta, uint32_t pa, co
 
 // debugging: -DRDMA_TRACE_NODE=n -DRDMA_TRACE_FROM=ns -DRDMA_TRACE_UNTIL=ns prints the events node n
 // runs in that window, with their chains
-#ifdef RDMA_TRACE_NODE
+#if defined(RDMA_CRIT)
+// -DRDMA_CRIT: the critical path of the run's dependences, in events. An event's depth is one more than
+// the larger of its scheduler's (carried in its chain's pad) and the previous event's of its node;
+// its frames and the events it schedules carry it on. (A node's ports count as one entity.)
+__device__ uint32_t *g_crit_last; // [N]
+__constant__ int c_crit_h;
+__device__ unsigned int g_crit_max;
+__device__ unsigned long long g_crit_ev;
+__device__ unsigned long long *g_crit_n; // [N * 4]: a node's events, by device (hosts) or 3 (switches)
+__device__ __forceinline__ void trace_event(int node, int64_t, const char *what, int port, const Chain &cc)
+{
+    atomicAdd(&g_crit_n[node * 4 + (node < c_crit_h && port >= 0 && port < 3 ? port : 3)], 1ull);
+    Chain &c = const_cast<Chain &>(cc);
+    const uint32_t last = atomicAdd(&g_crit_last[node], 0u);
+    const uint32_t d = (c.pad > last ? c.pad : last) + 1;
+    c.pad = d;
+    atomicMax(&g_crit_last[node], d);
+    atomicMax(&g_crit_max, d);
+    atomicAdd(&g_crit_ev, 1ull);
+}
+#elif defined(RDMA_TRACE_NODE)
 __device__ __forceinline__ void trace_event(int node, int64_t now, const char *what, int port, const Chain &c)
 {
     if (node != RDMA_TRACE_NODE || now < RDMA_TRACE_FROM || now > RDMA_TRACE_UNTIL)
@@ -616,6 +640,21 @@ __device__ __forceinline__ void trace_event(int node, int64_t now, const char *w
     for (int i = 0; i < RUNS && c.r[i].code; i++)
         printf(" %u.%u:%u", (c.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (c.r[i].code & CODE_ORD_MAX), c.r[i].cnt);
     printf(" root %u%s\n", c.root, c.tail ? " +tail" : "");
+}
+#elif defined(TWINS_ASTRA)
+// --nvl-record: the events inside each server (at a GPU's NVLink device, or an NVSwitch), counted per
+// server (g_nvl_mask: a host's NVLink devices as bits, 0x80 an NVSwitch; g_nvl_srv: the server)
+__device__ uint32_t *g_nvl_cnt;
+__device__ const uint8_t *g_nvl_mask;
+__device__ const int *g_nvl_srv;
+__device__ __forceinline__ void trace_event(int node, int64_t, const char *, int port, const Chain &)
+{
+    if (g_nvl_cnt)
+    {
+        const uint8_t m = g_nvl_mask[node];
+        if ((m & 0x80) || (port >= 0 && port < 7 && ((m >> port) & 1)))
+            atomicAdd(&g_nvl_cnt[g_nvl_srv[node]], 1u);
+    }
 }
 #else
 __device__ __forceinline__ void trace_event(int, int64_t, const char *, int, const Chain &) {}
@@ -638,6 +677,10 @@ __host__ __device__ __forceinline__ uint32_t qp_pick(uint32_t sip, uint32_t dip,
 // start; a traced DAG's timers can put tI later).
 __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI, const Chain &E, int ord)
 {
+#ifdef TWINS_ASTRA
+    if (s.nvl_oracle && s.fi[f].fast)
+        return; // (its completions come from the recording)
+#endif
     int64_t ts = tI + s.send_lat;
     int64_t a = (int64_t)fdiv(s.fD, tE + s.send_lat);
     int b = (int)fmod(s.fnbi, a);
@@ -4124,6 +4167,40 @@ __global__ void closed_apply(int n, int64_t limit, int64_t cap, int single, unsi
         const int64_t room = limit - *s.slot;
         *s.gk = single || c.k <= 1 || room <= 1 ? 1 : (int)(c.k < room ? c.k : room);
     }
+}
+
+constexpr int NVL_DEPTH = 1024; // tail nodes of a chain recorded (beyond: lost, if a comparison reaches it)
+// --nvl-record: the tail nodes of completions' chains (ring slots idx[e]) not recorded before, each
+// chain's newest first (seg[e] its first in out); mark[slot] is the pos recorded there. err: 1 a tail
+// overwritten, 2 more than cap nodes
+__global__ void nvl_walk(const uint32_t *idx, int n, TailNode *out, int cap, int *seg, int *nout, uint64_t *mark, int *err)
+{
+    const Sim &s = c_sim;
+    int k = 0;
+    for (int e = 0; e < n; e++)
+    {
+        seg[e] = k;
+        uint64_t p = s.cev_c[idx[e]].tail;
+        for (int depth = 0; p && depth < NVL_DEPTH; depth++)
+        {
+            const uint64_t slot = (p - 1) & g_tail.mask;
+            if (mark[slot] == p)
+                break;
+            const TailNode &t = g_tail.n[slot];
+            if (t.pos != p)
+                break; // (overwritten: nothing the recording run compared reached it)
+            if (k == cap)
+            {
+                *err = 2;
+                return;
+            }
+            mark[slot] = p;
+            out[k++] = t;
+            p = t.next;
+        }
+    }
+    seg[n] = k;
+    *nout = k;
 }
 
 // a timer against a completion of its time and lead: their chains decide (in cl->cmp)

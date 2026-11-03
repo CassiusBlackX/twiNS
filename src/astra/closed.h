@@ -15,10 +15,30 @@
 #include <map>
 #include <sys/wait.h>
 #include <tuple>
+#include <unordered_map>
 
 #include "astra/frontend.h"
 
 static int send_lat_slots(int64_t send_lat, int64_t D) { return (int)((send_lat - 1) / D); }
+// --nvl-record=F writes every completion of a flow between GPUs of one server (FlowInfo::fast) with
+// its chain; --nvl-oracle=F does not run those flows, and puts F's completions in the ring when the
+// GPU reaches their times, as if it had made them. Same completions, same chains: the system layer
+// must do exactly what it did. What is left on the GPU is the network between the servers.
+static string g_nvl_record, g_nvl_oracle;
+static uint32_t *g_nvl_cnt_host = nullptr; // (the GPU's counts of events inside servers: rstep.cuh)
+static int g_nvl_nsw = 0;
+// The file: items in the order they were recorded. A tail node (tag 0) comes before the chains that
+// reach it, and after the older node it points to; a completion (tag 1) can be put in once the
+// GPU has passed avail (the slot the recording run had reached when it read it), which is before
+// its time.
+struct NvlRec
+{
+    uint32_t tag, pad;
+    int64_t avail;
+    CEvH h;
+    Chain c;
+    TailNode n;
+};
 
 struct Closed : astra::Network
 {
@@ -125,8 +145,36 @@ struct Closed : astra::Network
     ClCtl *dev_cl = nullptr;
     int64_t *dev_slot = nullptr;
     int64_t cev_mask = 0;
-    void setup(Sim &s, int span_slots)
+    vector<char> fast;
+    vector<NvlRec> orecs;
+    std::unordered_map<uint64_t, uint64_t> opos; // a recorded tail node's pos: its pos in this run
+    size_t onext = 0;
+    FILE *rec_f = nullptr;
+    unsigned long long injected = 0, recorded = 0;
+    void setup(Sim &s, int span_slots, const vector<FlowInfo> &fi)
     {
+        fast.resize(fi.size());
+        for (size_t g = 0; g < fi.size(); g++)
+            fast[g] = fi[g].fast;
+        s.nvl_oracle = !g_nvl_oracle.empty();
+        if (!g_nvl_record.empty() && !(rec_f = fopen(g_nvl_record.c_str(), "wb")))
+        {
+            fprintf(stderr, "cannot write %s\n", g_nvl_record.c_str());
+            exit(1);
+        }
+        if (s.nvl_oracle)
+        {
+            FILE *f = fopen(g_nvl_oracle.c_str(), "rb");
+            if (!f)
+            {
+                fprintf(stderr, "cannot read %s\n", g_nvl_oracle.c_str());
+                exit(1);
+            }
+            NvlRec r;
+            while (fread(&r, sizeof(r), 1, f) == 1)
+                orecs.push_back(r);
+            fclose(f);
+        }
         span = span_slots;
         s.cl_span = span;
         s.cev_mask = (1ull << CEV_LOG) - 1;
@@ -164,6 +212,8 @@ struct Closed : astra::Network
             t = fe->next_timer();
         for (auto &p : pool)
             t = std::min(t, p.t);
+        if (onext < orecs.size())
+            t = std::min(t, orecs[onext].avail); // (no later item of the recording is due before it)
         return t == INT64_MAX ? INT64_MAX : (D ? t / D : t / 25);
     }
     unsigned long long oldest(unsigned long long head) const
@@ -243,9 +293,75 @@ struct Closed : astra::Network
                 CK(hipStreamSynchronize(st));
             for (unsigned long long i = seen; i < ctl.head; i++)
                 pool.push_back(Pending{hs[i - seen].t, (uint32_t)(i & cev_mask), hs[i - seen], 0});
+            if (rec_f)
+                record(s, st, hs, seen, ctl.head, rec_reach);
+            if (g_nvl_cnt_host)
+            {
+                // the events inside each server since the last sync, for --nvl-record's .ev file
+                static FILE *evf = fopen((g_nvl_record + ".ev").c_str(), "wb");
+                static vector<uint32_t> cnt;
+                cnt.resize(g_nvl_nsw);
+                CK(hipMemcpy(cnt.data(), g_nvl_cnt_host, g_nvl_nsw * sizeof(uint32_t), hipMemcpyDeviceToHost));
+                CK(hipMemset(g_nvl_cnt_host, 0, g_nvl_nsw * sizeof(uint32_t)));
+                const int64_t at = S * D;
+                fwrite(&at, sizeof(at), 1, evf);
+                fwrite(cnt.data(), sizeof(uint32_t), g_nvl_nsw, evf);
+                fflush(evf);
+            }
             seen = ctl.head;
             // the due ones in order
             const int64_t reach = S * D;
+            rec_reach = reach;
+            if (onext < orecs.size() && orecs[onext].avail < reach)
+            {
+                // the recording's items the GPU has now passed: tail nodes into this run's ring,
+                // completions into the ring of completions, as the GPU's own
+                unsigned long long head = ctl.head;
+                TailPool tp;
+                CK(hipMemcpyFromSymbol(&tp, HIP_SYMBOL(g_tail), sizeof(tp)));
+                unsigned long long tcnt;
+                CK(hipMemcpy(&tcnt, tp.cnt, sizeof(tcnt), hipMemcpyDeviceToHost));
+                vector<TailNode> nodes;
+                const unsigned long long t0 = tcnt;
+                auto flush = [&]() {
+                    for (size_t q = 0; q < nodes.size();)
+                    {
+                        const uint64_t slot = (t0 + q) & tp.mask, m = std::min<uint64_t>(nodes.size() - q, tp.mask + 1 - slot);
+                        CK(hipMemcpyAsync(tp.n + slot, &nodes[q], m * sizeof(TailNode), hipMemcpyHostToDevice, st));
+                        q += m;
+                    }
+                };
+                for (; onext < orecs.size() && orecs[onext].avail < reach; onext++)
+                {
+                    const NvlRec &r = orecs[onext];
+                    if (r.tag == 0)
+                    {
+                        TailNode nd = r.n;
+                        nd.pos = ++tcnt;
+                        auto it = opos.find(nd.next);
+                        // (not recorded: overwritten in the recording's ring, or beyond NVL_DEPTH; a pos no
+                        // node will have, so that a comparison reaching it counts as on a lost tail)
+                        nd.next = !nd.next ? 0 : it != opos.end() ? it->second : (1ull << 62);
+                        opos[r.n.pos] = nd.pos;
+                        nodes.push_back(nd);
+                        continue;
+                    }
+                    const unsigned long long j = head & cev_mask;
+                    Chain c = r.c;
+                    auto it = opos.find(c.tail);
+                    c.tail = !c.tail ? 0 : it != opos.end() ? it->second : (1ull << 62);
+                    CK(hipMemcpyAsync(dev_h + j, &r.h, sizeof(CEvH), hipMemcpyHostToDevice, st));
+                    CK(hipMemcpyAsync(s.cev_c + j, &c, sizeof(Chain), hipMemcpyHostToDevice, st));
+                    pool.push_back(Pending{r.h.t, (uint32_t)j, r.h, 0});
+                    injected++;
+                    head++;
+                }
+                flush();
+                CK(hipMemcpyAsync(tp.cnt, &tcnt, sizeof(tcnt), hipMemcpyHostToDevice, st));
+                CK(hipMemcpyAsync(&s.cl->head, &head, sizeof(head), hipMemcpyHostToDevice, st));
+                CK(hipStreamSynchronize(st));
+                seen = head;
+            }
             sort_due(s, st, reach);
             auto d = now();
             t_sync += sec(b, d);
@@ -315,13 +431,120 @@ struct Closed : astra::Network
             if (fe->finished)
                 return;
             // nothing more to come
-            if (ctl.idle && acts.empty() && pool.empty() && ready.empty() && !fe->has_timer())
+            if (ctl.idle && acts.empty() && pool.empty() && ready.empty() && !fe->has_timer() && onext == orecs.size())
                 return;
             apply(st, S + span, seen);
             for (int t : tfree_later)
                 tfree.push_back(t);
             CK(hipStreamSynchronize(st));
             t_sync += sec(e, now());
+        }
+    }
+    // the flows within servers: their starts and completion times kept (--nvl-record) or put back
+    template <typename FI>
+    void nvl_fct(vector<FI> &fi, vector<int64_t> &fct, unsigned int &done)
+    {
+        if (!g_nvl_record.empty())
+        {
+            FILE *f = fopen((g_nvl_record + ".fct").c_str(), "w");
+            for (size_t g = 0; g < fi.size(); g++)
+                if (fast[g] && fct[g] >= 0)
+                    fprintf(f, "%zu %lld %lld\n", g, (long long)fi[g].start, (long long)fct[g]);
+            fclose(f);
+        }
+        if (!g_nvl_oracle.empty())
+        {
+            FILE *f = fopen((g_nvl_oracle + ".fct").c_str(), "r");
+            if (!f)
+            {
+                fprintf(stderr, "cannot read %s.fct\n", g_nvl_oracle.c_str());
+                exit(1);
+            }
+            size_t g;
+            long long a, b;
+            while (fscanf(f, "%zu %lld %lld", &g, &a, &b) == 3)
+                if (g < fi.size() && fast[g] && fct[g] < 0)
+                {
+                    fi[g].start = a;
+                    fct[g] = b;
+                    done++;
+                }
+            fclose(f);
+        }
+    }
+    // --nvl-record: the new completions of flows within servers, with the tail nodes their chains
+    // reach that were not recorded before (found on the GPU)
+    unsigned long long rec_tails = 0;
+    int64_t rec_reach = 0;
+    void record(Sim &s, hipStream_t st, const vector<CEvH> &hs, unsigned long long from, unsigned long long to, int64_t avail)
+    {
+        vector<uint32_t> idx;
+        vector<unsigned long long> at;
+        for (unsigned long long i = from; i < to; i++)
+            if (fast[hs[i - from].flow])
+            {
+                idx.push_back((uint32_t)(i & cev_mask));
+                at.push_back(i);
+            }
+        if (idx.empty())
+            return;
+        const int n = idx.size(), cap = 1 << 22;
+        static uint32_t *d_idx = nullptr;
+        static int *d_seg = nullptr, *d_k = nullptr, d_n = 0;
+        static TailNode *d_out = nullptr;
+        static uint64_t *d_mark = nullptr;
+        if (!d_out)
+        {
+            TailPool tp;
+            CK(hipMemcpyFromSymbol(&tp, HIP_SYMBOL(g_tail), sizeof(tp)));
+            d_mark = dev_alloc<uint64_t>(tp.mask + 1);
+            d_out = dev_alloc<TailNode>(cap);
+            d_k = dev_alloc<int>(2);
+        }
+        if (n > d_n)
+        {
+            if (d_idx)
+            {
+                CK(hipFree(d_idx));
+                CK(hipFree(d_seg));
+            }
+            d_n = std::max(n, 2 * d_n);
+            d_idx = dev_alloc<uint32_t>(d_n);
+            d_seg = dev_alloc<int>(d_n + 1);
+        }
+        CK(hipMemcpy(d_idx, idx.data(), n * sizeof(uint32_t), hipMemcpyHostToDevice));
+        nvl_walk<<<1, 1, 0, st>>>(d_idx, n, d_out, cap, d_seg, d_k, d_mark, d_k + 1);
+        CK(hipStreamSynchronize(st));
+        int kk[2];
+        CK(hipMemcpy(kk, d_k, sizeof(kk), hipMemcpyDeviceToHost));
+        if (kk[1])
+        {
+            fprintf(stderr, "nvl: more than %d new tail nodes in a sync\n", cap);
+            exit(1);
+        }
+        vector<int> seg(n + 1);
+        vector<TailNode> nodes(kk[0]);
+        CK(hipMemcpy(seg.data(), d_seg, (n + 1) * sizeof(int), hipMemcpyDeviceToHost));
+        if (kk[0])
+            CK(hipMemcpy(nodes.data(), d_out, kk[0] * sizeof(TailNode), hipMemcpyDeviceToHost));
+        for (int e = 0; e < n; e++)
+        {
+            NvlRec r = {};
+            r.avail = avail;
+            for (int q = seg[e + 1] - 1; q >= seg[e]; q--) // (oldest first: each points to one already written)
+            {
+                r.tag = 0;
+                r.n = nodes[q];
+                fwrite(&r, sizeof(r), 1, rec_f);
+                rec_tails++;
+            }
+            r = {};
+            r.tag = 1;
+            r.avail = avail;
+            r.h = hs[at[e] - from];
+            CK(hipMemcpy(&r.c, s.cev_c + idx[e], sizeof(Chain), hipMemcpyDeviceToHost));
+            fwrite(&r, sizeof(r), 1, rec_f);
+            recorded++;
         }
     }
     const bool progress = getenv("TWINS_AI_PROGRESS") != nullptr;
@@ -331,7 +554,7 @@ struct Closed : astra::Network
         if (!acts.empty())
             CK(hipMemcpyAsync(dev_act, acts.data(), acts.size() * sizeof(CAct), hipMemcpyHostToDevice, st));
         for (auto &x : acts)
-            single |= !(x.child & DACT_TIMER);
+            single |= !(x.child & DACT_TIMER) && !(!orecs.empty() && fast[x.child]); // (oracle: no flow of a server's own)
         closed_apply<<<1, 1, 0, st>>>((int)acts.size(), limit, next_cap(), single, seen, oldest(seen));
         single = false;
     }
@@ -396,6 +619,13 @@ struct Closed : astra::Network
 
     void report()
     {
+        if (rec_f)
+        {
+            fclose(rec_f);
+            printf("nvl: %llu completions of flows within servers recorded, %llu tail runs\n", recorded, rec_tails);
+        }
+        if (!orecs.empty())
+            printf("nvl: %llu of %zu recorded completions put in (flows within servers not run)\n", injected, orecs.size());
         printf("closed loop: %zu flows, %zu timers, %llu callbacks, %llu syncs, %llu of them with ties (%llu completions), %llu lead ties; GPU %.3f s, system layer %.3f s, sync %.3f s\n",
                fe->flows.size(), fe->timers.size(), (unsigned long long)fe->callbacks, syncs, sort_runs, sorted, lead_ties, t_gpu, t_cpu, t_sync);
         if (lead_ties)

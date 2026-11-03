@@ -534,6 +534,7 @@ struct Sim
 #ifdef TWINS_ASTRA
     // the closed loop with astra-sim (src/astra/closed.h)
     struct ClCtl *cl;
+    int nvl_oracle; // --nvl-oracle: flows between GPUs of one server are not run (closed.h)
     struct CEvH *cev_h;
     Chain *cev_c;
     unsigned long long cev_mask;
