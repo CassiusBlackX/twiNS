@@ -221,7 +221,8 @@ runs message for message (`gpt3_175b_full_hpn128` on its 64-bit DAG, `gpt3_175b_
   are not covered.
 - A uniform send_lat is assumed (`SEND_LAT_NS`, SimAI's `AS_SEND_LAT`). Windows rely on it, and so does
   the flow filing. SimAI's per-algorithm table is not modelled.
-- CC is what twins-rdma models: DCQCN and HPCC.
+- CC is what twins-rdma models: DCQCN and HPCC. DCTCP (`CC_MODE 8`) is modelled too and identical to
+  simai-ref (`validation/simai/jobs_dctcp.txt`), but the closed loop has not been compared with SimAI on it.
 - Each callback runs on one CPU thread, so microAllReduce-like loads stay near SimAI's own speed.
 
 ## Fixes the matrix found in TwiNS

@@ -1,0 +1,2 @@
+# drops strand 5 of 12519 flows, in the reference too: 12514 flows identical, and check.sh reports rc 2
+k8_a2a50s_b1_m9k_cc8 fattree8.txt k8_a2a50s.csv CC_MODE=8 BUFFER_SIZE=1 PACKET_PAYLOAD_SIZE=9000

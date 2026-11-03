@@ -1234,6 +1234,48 @@ __device__ __forceinline__ void dcqcn_cnp(HCtx<ND> &c, int f, SndQP &q)
     }
 }
 
+// RdmaHw::HandleAckDctcp. The fork's sequence numbers here are 32 bits (SimAI's 64, the same below 4 GB
+// a flow, as everywhere in Pkt); the rate changes with no ChangeRate, so the next send keeps its time.
+template <int ND>
+__device__ __forceinline__ void dctcp_ack(HCtx<ND> &c, SndQP &q, const Pkt &p)
+{
+    const Params &P = *c.P;
+    bool new_batch = false;
+    q.ecn_cnt += p.cnp ? 1 : 0;
+    if (p.seq > q.last_update_seq)
+    {
+        new_batch = true;
+        if (q.last_update_seq == 0)
+        {
+            q.last_update_seq = (uint32_t)q.snd_nxt;
+            q.batch = (uint32_t)(q.snd_nxt / P.mtu + 1);
+        }
+        else
+        {
+            const double frac = (double)q.ecn_cnt / (double)q.batch;
+            q.alpha = fma(1 - P.g, q.alpha, P.g * (frac < 1.0 ? frac : 1.0)); // as GCC contracts it
+            q.last_update_seq = (uint32_t)q.snd_nxt;
+            q.ecn_cnt = 0;
+            // (after a NACK snd_nxt can be behind the ACK: this wraps as in the fork)
+            q.batch = (uint32_t)((q.snd_nxt - (uint64_t)p.seq) / P.mtu + 1);
+        }
+    }
+    if (q.ca_state == 1 && p.seq > q.high_seq)
+        q.ca_state = 0;
+    if (p.cnp && q.ca_state == 0)
+    {
+        const uint64_t r = rate_of((double)q.rate * (1 - q.alpha / 2));
+        q.rate = r > P.min_rate ? r : P.min_rate;
+        q.ca_state = 1;
+        q.high_seq = (uint32_t)q.snd_nxt;
+    }
+    if (q.ca_state == 0 && new_batch)
+    {
+        const uint64_t r = q.rate + P.dctcp_rai;
+        q.rate = r < q.max_rate ? r : q.max_rate;
+    }
+}
+
 // the DCQCN timers: 0 UpdateAlphaMlx, 1 CheckRateDecreaseMlx, 2 RateIncEventTimerMlx
 template <int ND>
 __device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
@@ -1331,6 +1373,8 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         else if (c.P->fast_react)
             hpcc_update(c, q, p, true);
     }
+    if (c.P->cc == 8 && !q.done) // (after QpComplete nothing reads what it changes)
+        dctcp_ack(c, q, p);
     h_dequeue(c);
 }
 
@@ -1419,8 +1463,11 @@ __device__ __forceinline__ void h_start(HCtx<ND> &c, int f)
     q.first_cnp = 1;
     q.target = nic;
     q.t_alpha = q.t_dec = q.t_rp = -1;
-    q.cur_rate = nic;
-    q.u = 1;
+    if (c.P->cc == 3)
+    {
+        q.cur_rate = nic;
+        q.u = 1;
+    }
     q.next_avail = c.now;
     if (c.st().qp_n >= s.qps_cap)
     {

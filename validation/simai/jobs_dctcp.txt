@@ -1,0 +1,18 @@
+# SimAI mode with DCTCP over RDMA (CC_MODE 8): uniform FatTrees, rates and delays, GPU servers, DAGs
+s_ft4_inc1_cc8 ft4_100g.topo inc1.csv CC_MODE=8
+s_ft4_inc1_b1_cc8 ft4_100g.topo inc1.csv CC_MODE=8 BUFFER_SIZE=1
+s_ft4_inc1_m1000_cc8 ft4_100g.topo inc1.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1000
+s_k8_a2a30_cc8 ft8_100g.topo k8_a2a30.csv CC_MODE=8
+h_ft8_rate_a2a30_cc8 ft8_h100_s400.topo k8_a2a30.csv CC_MODE=8
+h_ft8_dcn_a2a30_cc8 ft8_dcn.topo k8_a2a30.csv CC_MODE=8
+h_ft4_inv_inc1_cc8 ft4_h25d1500_s100d300.topo inc1.csv CC_MODE=8
+g_sx16_ring_cc8 sx16.topo g16_ring.csv CC_MODE=8
+g_sx16_cross_cc8 sx16.topo g16_cross.csv CC_MODE=8
+g_sx16_incast_cc8 sx16.topo g16_incast.csv CC_MODE=8
+d_sx16_ring_cc8 sx16.topo d16_ring.dag CC_MODE=8
+d_sx16_ring4ch_cc8 sx16.topo d16_ring4ch.dag CC_MODE=8
+d_sx16_a2a_cc8 sx16.topo d16_a2a.dag CC_MODE=8
+# many marks, and marks with drops
+s_k8_a2a30_lowk_cc8 ft8_100g.topo k8_a2a30.csv CC_MODE=8 KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1
+s_ft4_inc1_b1_lowk_cc8 ft4_100g.topo inc1.csv CC_MODE=8 BUFFER_SIZE=1 KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1
+g_sx16_incast_lowk_cc8 sx16.topo g16_incast.csv CC_MODE=8 KMIN_MAP=1,400000000000,10 KMAX_MAP=1,400000000000,40 PMAX_MAP=1,400000000000,1

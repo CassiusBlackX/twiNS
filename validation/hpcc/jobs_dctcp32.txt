@@ -1,0 +1,3 @@
+# k=32 with no transmission trace (run one at a time; about 50 GB each)
+dons_k32_s_q0 ft32.topo k32_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=0
+dons_k32_s_q1 ft32.topo k32_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=1

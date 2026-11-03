@@ -1,0 +1,45 @@
+# DCTCP over RDMA (CC_MODE 8): the congestion, topologies and parameters of jobs1-3
+inc1_b1_cc8 ft4.topo inc1.csv CC_MODE=8 BUFFER_SIZE=1
+k8_a2a30_cc8 fattree8.txt k8_a2a30.csv CC_MODE=8
+k8_incast16_cc8 fattree8.txt k8_incast16.csv CC_MODE=8
+k8_incast16_b2_cc8 fattree8.txt k8_incast16.csv CC_MODE=8 BUFFER_SIZE=2
+k8_a2a50s_cc8 fattree8.txt k8_a2a50s.csv CC_MODE=8
+k16_a2a30_cc8 ft16.topo k16_a2a30.csv CC_MODE=8
+k16_incast16_cc8 ft16.topo k16_incast16.csv CC_MODE=8
+k16_incast16_b2_cc8 ft16.topo k16_incast16.csv CC_MODE=8 BUFFER_SIZE=2
+ls_a2a30_cc8 ls16x8.topo ls_a2a30.csv CC_MODE=8
+ls_incast16_b2_cc8 ls16x8.topo ls_incast16.csv CC_MODE=8 BUFFER_SIZE=2
+jf32_a2a30_cc8 jf32.txt jf32_a2a30.csv CC_MODE=8
+jf32_incast_b1_cc8 jf32.txt jf32_incast.csv CC_MODE=8 BUFFER_SIZE=1
+torus6_a2a30_cc8 torus6.txt torus6_a2a30.csv CC_MODE=8
+df4x9_a2a30_cc8 df4x9.txt df4x9_a2a30.csv CC_MODE=8
+k8_incast64_b1_cc8 fattree8.txt k8_incast64.csv CC_MODE=8 BUFFER_SIZE=1
+k8_perm_cc8 fattree8.txt k8_perm.csv CC_MODE=8
+k8_perm_lowk_cc8 fattree8.txt k8_perm.csv CC_MODE=8 KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160
+k8_a2a50s_b1_cc8 fattree8.txt k8_a2a50s.csv CC_MODE=8 BUFFER_SIZE=1
+k8_perm_b1_cc8 fattree8.txt k8_perm.csv CC_MODE=8 BUFFER_SIZE=1
+ls_a2a50s_b2_cc8 ls16x8.topo ls_a2a50s.csv CC_MODE=8 BUFFER_SIZE=2
+k16_a2a50s_b2_cc8 ft16.topo k16_a2a50s.csv CC_MODE=8 BUFFER_SIZE=2
+# parameters
+k8_inc16_ackhi_cc8 fattree8.txt k8_incast16.csv CC_MODE=8 BUFFER_SIZE=2 ACK_HIGH_PRIO=1
+k8_perm_novarwin_cc8 fattree8.txt k8_perm.csv CC_MODE=8 VAR_WIN=0
+k8_perm_nowin_cc8 fattree8.txt k8_perm.csv CC_MODE=8 HAS_WIN=0
+k8_perm_nobound_cc8 fattree8.txt k8_perm.csv CC_MODE=8 RATE_BOUND=0
+k8_perm_mtu1500_cc8 fattree8.txt k8_perm.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1500
+k8_perm_ack4k_cc8 fattree8.txt k8_perm.csv CC_MODE=8 L2_ACK_INTERVAL=4000
+k8_perm_g16_cc8 fattree8.txt k8_perm.csv CC_MODE=8 EWMA_GAIN=0.0625 KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160
+k8_perm_rai100_cc8 fattree8.txt k8_perm.csv CC_MODE=8 DCTCP_RATE_AI=100Mb/s KMIN_MAP=1,100000000000,40 KMAX_MAP=1,100000000000,160
+k8_perm_minrate_cc8 fattree8.txt k8_perm.csv CC_MODE=8 MIN_RATE=10Gb/s KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1
+k8_a2a50s_lowk_b1_cc8 fattree8.txt k8_a2a50s.csv CC_MODE=8 BUFFER_SIZE=1 KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1
+# DONS's public ns-3 config (ENABLE_QCN 0: no marks, DCTCP only adds), its permutations, and with ECN on
+dons_k8_s_q0 fattree8.txt k8_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=0
+dons_k8_l_q0 fattree8.txt k8_perm_l.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=0
+dons_k16_s_q0 ft16.topo k16_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=0
+dons_k8_s_q1 fattree8.txt k8_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=1
+dons_k8_l_q1 fattree8.txt k8_perm_l.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=1
+dons_k16_s_q1 ft16.topo k16_perm_s.csv CC_MODE=8 PACKET_PAYLOAD_SIZE=1452 ENABLE_QCN=1
+# drops and NACKs (9000-byte frames in a 1 MB buffer), with and without marks
+inc1_b1_m9k_cc8 ft4.topo inc1.csv CC_MODE=8 BUFFER_SIZE=1 PACKET_PAYLOAD_SIZE=9000
+inc1_b1_m9k_lowk_cc8 ft4.topo inc1.csv CC_MODE=8 BUFFER_SIZE=1 PACKET_PAYLOAD_SIZE=9000 KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1
+k8_incast64_b1_m9k_cc8 fattree8.txt k8_incast64.csv CC_MODE=8 BUFFER_SIZE=1 PACKET_PAYLOAD_SIZE=9000
+k8_incast64_b1_m9k_lowk_cc8 fattree8.txt k8_incast64.csv CC_MODE=8 BUFFER_SIZE=1 PACKET_PAYLOAD_SIZE=9000 KMIN_MAP=1,100000000000,10 KMAX_MAP=1,100000000000,40 PMAX_MAP=1,100000000000,1

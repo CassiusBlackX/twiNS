@@ -30,7 +30,7 @@ simulator is the ns-3 fork that RDMA studies build on (ns3-rdma, ConWeave). twin
 - the RDMA NIC's queue pairs: rate pacing, windows, go-back-N;
 - PFC with the shared-buffer MMU's dynamic thresholds and headroom;
 - ECN marking at dequeue;
-- DCQCN and HPCC with INT.
+- DCQCN, HPCC with INT, and DCTCP over RDMA (`CC_MODE 8`).
 
 In 47 validation runs every flow's completion time equals the reference's. The runs span FatTree
 k=4–16, leaf-spine, Jellyfish, torus and Dragonfly, PFC storms, and every switch of the config.
@@ -360,7 +360,7 @@ them, see `validation/README.md`.
   further back.
 - **Topology files.** Links all run at 100 Gbps with 1 µs delay (the slot is the propagation
   delay; mixed rates are not modelled yet); hosts have one link.
-- **Protocols.** RDMA (PFC, DCQCN, HPCC) is modelled by `twins-rdma`, against the HPCC
+- **Protocols.** RDMA (PFC, DCQCN, HPCC, DCTCP) is modelled by `twins-rdma`, against the HPCC
   simulator rather than ns-3.46; see `validation/hpcc/README.md` for what it does not cover.
 - **What exactness is relative to.** It is defined against sequential ns-3.46.1 built with GCC
   `-march=native` on x86-64 (glibc 2.39). Other ns-3 versions or build flags may need
