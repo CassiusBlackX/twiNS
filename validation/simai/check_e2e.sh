@@ -14,7 +14,11 @@ n=0
 while read -r name topo rest; do
     case "$name" in "" | "#"*) continue ;; esac
     n=$((n + 1))
-    python3 workloads/trace2dag.py "$E2E/$name.trace" "$E2E/$name.fct" "$E2E/$name.dag" "$E2E/$name.ref" > /dev/null || { echo "$name: no DAG"; continue; }
+    # (only when the trace is newer: a DAG and reference put in place by hand, such as a run's with
+    # 64-bit uids beside a 32-bit trace, stay)
+    if [ ! -f "$E2E/$name.dag" ] || [ ! -f "$E2E/$name.ref" ] || [ "$E2E/$name.trace" -nt "$E2E/$name.dag" ] || [ "$E2E/$name.trace" -nt "$E2E/$name.ref" ]; then
+        python3 workloads/trace2dag.py "$E2E/$name.trace" "$E2E/$name.fct" "$E2E/$name.dag" "$E2E/$name.ref" > /dev/null || { echo "$name: no DAG"; continue; }
+    fi
     s=$(date +%s.%N)
     $BIN "$CFG" --topo="$DATA/$topo" --flows="$E2E/$name.dag" --out="$E2E/$name.twins" $rest > "$E2E/$name.twins.log" 2>&1
     rc=$?
