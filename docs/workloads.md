@@ -7,13 +7,13 @@ against ns-3 and GeDES, and gives the flow-completion-time slowdowns they produc
 
 ## Result
 
-- **Exact.** 41 of 41 runs identical per flow to sequential ns-3.46.1 (establishment and completion
+- **Exact.** 46 of 46 runs identical per flow to sequential ns-3.46.1 (establishment and completion
   times): four distributions at 30, 50 and 70% load, DCTCP and NewReno, on FatTree k=8 and k=16,
   and the pair workloads GeDES runs.
 - **TwiNS's slowdown curves are therefore ns-3's.** The tables below come from either; they are the
   same numbers.
 - **Speed.** Against ns-3 on one core: 266–405× on web search at k=8, 789–1014× at k=16, up to
-  1680× on Hadoop and 1612× on lunaWrite. DataMining is the exception, at 42–171×: a few flows of
+  1680× on Hadoop and 1967× on lunaWrite. DataMining is the exception, at 42–171×: a few flows of
   up to 1 GB keep the network busy long after the 10 ms of arrivals, and TwiNS's cost follows
   simulated time, not packets.
 - **GeDES is fast but wrong.** On its own pairing (host i with i + N/2), TwiNS takes 0.44–7.2 s and
@@ -41,8 +41,8 @@ Poisson process at the load asked for. The CDFs, in `workloads/cdf/`, with their
   2 ms (k=16, 32); Hadoop over 1.5 ms, since GeDES holds at most 99 flows on a connection.
 - **Statistics** leave out the flows that arrive in the first 20% of the arrival window
   (warm-up).
-- **Limits.** TwiNS's TCP model holds 256 active connections a host. NewReno at lunaWrite 50% and
-  70% exceeds it (drops pile up connections behind 1 ms RTOs); TwiNS then says so
+- **Limits.** TwiNS's TCP model holds 256 active connections a host. NewReno at lunaWrite 70%, and
+  at 50% on k=8, exceeds it (drops pile up connections behind 1 ms RTOs); TwiNS then says so
   (`active-ovf`), and those runs are left out.
 
 ## Exactness
@@ -52,8 +52,8 @@ Poisson process at the load asked for. The CDFs, in `workloads/cdf/`, with their
 | FatTree | workloads | TCPs | runs identical |
 |---|---|---|---|
 | k=8 | ws, hdp, dm at 30/50/70%; luna at 30% | DCTCP, NewReno | 20 of 20 |
-| k=8 | luna 50% | DCTCP | 1 of 1 |
-| k=16 | ws 30/50/70%, hdp 30/50/70%, dm 30/50/70% | DCTCP (and NewReno at 50%) | 12 of 12 |
+| k=8 | luna 50%, 70% | DCTCP | 2 of 2 |
+| k=16 | ws, hdp, dm, luna at 30/50/70% | DCTCP (and NewReno at 50%) | 16 of 16 |
 | k=8, 16 | GeDES's pairs, ws and hdp at 50% | DCTCP, NewReno | 8 of 8 |
 
 ## Slowdowns
@@ -92,6 +92,7 @@ on a87's Xeon Gold 5218, its event loop, 4–8 runs at a time (a87 was shared wi
 | k=8 | Hadoop | 70% | 90417 | 3207 | 3.33 | 963 | 3758 | 4.58 | 820 |
 | k=8 | lunaWrite | 30% | 116401 | 1425 | 1.38 | 1030 | 1767 | 2.50 | 707 |
 | k=8 | lunaWrite | 50% | 192775 | 4255 | 2.64 | 1612 | | | |
+| k=8 | lunaWrite | 70% | 270343 | 8944 | 4.55 | 1967 | | | |
 | k=8 | DataMining | 30% | 351 | 368 | 8.79 | 42 | 425 | 8.46 | 50 |
 | k=8 | DataMining | 50% | 663 | 475 | 8.87 | 54 | 607 | 8.61 | 70 |
 | k=8 | DataMining | 70% | 898 | 696 | 8.53 | 82 | 1156 | 8.41 | 137 |
@@ -101,6 +102,9 @@ on a87's Xeon Gold 5218, its event loop, 4–8 runs at a time (a87 was shared wi
 | k=16 | Hadoop | 30% | 62034 | 887 | 0.86 | 1031 | | | |
 | k=16 | Hadoop | 50% | 103166 | 2109 | 1.30 | 1617 | 2029 | 1.98 | 1026 |
 | k=16 | Hadoop | 70% | 144403 | 3041 | 1.81 | 1680 | | | |
+| k=16 | lunaWrite | 30% | 183139 | 1411 | 0.93 | 1518 | | | |
+| k=16 | lunaWrite | 50% | 295245 | 2932 | 1.85 | 1582 | 2911 | 4.15 | 701 |
+| k=16 | lunaWrite | 70% | 406677 | 4320 | 4.51 | 959 | | | |
 | k=16 | DataMining | 30% | 561 | 306 | 4.54 | 67 | | | |
 | k=16 | DataMining | 50% | 1005 | 648 | 5.62 | 115 | 697 | 5.48 | 127 |
 | k=16 | DataMining | 70% | 1405 | 1654 | 9.67 | 171 | | | |

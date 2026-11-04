@@ -173,7 +173,7 @@ enqueue and then reading the ns-3 source (see `validation/README.md`).
 
 Two later sets, DCTCP and NewReno, are identical too: 58 runs on 12 topologies of 96–1,056
 hosts (leaf-spine with 3:1 oversubscription, 3-D torus, HyperX, Xpander, larger Jellyfish, tori and
-Dragonfly; `docs/topologies.md`), and 41 runs with measured flow-size distributions (web search,
+Dragonfly; `docs/topologies.md`), and 46 runs with measured flow-size distributions (web search,
 Hadoop, lunaWrite, data mining) at 30–70% load (`docs/workloads.md`).
 
 A few runs (3 of 138 k=8 and 8 of 48 k=16 sweep configurations, k16 a2a30 NewReno with spraying)
@@ -226,7 +226,7 @@ At k=32 (8,192 hosts), DCTCP:
 
 **Other topologies and workloads.** On the 8 topologies of 512–1,056 hosts, TwiNS is 301–790×
 ns-3 and 14–71× Unison on the all-to-all workloads (`docs/topologies.md`). With measured flow-size
-distributions on FatTrees it is 42–1680× ns-3, and 2.4–112× GeDES on GeDES's own pairing, where
+distributions on FatTrees it is 42–1967× ns-3, and 2.4–112× GeDES on GeDES's own pairing, where
 GeDES's mean FCT is off by 5–96% (`docs/workloads.md`).
 
 **Parameter sweeps.** `bench/sweep.py` runs a grid as batches of worlds;
