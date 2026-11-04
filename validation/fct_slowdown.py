@@ -53,9 +53,9 @@ def main():
             ns[(a, b, sz, st)] = done - st
     gd = {}
     if len(args) > 2:
-        base = None
         for r in csv.DictReader(open(args[2])):
-            ip = lambda x: (int(x) - 3232235520) >> 8 if int(x) >= 3232235520 else int(x)
+            # (GeDES's address of host h: 192.168.0.0 + 48 * (h's edge switch) + h's index under it)
+            ip = lambda x: ((int(x) - 3232235520) // 48) * (k // 2) + (int(x) - 3232235520) % 48 if int(x) >= 3232235520 else int(x)
             gd[(ip(r["source_ip"]), ip(r["dst_ip"]), int(r["flow_size"]), int(r["start_timestamp"]))] = int(r["flow_completion_time"])
     print("| flow size | flows | p50 slowdown | p99 slowdown |" + (" GeDES p50 | GeDES p99 |" if gd else ""))
     print("|---|---|---|---|" + ("---|---|" if gd else ""))

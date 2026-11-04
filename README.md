@@ -171,6 +171,11 @@ enqueue and then reading the ns-3 source (see `validation/README.md`).
 | k=8 sweep: ECN threshold K × queue limit × 2 loads | 138 |
 | k=16 sweep: K × queue limit × 2 loads | 48 |
 
+Two later sets, DCTCP and NewReno, are identical too: 58 runs on 12 topologies of 96–1,056
+hosts (leaf-spine with 3:1 oversubscription, 3-D torus, HyperX, Xpander, larger Jellyfish, tori and
+Dragonfly; `docs/topologies.md`), and 41 runs with measured flow-size distributions (web search,
+Hadoop, lunaWrite, data mining) at 30–70% load (`docs/workloads.md`).
+
 A few runs (3 of 138 k=8 and 8 of 48 k=16 sweep configurations, k16 a2a30 NewReno with spraying)
 contain simultaneous events whose recorded histories are equal over all 9 runs a 64-byte frame
 holds. TwiNS counts such undecided ties and warns; `twins128` (128-byte frames, 25 runs) decides
@@ -218,6 +223,11 @@ At k=32 (8,192 hosts), DCTCP:
 | k32 paper | 8192 | 220 s | 1.43 s | 153× |
 | k32 a2a50s | 162505 | 337 s | 1.43 s | 236× |
 | k32 incast16 | 160 | 16.3 s | 0.097 s | 169× |
+
+**Other topologies and workloads.** On the 8 topologies of 512–1,056 hosts, TwiNS is 301–790×
+ns-3 and 14–71× Unison on the all-to-all workloads (`docs/topologies.md`). With measured flow-size
+distributions on FatTrees it is 42–1680× ns-3, and 2.4–112× GeDES on GeDES's own pairing, where
+GeDES's mean FCT is off by 5–96% (`docs/workloads.md`).
 
 **Parameter sweeps.** `bench/sweep.py` runs a grid as batches of worlds;
 `bench/sweep_report.py` tabulates short-flow p99 and long-flow mean FCT per configuration.
