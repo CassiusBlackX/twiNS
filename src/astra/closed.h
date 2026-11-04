@@ -26,6 +26,8 @@ static int send_lat_slots(int64_t send_lat, int64_t D) { return (int)((send_lat 
 // must do exactly what it did. What is left on the GPU is the network between the servers.
 static string g_nvl_record, g_nvl_oracle;
 static int g_nvl_islands = 0;
+static int g_nvl_ringlog = 24; // --nvl-ringlog: an island's tail ring holds 2^this nodes
+static unsigned long long g_isl_ev[40]; // the islands' counters, summed (added to the GPU's in the report)
 struct NvlPre
 {
     int g;
@@ -46,13 +48,14 @@ static int g_nvl_nsw = 0;
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <csignal>
+#include <ftw.h>
 
 // --nvl-islands: the flows between GPUs of one server run on CPU cores, a twins-island process per
 // server (src/rdma/island.h), alongside the GPU. Each sync the islands get the messages starting
 // their flows and run to the GPU's limit; their completions go into the GPU's ring of completions,
-// as the GPU's own. Chains cross both ways with the tail nodes they reach (each sent once to each
-// side), renumbered in the receiver's ring.
-constexpr int NVL_ISL_DEPTH = 64; // the GPU's tail nodes of a chain sent to an island (beyond: lost, if reached)
+// as the GPU's own. Chains cross both ways with the tail nodes they reach: the islands' nodes the GPU
+// reads where they are, the GPU's go into one table all islands read (IslCopies).
+constexpr int NVL_ISL_DEPTH = 1 << 30; // the GPU's tail nodes of a chain put in the islands' table: all it reaches (each once)
 struct NvlIslands
 {
     struct Node
@@ -66,10 +69,15 @@ struct NvlIslands
     vector<pid_t> pid;
     vector<string> names;
     vector<vector<NvlRec>> queue;    // items for an island's next command
-    vector<std::unordered_set<uint64_t>> sent; // GPU nodes an island has
+    IslCopies *copies = nullptr;       // the GPU's nodes the islands have (isl_shm.h)
+    uint32_t copy_gen = 0;
+    string copy_prefix;
     std::unordered_map<uint64_t, Node> gnodes; // the GPU's nodes the walks found
     vector<void *> rings;            // the islands' tail rings (shared memory, mapped for the GPU)
-    static constexpr int RING_LOG = 24;
+    RemoteRings rr_host = {}, *drr = nullptr; // (their lo: see tail_at)
+    vector<uint64_t> nodes_at_go;    // each island's tail nodes when its run began
+    unsigned long long wide_windows = 0; // runs in which an island wrote half a ring or more
+    int RING_LOG = 24;              // (--nvl-ringlog)
     long long live = 0;              // flows given to islands and not complete
     int64_t slot = 0;                // where the islands are
     int64_t sent_limit = 0;          // the limit of the last run
@@ -84,6 +92,7 @@ struct NvlIslands
     void start(Sim &s, const vector<FlowInfo> &fi, const vector<int> &h_srv, const string &topo, int64_t D, int P)
     {
         const int S = s.S;
+        RING_LOG = g_nvl_ringlog;
         of_sw.assign(S, -1);
         vector<vector<int>> flows(S);
         for (size_t g = 0; g < fi.size(); g++)
@@ -122,6 +131,30 @@ struct NvlIslands
             exit(1);
         }
         dir = tmpl;
+        static vector<string> *to_unlink = &names;
+        static string *to_remove = &dir;
+        static vector<pid_t> *to_kill = &pid;
+        static pid_t owner = getpid(); // (a forked child of twins-ai has the handler too: it leaves this to its parent)
+        atexit([] {
+            for (auto &x : *to_unlink)
+                shm_unlink(x.c_str());
+        });
+        // (killed, as by timeout: the segments and the directory would stay in /dev/shm, in memory)
+        for (int sig : {SIGTERM, SIGINT, SIGHUP})
+            signal(sig, [](int sig) {
+                if (getpid() != owner)
+                    _exit(128 + sig);
+                for (pid_t p : *to_kill) // (the islands first: they write in the directory)
+                {
+                    kill(p, SIGKILL);
+                    waitpid(p, nullptr, 0);
+                }
+                for (auto &x : *to_unlink)
+                    shm_unlink(x.c_str());
+                if (!to_remove->empty())
+                    nftw(to_remove->c_str(), [](const char *f, const struct stat *, int, struct FTW *) { remove(f); return 0; }, 16, FTW_DEPTH | FTW_PHYS);
+                _exit(128 + sig);
+            });
         const char *bin = getenv("TWINS_ISLAND");
         string island_bin = bin ? bin : "";
         if (island_bin.empty())
@@ -161,8 +194,11 @@ struct NvlIslands
             rings.push_back(p);
             names.push_back(name);
         }
-        const RemoteRings *drr = dev_copy(vector<RemoteRings>{rr});
-        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_remote), &drr, sizeof(drr)));
+        rr_host = rr;
+        drr = const_cast<RemoteRings *>(dev_copy(vector<RemoteRings>{rr}));
+        const RemoteRings *cdrr = drr;
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(g_remote), &cdrr, sizeof(cdrr)));
+        nodes_at_go.assign(n, 0);
         for (int k = 0; k < n; k++)
         {
             string pd = dir + "/p" + std::to_string(k);
@@ -247,18 +283,17 @@ struct NvlIslands
             pid.push_back(p);
         }
         queue.assign(n, {});
-        sent.assign(n, {});
-        static vector<string> *to_unlink = &names;
-        atexit([] {
-            for (auto &x : *to_unlink)
-                shm_unlink(x.c_str());
-        });
+        copy_prefix = "/twins-isl-" + std::to_string(getpid()) + "-copies";
+        copies_make(1ull << 20);
         printf("nvl: %zu servers on %d islands (%s)\n", xs.size(), n, dir.c_str());
     }
     int island_of_flow(const FlowInfo &y, const vector<int> &h_srv) const { return of_sw[h_srv[y.src]]; }
     // a command to an island (its queue first, in pieces if needed); waits only for the pieces
-    void command(int k, uint32_t cmd, int64_t limit)
+    // (returns done_seq as it was before the last part: an answer to the command moves it on; a queue
+    // longer than in_cap goes as ISL_LOADs first, each answered, so the value before them would not do)
+    uint32_t command(int k, uint32_t cmd, int64_t limit)
     {
+        uint32_t d_last = 0;
         IslShm *m = shm[k];
         auto &q = queue[k];
         size_t at = 0;
@@ -273,6 +308,7 @@ struct NvlIslands
             m->cmd = last ? cmd : ISL_LOAD;
             m->limit = limit;
             const uint32_t d = m->done_seq.load(std::memory_order_acquire);
+            d_last = d;
             isl_wake(m->cmd_seq);
             if (!last)
                 isl_wait(m->done_seq, d);
@@ -280,15 +316,23 @@ struct NvlIslands
                 break;
         } while (true);
         q.clear();
+        return d_last;
     }
     vector<uint32_t> done_at;
-    void go(int64_t limit)
+    void go(int64_t limit, hipStream_t st)
     {
         done_at.assign(n, 0);
+        // (the GPU takes no island node that this run could overwrite: see tail_at)
+        const uint64_t half = 1ull << (RING_LOG - 1);
         for (int k = 0; k < n; k++)
         {
-            done_at[k] = shm[k]->done_seq.load(std::memory_order_acquire);
-            command(k, ISL_RUN, limit);
+            nodes_at_go[k] = shm[k]->nodes;
+            rr_host.lo[k] = nodes_at_go[k] > half ? nodes_at_go[k] - half : 0;
+        }
+        CK(hipMemcpyAsync(drr->lo, rr_host.lo, n * sizeof(uint64_t), hipMemcpyHostToDevice, st));
+        for (int k = 0; k < n; k++)
+        {
+            done_at[k] = command(k, ISL_RUN, limit);
         }
         sent_limit = limit;
     }
@@ -313,6 +357,8 @@ struct NvlIslands
                 isl_wait(m->done_seq, d);
             }
             slot = m->slot;
+            if (m->nodes - nodes_at_go[k] >= (1ull << (RING_LOG - 1)))
+                wide_windows++; // (the GPU may have read a node as it was overwritten: a lost tail)
         }
         t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
@@ -415,7 +461,7 @@ struct NvlIslands
         for (int e = 0; e < m; e++)
         {
             const int k = island_of_flow(fi[hs[e].flow], h_srv);
-            send_tail(k, cs[e].tail);
+            send_tail(cs[e].tail);
             NvlRec r = {};
             r.tag = 2;
             r.avail = as[e];
@@ -424,29 +470,56 @@ struct NvlIslands
             r.n.pos = (uint64_t)made;
             queue[k].push_back(r);
         }
+        gnodes.clear(); // (all in the table now)
         xn_seen = xn;
         t_xfer += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
-    // the GPU's nodes of a tail the island lacks, oldest first, onto its queue
-    void send_tail(int k, uint64_t p)
+    // a new table of the GPU's nodes for the islands, with what the old one held
+    void copies_make(uint64_t cap)
     {
-        vector<uint64_t> todo;
-        while (p && !(p >> TAIL_SIDE) && !sent[k].count(p)) // (an island's node: the island reads it where it is)
+        const string name = copy_prefix + std::to_string(++copy_gen);
+        const size_t bytes = IslCopies::bytes(cap);
+        int fd = shm_open(name.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        void *p = fd >= 0 && !ftruncate(fd, bytes) ? mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+        if (fd >= 0)
+            close(fd);
+        if (p == MAP_FAILED || name.size() >= sizeof(shm[0]->copy_name))
+        {
+            fprintf(stderr, "nvl: cannot make %s\n", name.c_str());
+            exit(1);
+        }
+        names.push_back(name);
+        IslCopies *c = static_cast<IslCopies *>(p);
+        c->mask = cap - 1;
+        c->n = 0;
+        if (copies)
+        {
+            const TailNode *o = copies->slots();
+            for (uint64_t i = 0; i <= copies->mask; i++)
+                if (o[i].pos)
+                    c->put(o[i]);
+            munmap(copies, IslCopies::bytes(copies->mask + 1));
+            shm_unlink((copy_prefix + std::to_string(copy_gen - 1)).c_str()); // (the islands keep it mapped until they move)
+        }
+        copies = c;
+        for (int k = 0; k < n; k++)
+        {
+            shm[k]->copy_gen = copy_gen;
+            strcpy(shm[k]->copy_name, name.c_str());
+        }
+    }
+    // the GPU's nodes of a tail not yet in the islands' table, into it (the islands wait for a command)
+    void send_tail(uint64_t p)
+    {
+        while (p && !(p >> TAIL_SIDE) && !copies->find(p)) // (an island's node: the islands read it where it is)
         {
             auto it = gnodes.find(p);
             if (it == gnodes.end())
                 break; // (overwritten in the GPU's ring before it was found: lost, if reached)
-            todo.push_back(p);
+            if (2 * (copies->n + 1) > copies->mask + 1)
+                copies_make(2 * (copies->mask + 1));
+            copies->put(TailNode{it->second.code, it->second.cnt, it->second.next, p});
             p = it->second.next;
-        }
-        for (size_t i = todo.size(); i-- > 0;)
-        {
-            const Node &nd = gnodes[todo[i]];
-            NvlRec r = {};
-            r.tag = 0;
-            r.n = TailNode{nd.code, nd.cnt, nd.next, todo[i]};
-            queue[k].push_back(r);
-            sent[k].insert(todo[i]);
         }
     }
     // main's flows within servers, ready at the start (their chains are main's: no tails)
@@ -465,19 +538,24 @@ struct NvlIslands
         for (int k = 0; k < n; k++)
         {
             done_at.assign(n, 0);
-            const uint32_t d = shm[k]->done_seq.load(std::memory_order_acquire);
-            command(k, ISL_LOAD, 0);
-            isl_wait(shm[k]->done_seq, d);
+            isl_wait(shm[k]->done_seq, command(k, ISL_LOAD, 0));
         }
     }
     // the end: the islands write their flows' completion times; these, by global id
     void finish(vector<int64_t> &start, vector<int64_t> &fct, unsigned &done)
     {
         double busy = 0;
+        uint64_t nodes_max = 0;
         for (int k = 0; k < n; k++)
         {
             const uint32_t d = shm[k]->done_seq.load(std::memory_order_acquire);
             busy += shm[k]->busy_s;
+            nodes_max = std::max<uint64_t>(nodes_max, shm[k]->nodes);
+            for (int i = 0; i < 40; i++)
+                g_isl_ev[i] += shm[k]->ev[i];
+            g_isl_ev[9] += k == 0 ? wide_windows : 0;
+            if (shm[k]->ev[8] || shm[k]->ev[9])
+                fprintf(stderr, "nvl: island %d: undecided ties %llu, on lost tails %llu\n", k, shm[k]->ev[8], shm[k]->ev[9]);
             shm[k]->cmd = ISL_QUIT;
             isl_wake(shm[k]->cmd_seq);
             isl_wait(shm[k]->done_seq, d);
@@ -507,8 +585,10 @@ struct NvlIslands
             if (system(cmd.c_str()))
                 fprintf(stderr, "nvl: could not remove %s\n", dir.c_str());
         }
-        printf("nvl: islands busy %.3f s in all; twins-ai waited %.3f s for them, %.3f s moving items; %llu items in, %llu out\n", busy,
-               t_wait, t_xfer, items_in, items_out);
+        printf("nvl: islands busy %.3f s in all; twins-ai waited %.3f s for them, %.3f s moving items; %llu items in, %llu out; up to %llu tail nodes an island (ring %llu)\n", busy,
+               t_wait, t_xfer, items_in, items_out, (unsigned long long)nodes_max, 1ull << RING_LOG);
+        // (a ring that wrapped is fine while no comparison reaches back past it: one that does is
+        // counted as on a lost tail, and the run is redone with larger rings)
     }
 };
 
@@ -765,7 +845,7 @@ struct Closed : astra::Network
         for (;;)
         {
             if (isl.n)
-                isl.go(isl_lim); // (the islands run alongside the GPU's launches)
+                isl.go(isl_lim, st); // (the islands run alongside the GPU's launches)
             auto a = now();
             // (few launches, up to the limit, while completions keep coming; else many: without any
             // the GPU moves the limit itself)
@@ -838,7 +918,7 @@ struct Closed : astra::Network
                 if (S > isl.sent_limit)
                 {
                     // (the GPU went on alone, with no island flow running: the islands catch up)
-                    isl.go(S);
+                    isl.go(S, st);
                     isl.collect(isl_more);
                     for (int k = 0; k < isl.n; k++)
                         isl_out[k].insert(isl_out[k].end(), isl_more[k].begin(), isl_more[k].end());

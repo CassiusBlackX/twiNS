@@ -1127,6 +1127,8 @@ int main(int argc, char **argv)
             g_nvl_oracle = v;
         else if (k == "--nvl-islands") // those flows run by a twins-island per server, on CPU cores
             g_nvl_islands = atoi(v.c_str());
+        else if (k == "--nvl-ringlog")
+            g_nvl_ringlog = std::max(16, std::min(32, atoi(v.c_str())));
 #endif
         else if (k == "--dcap")
         {
@@ -1425,7 +1427,11 @@ int main(int argc, char **argv)
             if (g < H && nv == 1)
                 h_srv[g] = srv;
         }
-#ifdef TWINS_ASTRA_HOST
+#if defined(TWINS_ASTRA_HOST) && !defined(TWINS_NVL_EV)
+        if (!g_nvl_record.empty())
+            fprintf(stderr, "nvl: no %s.ev (the events inside servers per sync): a -DTWINS_NVL_EV build counts them\n", g_nvl_record.c_str());
+#endif
+#if defined(TWINS_ASTRA_HOST) && defined(TWINS_NVL_EV)
         if (!g_nvl_record.empty())
         {
             // (each node's server and NVLink devices, for counting the events inside servers)
@@ -2164,6 +2170,11 @@ int main(int argc, char **argv)
 #endif
     unsigned long long ev[40];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
+#ifdef TWINS_ASTRA_HOST
+    // the islands' ties and overflows count as the run's (--nvl-islands)
+    for (int i : {4, 5, 6, 7, 8, 9, 12, 14, 15, 32, 33})
+        ev[i] += g_isl_ev[i];
+#endif
     for (int wi = 0; wi < W; wi++)
     {
         string path = batch_file.empty() ? out_file : out_dir + "/" + worlds[wi].name + ".fct";
@@ -2319,14 +2330,30 @@ int main(int argc, char **argv)
     // overwritten tail: the run is not exact; it starts again with more room, the same arguments
     // otherwise
     const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set && tail_log2 < tail_max;
-    if (redo_d || redo_t)
+#ifdef TWINS_ASTRA_HOST
+    // (with islands, the lost tail may be one of theirs: their rings grow too, up to 2^26 nodes)
+    const bool redo_i = !redo_d && ev[9] && g_nvl_islands && g_nvl_ringlog < 26;
+#else
+    const bool redo_i = false;
+#endif
+    if (redo_d || redo_t || redo_i)
     {
-        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27));
+        string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : redo_t ? "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27)) : "";
+#ifdef TWINS_ASTRA_HOST
+        if (redo_i)
+            more += string(more.empty() ? "" : " ") + "--nvl-ringlog=" + std::to_string(g_nvl_ringlog + 2);
+#endif
         fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
         fflush(stdout);
         fflush(stderr);
         vector<string> av(argv, argv + argc);
-        av.push_back(more);
+        for (size_t i = 0, j; i < more.size(); i = j + 1) // (one argument each)
+        {
+            j = more.find(' ', i);
+            if (j == string::npos)
+                j = more.size();
+            av.push_back(more.substr(i, j - i));
+        }
         vector<char *> pv;
         for (auto &a : av)
             pv.push_back(const_cast<char *>(a.c_str()));

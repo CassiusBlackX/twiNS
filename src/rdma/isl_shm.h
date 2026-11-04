@@ -43,9 +43,58 @@ struct IslShm
     int64_t slot;       // the island's slot after the command
     uint64_t in_n, out_n, in_cap, out_cap;
     double busy_s; // the island's time in its runs
+    uint64_t nodes; // the tail nodes the island has made (its ring holds the last 2^ringlog)
+    unsigned long long ev[40]; // its counters (Sim::ev): undecided ties, ties on lost tails, overflows
+    uint32_t copy_gen;   // the table of the GPU's nodes (IslCopies): remap when this changes
+    char copy_name[64];  // its shared memory
     NvlRec *in() { return reinterpret_cast<NvlRec *>(this + 1); }
     NvlRec *out() { return in() + in_cap; }
     static size_t bytes(uint64_t in_cap, uint64_t out_cap) { return sizeof(IslShm) + (in_cap + out_cap) * sizeof(NvlRec); }
+};
+
+// The GPU's tail nodes the islands' chains may reach, one table for all islands: a chain can go from
+// one island's ring into another's and on into GPU nodes that came with the other's starts. twins-ai
+// writes it only while every island waits for a command (between collecting their answers and the
+// next command), and grows it into a new segment (copy_gen); the islands read it in their runs.
+// Open addressing by pos (0: empty), at most half full.
+struct IslCopies
+{
+    uint64_t mask, n;
+    TailNode *slots() { return reinterpret_cast<TailNode *>(this + 1); }
+    const TailNode *slots() const { return reinterpret_cast<const TailNode *>(this + 1); }
+    static size_t bytes(uint64_t cap) { return sizeof(IslCopies) + cap * sizeof(TailNode); }
+    static uint64_t hash(uint64_t p)
+    {
+        p ^= p >> 33;
+        p *= 0xff51afd7ed558ccdull;
+        return p ^ (p >> 33);
+    }
+    const TailNode *find(uint64_t p) const
+    {
+        const TailNode *s = slots();
+        for (uint64_t i = hash(p) & mask;; i = (i + 1) & mask)
+        {
+            if (s[i].pos == p)
+                return &s[i];
+            if (!s[i].pos)
+                return nullptr;
+        }
+    }
+    void put(const TailNode &t) // (the caller keeps it at most half full)
+    {
+        TailNode *s = slots();
+        for (uint64_t i = hash(t.pos) & mask;; i = (i + 1) & mask)
+        {
+            if (s[i].pos == t.pos)
+                return;
+            if (!s[i].pos)
+            {
+                s[i] = t;
+                n++;
+                return;
+            }
+        }
+    }
 };
 
 inline void isl_wait(std::atomic<uint32_t> &w, uint32_t old)

@@ -19,19 +19,38 @@ static int g_isl_side = 0, g_isl_nrings = 0, g_isl_ringlog = 22;
 static std::unordered_map<uint64_t, TailNode> g_isl_copies;
 static vector<const TailNode *> g_isl_ring;
 static TailNode g_isl_none = {};
+static const IslCopies *g_isl_cp = nullptr; // with twins-ai: its table of the GPU's nodes (isl_shm.h)
+static uint32_t g_isl_cp_gen = 0;
 namespace rdma
 {
 uint64_t g_tail_side = 0;
-const TailNode &island_remote(uint64_t p)
+TailNode island_remote(uint64_t p)
 {
     const int k = (int)(p >> TAIL_SIDE);
     if (k == 0)
     {
+        if (g_isl_cp)
+        {
+            const TailNode *t = g_isl_cp->find(p);
+            return t ? *t : g_isl_none; // (not there: lost, if reached)
+        }
         auto it = g_isl_copies.find(p);
         return it != g_isl_copies.end() ? it->second : g_isl_none; // (not sent: lost, if reached)
     }
     if (k <= (int)g_isl_ring.size() && g_isl_ring[k - 1])
-        return g_isl_ring[k - 1][(p - 1) & ((1ull << g_isl_ringlog) - 1)];
+    {
+        // (another island's, being written: see tail_at)
+        const TailNode &v = g_isl_ring[k - 1][(p - 1) & ((1ull << g_isl_ringlog) - 1)];
+        TailNode n;
+        n.pos = __atomic_load_n(&v.pos, __ATOMIC_ACQUIRE);
+        n.code = __atomic_load_n(&v.code, __ATOMIC_RELAXED);
+        n.cnt = __atomic_load_n(&v.cnt, __ATOMIC_RELAXED);
+        n.next = __atomic_load_n(&v.next, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&v.pos, __ATOMIC_RELAXED) != n.pos)
+            n.pos = 0;
+        return n;
+    }
     return g_isl_none;
 }
 } // namespace rdma
@@ -288,6 +307,26 @@ static void island_live(Island &is)
             isl_wake(m->done_seq);
             continue;
         }
+        if (m->copy_gen != g_isl_cp_gen)
+        {
+            // (twins-ai's table of the GPU's nodes, new or grown)
+            if (g_isl_cp)
+                munmap((void *)g_isl_cp, IslCopies::bytes(g_isl_cp->mask + 1));
+            int fd = shm_open(m->copy_name, O_RDONLY, 0600);
+            IslCopies h;
+            void *p = fd >= 0 && pread(fd, &h, sizeof(h), 0) == (ssize_t)sizeof(h)
+                          ? mmap(nullptr, IslCopies::bytes(h.mask + 1), PROT_READ, MAP_SHARED, fd, 0)
+                          : MAP_FAILED;
+            if (fd >= 0)
+                close(fd);
+            if (p == MAP_FAILED)
+            {
+                fprintf(stderr, "island: cannot map %s\n", m->copy_name);
+                exit(1);
+            }
+            g_isl_cp = static_cast<const IslCopies *>(p);
+            g_isl_cp_gen = m->copy_gen;
+        }
         NvlRec *in = m->in();
         for (uint64_t i = 0; i < m->in_n; i++)
             is.take(in[i]);
@@ -311,6 +350,8 @@ static void island_live(Island &is)
             m->more = 0;
         }
         m->slot = *s.slot;
+        m->nodes = *g_tail.cnt - g_tail_side;
+        memcpy(m->ev, s.ev, sizeof(m->ev));
         isl_wake(m->done_seq);
     }
 }

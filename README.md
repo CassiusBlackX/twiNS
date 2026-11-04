@@ -42,6 +42,11 @@ the GPU, with no SimAI run first. Against SimAI, every message and every action 
 is identical on 5 workloads across Spectrum-X, AlibabaHPN, DCN+, HPCC, 200G NICs and small buffers,
 and on all 42 runs of SimAI's paper workloads, up to 1024 GPUs. It is 6–29× faster than SimAI on
 one core. `src/astra/fetch.sh` gets SimAI's code first. See [docs/ai/whatif.md](docs/ai/whatif.md).
+With `--nvl-islands=P`, the flows between GPUs of one server run on P CPU processes
+(`twins-island`, the same model built for the CPU) beside the GPU, still identical on all of these:
+GPT-3 13B at 128 GPUs goes from 6× to 12× SimAI on this machine's 4 cores, and to 42× on a 16-core
+Ryzen 9950X with an RTX 5090. Runs that are not NVLink-bound gain nothing or lose; see
+[docs/ai/speed.md](docs/ai/speed.md).
 
 ## Build
 

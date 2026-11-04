@@ -165,18 +165,24 @@ __device__ TailPool g_tail;
 // island k. The GPU reads the islands' rings in mapped host memory; an island reads the others'
 // in shared memory, and the GPU's from the copies it was sent (src/rdma/island.h).
 constexpr int TAIL_SIDE = 56;
+// An island's ring is read by the GPU and the other islands while the island writes it. Islands
+// read each other's as a seqlock: the writer clears a node's pos, writes the node, then sets pos; a
+// reader copies a node and takes it only if pos was the one it wanted before and after. The GPU,
+// where fences cost, takes none older than lo (twins-ai sets it, half a ring below the island's
+// count, before each window, and counts a window in which an island wrote more as a lost tail).
 #ifdef TWINS_CPU
-const TailNode &island_remote(uint64_t p); // (island.h)
-extern uint64_t g_tail_side;               // this island's top byte, shifted
+TailNode island_remote(uint64_t p); // (island.h)
+extern uint64_t g_tail_side;        // this island's top byte, shifted
 #else
 struct RemoteRings
 {
     const TailNode *n[64];
     uint64_t mask[64];
+    uint64_t lo[64]; // (a count, without the side byte)
 };
 __device__ const RemoteRings *g_remote;
 #endif
-__device__ __forceinline__ const TailNode &tail_at(uint64_t p)
+__device__ __forceinline__ TailNode tail_at(uint64_t p)
 {
 #ifdef TWINS_CPU
     if ((p >> TAIL_SIDE) != (g_tail_side >> TAIL_SIDE))
@@ -185,6 +191,8 @@ __device__ __forceinline__ const TailNode &tail_at(uint64_t p)
     if (p >> TAIL_SIDE)
     {
         const int k = (int)(p >> TAIL_SIDE) - 1;
+        if ((p & ((1ull << TAIL_SIDE) - 1)) <= g_remote->lo[k])
+            return TailNode{}; // (may be overwritten in this window: lost)
         return g_remote->n[k][(p - 1) & g_remote->mask[k]];
     }
 #endif
@@ -253,10 +261,18 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__) || defined(TWINS_CPU)
             uint64_t pos = atomicAdd(g_tail.cnt, 1ull) + 1;
             TailNode &n = g_tail.n[(pos - 1) & g_tail.mask];
+#ifdef TWINS_CPU
+            __atomic_store_n(&n.pos, 0ull, __ATOMIC_RELAXED); // (read by others as it is written: see tail_at)
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
             n.code = par.r[RUNS - 1].code;
             n.cnt = par.r[RUNS - 1].cnt;
             n.next = par.tail;
+#ifdef TWINS_CPU
+            __atomic_store_n(&n.pos, (unsigned long long)pos, __ATOMIC_RELEASE);
+#else
             n.pos = pos;
+#endif
             c.tail = pos;
 #else
             c.tail = 0; // (the host builds short chains only)
@@ -275,6 +291,7 @@ struct RunCursor
     const Chain *c;
     int i;          // inline run, or RUNS: in the tail
     uint64_t node;  // the current tail node's pos
+    uint64_t nxt;   // and its next (from the copy read)
     uint32_t code;  // 0: the end
     uint32_t left;  // repetitions left of the current run
     bool lost;      // the tail was overwritten
@@ -319,7 +336,7 @@ struct RunCursor
             code = 0;
             return;
         }
-        const TailNode &n = tail_at(node);
+        const TailNode n = tail_at(node);
         if (n.pos != node)
         {
             lost = true;
@@ -328,6 +345,7 @@ struct RunCursor
         }
         code = n.code;
         left = n.cnt;
+        nxt = n.next;
     }
     __device__ __forceinline__ void next()
     {
@@ -341,7 +359,7 @@ struct RunCursor
             }
         }
         else
-            node = tail_at(node).next;
+            node = nxt;
         load();
     }
 };
@@ -670,9 +688,10 @@ __device__ __forceinline__ void trace_event(int node, int64_t now, const char *w
         printf(" %u.%u:%u", (c.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (c.r[i].code & CODE_ORD_MAX), c.r[i].cnt);
     printf(" root %u%s\n", c.root, c.tail ? " +tail" : "");
 }
-#elif defined(TWINS_ASTRA)
-// --nvl-record: the events inside each server (at a GPU's NVLink device, or an NVSwitch), counted per
-// server (g_nvl_mask: a host's NVLink devices as bits, 0x80 an NVSwitch; g_nvl_srv: the server)
+#elif defined(TWINS_ASTRA) && defined(TWINS_NVL_EV)
+// --nvl-record's F.ev (a -DTWINS_NVL_EV build: a load and a branch on every event): the events inside
+// each server (at a GPU's NVLink device, or an NVSwitch), counted per server (g_nvl_mask: a host's
+// NVLink devices as bits, 0x80 an NVSwitch; g_nvl_srv: the server)
 __device__ uint32_t *g_nvl_cnt;
 __device__ const uint8_t *g_nvl_mask;
 __device__ const int *g_nvl_srv;
