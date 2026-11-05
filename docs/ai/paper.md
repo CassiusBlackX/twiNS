@@ -147,6 +147,68 @@ same collectives, one run at a time.
 - **So sequential SimAI is the reference.** Its untraced runs (`simai-seq`) are identical to the
   traced ones that TwiNS matches.
 
+## How fair is "SimAI on one core"?
+
+Measured 2026-11-04/05 on a87 (2 × Xeon Gold 5218, 32 cores, 123 GB), against TwiNS on this machine
+(i5-7500, 4 cores; RX 9060 XT), final ai-nvl build, closed loop (no recording), best of the GPU alone
+and `--nvl-islands=4`. a87's scripts: `fair.sh`, `fair_b.sh` in `~/netsim/aiwork`.
+
+**Which SimAI TwiNS equals.** `simai-ref`: sequential SimAI with `simai.patch`, four fixes (a crash
+when a port resumes after PFC, ECN draws from one stream per port, routes ordered by node id instead
+of heap address, HPCC's INT header size), plus 64-bit event uids past 2^32 events. SimAI as shipped
+(`simai-seq` here) differs from it: on GPT-3 13B probe at 128 GPUs in 75% of messages and 20% in
+iteration time (45.2 against 56.4 ms); on LLaMA 65B and GPT-3 175B probes at 128 GPUs not at all. It
+also crashes (SIGSEGV) on HPCC, on DCN+ with 4 MB buffers and on all-to-all over DCN+.
+
+**SimAI's own times vary by 10–20%.** The same run, untraced:
+
+| run | traced, earlier | untraced, 3–6 runs at once | untraced, alone (simai-ref / simai-seq) |
+|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 518 s | 616 s | 497 / 510 s |
+| LLaMA 65B probe, 512 GPUs | 3526 s | 3572 s | 3726 / 3290 s |
+
+Tracing costs about 4%; other runs on the machine cost more (up to 46% on the largest). The speedups
+below use SimAI's fastest time of all its runs.
+
+**1. Against sequential SimAI, the exact reference** (42 paper runs):
+
+| runs | speedup |
+|---|---|
+| collectives, 128 / 512 / 1024 GPUs | 8.5–16× / 9.5–26× / 6.8–29× |
+| training, 128 GPUs | 11.7–14.7× |
+| training, 512 / 1024 GPUs | 17.6–23.7× / 17.6–28.8× |
+
+**2. Against SimAI with threads** (`simai-mtp`, Unison, `-t 16` and `-t 32`, best of the two, one run
+at a time). Threads gain 3.2–6.0× on training and 1.8–4.1× on collectives, but the results are not
+sequential SimAI's. Against the sequential build of the same code (unpatched):
+
+| run | SimAI, threads | TwiNS | TwiNS faster | messages differing | iteration time |
+|---|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 153 s | 42.4 s | 3.6× | 75% | +18.0% |
+| LLaMA 65B probe, 128 GPUs | 195 s | 49.9 s | 3.9× | 0.3% | +0.009% |
+| GPT-3 175B probe, 128 GPUs | 623 s | 146 s | 4.3× | 0.15% | +0.004% |
+| GPT-3 13B probe, 512 GPUs | 501 s | 156 s | 3.2× | 93% | +2.2% |
+| LLaMA 65B probe, 512 GPUs | 786 s | 154 s | 5.1× | 1.0% | +4.3% |
+| GPT-3 13B probe, 1024 GPUs | 1102 s | 349 s | 3.2× | 96% | −9.9% |
+| collectives (6, see above) | 7.8–133 s | 1.3–18.9 s | 3.6–7.7× | 0.04–16% | |
+
+So TwiNS, exact, is 3.2–7.7× faster than SimAI at its fastest, which is not exact (iteration times
+off by up to 18%).
+
+**3. Throughput: a whole server of SimAI runs against one GPU.** Runs are independent, so a sweep can
+run many SimAI processes at once, as many as memory allows.
+- The 47 what-if runs (`whatif.md`), simai-ref, all on a87 within 100 GB of container caps: **794 s**
+  from first start to last end; the longest single run (LLaMA probe with HPCC) took 769 s of it.
+- TwiNS, the same 47 runs, all identical to SimAI: 1112 s one at a time with 4 islands, 1179 s on the
+  GPU alone one at a time, 978 s two at a time, 1156 s three at a time, **854 s two at a time with 2
+  islands each**.
+- So on a sweep of small runs (128 GPUs and less), a 32-core server of SimAI matches or beats one
+  consumer GPU (794 against 854 s): SimAI's runs fit side by side, and the batch takes as long as its
+  longest run.
+- On large runs it does not. A run cannot be split, and memory limits how many fit (16–28 GB each at
+  1024 GPUs). The 15 training runs above took a87 9.4 h, the time of its longest run (GPT-3 175B probe
+  at 1024 GPUs, 6.5 h on a quiet machine); TwiNS runs all 15 one after another in 1.4 h.
+
 ## SimAI's event uids wrap after 2^32 events
 
 The GPT-3 13B probe at 1024 GPUs first differed from SimAI.
