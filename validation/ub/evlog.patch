@@ -1,0 +1,41 @@
+diff --git a/src/core/model/default-simulator-impl.cc b/src/core/model/default-simulator-impl.cc
+index c28778c4..243de9f3 100644
+--- a/src/core/model/default-simulator-impl.cc
++++ b/src/core/model/default-simulator-impl.cc
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "default-simulator-impl.h"
++#include <cstdlib>
++#include <iostream>
++static bool twins_evlog = getenv("TWINS_EVLOG") != nullptr;
+ 
+ #include "assert.h"
+ #include "log.h"
+@@ -130,6 +133,8 @@ DefaultSimulatorImpl::ProcessOneEvent()
+     m_currentTs = next.key.m_ts;
+     m_currentContext = next.key.m_context;
+     m_currentUid = next.key.m_uid;
++    if (twins_evlog)
++        std::clog << "@E " << next.key.m_ts << " " << next.key.m_uid << " " << next.key.m_context << "\n";
+     next.impl->Invoke();
+     next.impl->Unref();
+ 
+@@ -226,6 +231,8 @@ DefaultSimulatorImpl::Schedule(const Time& delay, EventImpl* event)
+     m_uid++;
+     m_unscheduledEvents++;
+     m_events->Insert(ev);
++    if (twins_evlog)
++        std::clog << "@S " << m_currentUid << " " << ev.key.m_uid << " " << ev.key.m_ts << " " << ev.key.m_context << "\n";
+     return EventId(event, ev.key.m_ts, ev.key.m_context, ev.key.m_uid);
+ }
+ 
+@@ -245,6 +252,8 @@ DefaultSimulatorImpl::ScheduleWithContext(uint32_t context, const Time& delay, E
+         m_uid++;
+         m_unscheduledEvents++;
+         m_events->Insert(ev);
++        if (twins_evlog)
++            std::clog << "@S " << m_currentUid << " " << ev.key.m_uid << " " << ev.key.m_ts << " " << ev.key.m_context << "\n";
+     }
+     else
+     {
