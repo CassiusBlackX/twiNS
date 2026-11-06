@@ -136,6 +136,7 @@ struct SeqEngine {
     void tg(Node &, int64_t delay, Ev ev) { push(-2, delay, ev); }
     bool in_root_batch = false;
     uint32_t nextRoot = 1;
+    void at_node_twin(int32_t, Ev) {}
     void at_node(int32_t node, int64_t delay, Ev ev)
     {
         if (in_root_batch)
@@ -187,6 +188,17 @@ struct SeqEngine {
         if (ftask)
             fprintf(ftask, "%lld %d %d %c\n", (long long)now_, n.id, t.id, c);
     }
+    // lifecycle control records are applied synchronously in a single-threaded run
+    Model<SeqEngine> *M = nullptr;
+    void lc_peer(int32_t node, int32_t ci, int op)
+    {
+        if (op == 0)
+            M->lc_freeze2(ci);
+        else
+            M->lc_destroy1(ci);
+    }
+    void lc_destroy2(int32_t, int32_t ci) { M->lc_destroy2(ci); }
+    void log_select(Node &, int32_t, int32_t, uint32_t, uint32_t, uint32_t) {}
     void trace_tp_destroy(Node &n, const Tp &t)
     {
         if (ftp)
@@ -255,6 +267,7 @@ int main(int argc, char **argv)
         E.lastKind.assign(w.nnode + 2, 0);
     }
     Model<SeqEngine> M(E, w);
+    E.M = &M;
     TrafficGen<SeqEngine> G(E, w);
     // CheckExampleProcess, scheduled at load (before the tasks), every 100 us until all complete
     E.push(-1, 100000000, Ev{E_CHECK, 0, 0, 0, 0});

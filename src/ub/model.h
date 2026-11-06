@@ -68,6 +68,8 @@ enum EvKind : uint8_t {
     E_START,     // a: task                 UbTrafficGen::StartTask
     E_CLEANUP,   // a: task, b: destroy     UbTrafficGen::ApplyTaskCleanupOnOwner
     E_APPLY,     // a: task (traffic gen)   UbTrafficGen::ApplyTaskCompletion
+    E_LCREQ,     // a: conn                 the destroy request's part on this node (DestroyConnection)
+    E_LCDESTROY2,// a: conn                 the destroy notice to ep2 after ep1 finalized
     E_RECV,      // engine-internal: an arrival
     E_CHECK,     // engine-internal: CheckExampleProcess
     E_STOP,
@@ -623,10 +625,12 @@ template <class E> struct Model {
             int32_t c = best != IQ_NONE ? best : wrap;
             uint32_t cs = best != IQ_NONE ? bs : ws;
             if (c != IQ_NONE) {
+                e.log_select(n, p, vi, start, cs, slots);
                 pt.selectedSlot = cs;
                 pt.rrIdx[pi] = (cs + 1) % slots;
                 return c;
             }
+            e.log_select(n, p, vi, start, ~0u, slots);
         }
         return IQ_NONE;
     }
@@ -897,22 +901,51 @@ template <class E> struct Model {
         t.frozen = 1;
         tp_notify(ti);
     }
+    // ep1 finalized: the owner asks the peer to destroy ep2 (OnEndpointDestroyed ->
+    // RequestDestroyNotice), synchronously in ns-3: on another node, through the engine
     UB_HD void endpoint_destroyed(int32_t ci, int slot)
     {
         if (slot == 1)
-            destroy_endpoint(ci, 2);
+            e.lc_destroy2(w.conn[ci].n2, ci);
     }
-    UB_HD void destroy_connection(int32_t ci)
+    // the parts of DestroyConnectionOwned on one node: the freeze notice to ep2 (n2), the destroy
+    // notice to ep1 (n1); ns-3 applies the freeze first
+    UB_HD void lc_freeze2(int32_t ci)
+    {
+        Conn &c = w.conn[ci];
+        if (c.ep[2] >= 0 && !w.tp[c.ep[2]].dead) {
+            w.tp[c.ep[2]].drainHold = 1;
+            w.tp[c.ep[2]].frozen = 1;
+        }
+    }
+    UB_HD void lc_destroy1(int32_t ci) { destroy_endpoint(ci, 1); }
+    UB_HD void lc_destroy2(int32_t ci) { destroy_endpoint(ci, 2); }
+    // the destroy request at node n: its own parts, in ns-3's order
+    UB_HD void lc_request(Node &n, int32_t ci)
+    {
+        Conn &c = w.conn[ci];
+        if (c.n2 == n.id)
+            lc_freeze2(ci);
+        if (c.n1 == n.id)
+            lc_destroy1(ci);
+    }
+    UB_HD void destroy_connection(Node &n, int32_t ci)
     {
         Conn &c = w.conn[ci];
         if (c.destroyRequested)
             return;
         c.destroyRequested = 1;
-        if (c.ep[2] >= 0 && !w.tp[c.ep[2]].dead) {
-            w.tp[c.ep[2]].drainHold = 1;
-            w.tp[c.ep[2]].frozen = 1;
-        }
-        destroy_endpoint(ci, 1);
+        // the other endpoint's node acts at the same instant: synchronously (seq engine) or as an
+        // event the traffic generator sent with the cleanup (parallel engines)
+        int32_t other = c.n1 == n.id ? c.n2 : c.n1;
+        if (c.n2 == n.id)
+            lc_freeze2(ci);
+        else
+            e.lc_peer(other, ci, 0);   // freeze ep2 on n2, before ep1's destroy
+        if (c.n1 == n.id)
+            lc_destroy1(ci);
+        else
+            e.lc_peer(other, ci, 1);   // destroy ep1 on n1
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1429,13 +1462,15 @@ template <class E> struct Model {
         j.bound = 0;
         tp_notify(j.tp);
         if (destroy)
-            destroy_connection(t.conn);
+            destroy_connection(n, t.conn);
     }
 
     // ------------------------------------------------------------------------------------------
     UB_HD void dispatch(Node &n, const Ev &ev)
     {
         switch (ev.kind) {
+        case E_LCREQ: lc_request(n, ev.a); break;
+        case E_LCDESTROY2: lc_destroy2(ev.a); break;
         case E_TXDONE: tx_done(n, ev.a); break;
         case E_TRIG: port_trigger(n, ev.a); break;
         case E_ALLOC: allocate_next(n, ev.a); break;
@@ -1508,6 +1543,13 @@ template <class E> struct TrafficGen {
         bool destroy = --c.uses == 0;
         Ev ev{E_CLEANUP, ti, destroy ? 1 : 0, 0, 0};
         e.at_node(t.src, 0, ev);
+        if (destroy) {
+            // the other endpoint's node takes its part at the cleanup's instant and place in the
+            // event order (parallel engines; the seq engine applies it inside the cleanup)
+            int32_t other = c.n1 == t.src ? c.n2 : c.n1;
+            Ev lc{E_LCREQ, t.conn, 0, 0, 0};
+            e.at_node_twin(other, lc);
+        }
     }
 };
 
