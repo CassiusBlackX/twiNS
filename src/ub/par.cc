@@ -469,7 +469,7 @@ int main(int argc, char **argv)
                 M.receive(w.node[id], e.ev.a, e.pk);
             else
                 M.dispatch(w.node[id], e.ev);
-            if (w.err)
+            if (w.mut->err)
                 return;
         }
     };
@@ -478,11 +478,11 @@ int main(int argc, char **argv)
         if (stopAt >= 0 && end > stopAt)
             end = stopAt + 1;
         run_node(E.tgq, end);
-        if (w.completed == w.ntask && stopAt < 0) {
+        if (w.mut->completed == w.ntask && stopAt < 0) {
             int64_t last = E.now_;
             stopAt = (last / CHECK + 1) * CHECK;
         }
-        for (int32_t i = 0; i < w.nnode && !w.err; ++i)
+        for (int32_t i = 0; i < w.nnode && !w.mut->err; ++i)
             run_node(i, end);
         // late destroy notices, in their order
         std::sort(E.late.begin(), E.late.end(), [&](const LateMsg &a, const LateMsg &b) {
@@ -497,7 +497,7 @@ int main(int argc, char **argv)
         for (auto &q : E.nq)
             q.sel.clear();
         ++slots;
-        if (w.err || (stopAt >= 0 && end > stopAt))
+        if (w.mut->err || (stopAt >= 0 && end > stopAt))
             break;
         // next slot: skip idle time
         int64_t next = INT64_MAX;
@@ -514,14 +514,14 @@ int main(int argc, char **argv)
     }
     if (E.fport) fclose(E.fport);
     if (E.ftask) fclose(E.ftask);
-    if (w.err) {
-        fprintf(stderr, "twins-ubpar: stopped with error %d\n", w.err);
+    if (w.mut->err) {
+        fprintf(stderr, "twins-ubpar: stopped with error %d\n", w.mut->err);
         return 2;
     }
     fprintf(stderr, "twins-ubpar: %d/%d tasks, %llu events, %llu slots of %lld ps, end %lld ps; late %llu, repaired %llu, "
                     "conflicts %llu; undecided %llu, inexact %llu, tail nodes %llu\n",
-            w.completed, w.ntask, (unsigned long long)E.events, (unsigned long long)slots, (long long)S,
+            w.mut->completed, w.ntask, (unsigned long long)E.events, (unsigned long long)slots, (long long)S,
             (long long)stopAt, (unsigned long long)E.lateMsgs, (unsigned long long)E.repairs,
             (unsigned long long)E.conflicts, E.stat[0], E.stat[1], (unsigned long long)E.tailCnt);
-    return w.completed == w.ntask && E.conflicts == 0 ? 0 : 3;
+    return w.mut->completed == w.ntask && E.conflicts == 0 ? 0 : 3;
 }

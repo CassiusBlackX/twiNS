@@ -15,6 +15,7 @@ namespace ub {
 
 struct HostWorld {
     World w{};
+    WorldMut mut{};
     std::vector<Node> node;
     std::vector<Port> port;
     std::vector<List> voq;
@@ -40,6 +41,7 @@ struct HostWorld {
 
     void fill_world()
     {
+        w.mut = &mut;
         w.node = node.data();
         w.port = port.data();
         w.voq = voq.data();
@@ -126,6 +128,10 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
     // nodes
     H.node.assign(NN, Node{});
     int32_t portOff = 0, voqOff = 0, ingOff = 0;
+    for (int i = 0; i < NN; ++i) {
+        if (C.nodes[i].ports > 64)
+            return "nodes with more than 64 ports are not supported yet";
+    }
     for (int i = 0; i < NN; ++i) {
         Node &n = H.node[i];
         n.id = i;
@@ -308,7 +314,7 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
         std::stable_sort(r.begin(), r.end(), [&](int a, int b) { return H.task[a].id < H.task[b].id; });
         for (size_t i = 0; i < r.size(); ++i)
             H.ready[i] = r[i];
-        H.w.nready = (int32_t)r.size();
+        H.mut.nready = (int32_t)r.size();
     }
     int32_t jOff = 0;
     for (int i = 0; i < NN; ++i) {

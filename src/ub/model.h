@@ -101,6 +101,7 @@ struct Port {
     int32_t txfree[VLN], toReturn[VLN];
     uint32_t rrIdx[VLN];
     int32_t tpcnt[MAXV];  // registered TPs by VL index
+    uint64_t vmask[MAXV]; // bit in: VOQ (this port, VL index, in) is not empty
     int32_t tplist;       // offset in World::tplist: [vlIdx][capacity] TP ids, registration order
 };
 
@@ -209,8 +210,15 @@ struct Params {
     int64_t depDelay;
 };
 
+// the few scalars the model writes (the World itself is read-only: pointers and parameters)
+struct WorldMut {
+    int32_t completed, nready, err, pad;
+    uint64_t drops;
+};
+
 // All state, in flat arrays (host vectors' data or device copies)
 struct World {
+    WorldMut *mut;
     Params P;
     int32_t nnode, ntask, nphase;
     Node *node;
@@ -234,18 +242,14 @@ struct World {
     int32_t *phaseDeps;
     int32_t *taskByJettyOp;     // unused
     int32_t *ready;             // traffic gen ready list (task indices)
-    int32_t nready;
-    int32_t completed;
-    uint64_t drops;
-    int32_t err;                // nonzero: an unsupported situation (see ub_err)
 };
 
 // ----------------------------------------------------------------------------------------------
 // small helpers
 #define UB_FAIL(w, code)                                                                           \
     do {                                                                                           \
-        if (!(w).err)                                                                              \
-            (w).err = (code);                                                                      \
+        if (!(w).mut->err)                                                                         \
+            (w).mut->err = (code);                                                                 \
     } while (0)
 enum : int32_t {
     ERR_POOL_PKT = 1, ERR_POOL_SEG, ERR_POOL_ENT, ERR_POOL_REM, ERR_DROP, ERR_ROUTE, ERR_NOTP,
@@ -369,6 +373,22 @@ UB_HD inline List &voq_of(World &w, Node &n, int32_t out, int32_t vi, int32_t in
     return w.voq[n.voq0 + (out * n.nv + vi) * n.P + in];
 }
 UB_HD inline uint64_t &ingress_of(World &w, Node &n, int32_t in, int32_t vi) { return w.ingress[n.ingress0 + in * n.nv + vi]; }
+UB_HD inline void voq_push(World &w, Node &n, int32_t out, int32_t vi, int32_t in, int32_t k)
+{
+    List &q = voq_of(w, n, out, vi, in);
+    UB_LIST_PUSH(q, w.pkt, k);
+    port_of(w, n, out).vmask[vi] |= 1ull << in;
+}
+// a VOQ by its index: (out, vi, in) from the offset
+UB_HD inline int32_t voq_pop(World &w, Node &n, int32_t q)
+{
+    int32_t k = l_pop(w.voq[q], w.pkt);
+    if (!w.voq[q].n) {
+        int32_t rel = q - n.voq0, in = rel % n.P, vi = rel / n.P % n.nv, out = rel / n.P / n.nv;
+        port_of(w, n, out).vmask[vi] &= ~(1ull << in);
+    }
+    return k;
+}
 
 // ----------------------------------------------------------------------------------------------
 template <class E> struct Model {
@@ -548,8 +568,7 @@ template <class E> struct Model {
             for (int v = 0; v < VLN; ++v)
                 w.pkt[k].credits[v] = cr[v];
             // UbSwitch::SendControlFrame: VOQ[p][0][p], then TriggerTransmit
-            List &q = voq_of(w, n, p, n.vlIdx[0], p);
-            UB_LIST_PUSH(q, w.pkt, k);
+            voq_push(w, n, p, n.vlIdx[0], p, k);
             port_trigger(n, p);
         }
     }
@@ -597,10 +616,9 @@ template <class E> struct Model {
             int32_t best = IQ_NONE, wrap = IQ_NONE;
             uint32_t bs = 0, ws = 0;
             // VOQs (slot = in port), then TPs (slot = P + ordinal)
-            for (int32_t in = 0; in < P0; ++in) {
+            for (uint64_t m = pt.vmask[vi]; m; m &= m - 1) {
+                int32_t in = __builtin_ctzll(m);
                 int32_t q = (int32_t)(&voq_of(w, n, p, vi, in) - w.voq);
-                if (w.voq[q].n == 0)
-                    continue;
                 if (fc_limited(n, pt, q))
                     continue;
                 uint32_t slot = (uint32_t)in;
@@ -638,9 +656,8 @@ template <class E> struct Model {
     {
         Port &pt = port_of(w, n, p);
         for (int vi = 0; vi < n.nv; ++vi) {
-            for (int32_t in = 0; in < n.P; ++in)
-                if (voq_of(w, n, p, vi, in).n)
-                    return true;
+            if (pt.vmask[vi])
+                return true;
             const int32_t *tl = w.tplist + pt.tplist + vi * n.ntp;
             for (int32_t o = 0; o < pt.tpcnt[vi]; ++o)
                 if (tp_has_work(w.tp[tl[o]]))
@@ -670,7 +687,7 @@ template <class E> struct Model {
                     return;
                 }
             } else
-                k = l_pop(w.voq[q], w.pkt);
+                k = voq_pop(w, n, q);
             UB_LIST_PUSH(pt.egress, w.pkt, k);
             pt.egressBytes += w.pkt[k].size;
             fc_on_egress_enqueued(n, pt, q, k);
@@ -776,8 +793,7 @@ template <class E> struct Model {
     }
     UB_HD void voq_enqueue(Node &n, int32_t in, int32_t out, int32_t k)
     {
-        List &q = voq_of(w, n, out, n.vlIdx[w.pkt[k].vl], in);
-        UB_LIST_PUSH(q, w.pkt, k);
+        voq_push(w, n, out, n.vlIdx[w.pkt[k].vl], in, k);
         port_trigger(n, out);
     }
     UB_HD void forward(Node &n, int32_t in, int32_t k)
@@ -791,7 +807,7 @@ template <class E> struct Model {
         }
         uint64_t &ib = ingress_of(w, n, in, vi);
         if (ib + pk.size > w.P.reservePerQueue) {
-            w.drops++;
+            w.mut->drops++;
             UB_FAIL(w, ERR_DROP);
             return;
         }
@@ -1496,7 +1512,7 @@ template <class E> struct TrafficGen {
     UB_HD void schedule_ready()
     {
         // CollectReadyTaskBatchLocked: sorted by task id (the ready list is kept sorted)
-        for (int32_t i = 0; i < w.nready; ++i) {
+        for (int32_t i = 0; i < w.mut->nready; ++i) {
             int32_t ti = w.ready[i];
             TaskG &t = w.task[ti];
             if (t.state != 1)
@@ -1505,11 +1521,11 @@ template <class E> struct TrafficGen {
             Ev ev{E_START, ti, 0, 0, 0};
             e.at_node(t.src, t.delay, ev);
         }
-        w.nready = 0;
+        w.mut->nready = 0;
     }
     UB_HD void ready_insert(int32_t ti)
     {
-        int32_t i = w.nready++;
+        int32_t i = w.mut->nready++;
         while (i > 0 && w.task[w.ready[i - 1]].id > w.task[ti].id) {
             w.ready[i] = w.ready[i - 1];
             --i;
@@ -1522,7 +1538,7 @@ template <class E> struct TrafficGen {
         if (t.state == 3)
             return;
         t.state = 3;
-        w.completed++;
+        w.mut->completed++;
         PhaseG &ph = w.phase[t.phase];
         ph.completed++;
         if (ph.completed >= ph.total && !ph.released) {

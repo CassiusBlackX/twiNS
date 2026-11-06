@@ -275,7 +275,7 @@ int main(int argc, char **argv)
     G.schedule_ready();
     E.in_root_batch = false;
     bool stopped = false;
-    while (!E.q.empty() && !stopped && !w.err) {
+    while (!E.q.empty() && !stopped && !w.mut->err) {
         QEv x = E.q.top();
         E.q.pop();
         E.now_ = x.ts;
@@ -283,7 +283,7 @@ int main(int argc, char **argv)
         if (x.node == -1) {
             if (x.ev.kind == E_STOP)
                 stopped = true;
-            else if (w.completed < w.ntask)
+            else if (w.mut->completed < w.ntask)
                 E.push(-1, 100000000, Ev{E_CHECK, 0, 0, 0, 0});
             else
                 E.push(-1, 0, Ev{E_STOP, 0, 0, 0, 0});
@@ -305,16 +305,16 @@ int main(int argc, char **argv)
     if (E.fport) fclose(E.fport);
     if (E.ftask) fclose(E.ftask);
     if (E.ftp) fclose(E.ftp);
-    if (w.err) {
-        fprintf(stderr, "twins-ubseq: stopped at %lld ps: %s\n", (long long)E.now_, errname(w.err));
+    if (w.mut->err) {
+        fprintf(stderr, "twins-ubseq: stopped at %lld ps: %s\n", (long long)E.now_, errname(w.mut->err));
         return 2;
     }
-    fprintf(stderr, "twins-ubseq: %d/%d tasks, %llu events, end %lld ps, drops %llu\n", w.completed, w.ntask,
-            (unsigned long long)E.events, (long long)E.now_, (unsigned long long)w.drops);
+    fprintf(stderr, "twins-ubseq: %d/%d tasks, %llu events, end %lld ps, drops %llu\n", w.mut->completed, w.ntask,
+            (unsigned long long)E.events, (long long)E.now_, (unsigned long long)w.mut->drops);
     if (chainCheck)
         fprintf(stderr, "twins-ubseq: chains: %llu same-time pairs checked, %llu disagree, %llu undecided, %llu "
                         "inexact, %llu tail nodes\n",
                 (unsigned long long)E.checked, (unsigned long long)E.disagree, E.stat[0], E.stat[1],
                 (unsigned long long)E.tailCnt);
-    return w.completed == w.ntask ? 0 : 3;
+    return w.mut->completed == w.ntask ? 0 : 3;
 }

@@ -35,8 +35,13 @@ struct DEnt {
     Ev ev;
     Pkt pk;
 };
+struct HK {               // a heap entry: the event's time inline, its pool index
+    int64_t ts;
+    int32_t idx, pad;
+};
 struct DQ {               // a node's (or the traffic generator's) event queue
     int32_t heapN, freeN;
+    int32_t fhead, ftail;  // FIFO of this instant's zero-delay events (pool indices)
     uint32_t inHead, inTail;
     int32_t ebase, ecap, ibase, icap;
     uint64_t seqc;
@@ -67,7 +72,8 @@ struct Dev {
     ChainCtx cx;
     DQ *q;
     DEnt *ent;            // event pools
-    int32_t *heap, *efree;
+    HK *heap;
+    int32_t *efree, *fifo;
     DEnt *inbox;
     DSel *sel;
     DLate *late;
@@ -112,120 +118,154 @@ __device__ __forceinline__ bool ent_before(const ChainCtx &x, const DEnt &a, con
     return c < 0;
 }
 
-__device__ void heap_push(DQ &q, const DEnt &e)
+#ifdef UB_NODE_PROF
+__device__ unsigned long long g_sect[8], g_hmax, g_hsum;
+#define SECT_BEGIN long long sc0_ = clock64();
+#define SECT_END(i) atomicAdd(&g_sect[i], (unsigned long long)(clock64() - sc0_));
+#else
+#define SECT_BEGIN
+#define SECT_END(i)
+#endif
+__device__ __forceinline__ int32_t pool_get(const Dev &d, DQ &q)
 {
-    Dev &d = g_d;
     if (q.freeN == 0) {
         UB_ATOMIC_ADD(&d.counters[4], 1ull);
         UB_FAIL(d.w, 100);
-        return;
+        return 0;
     }
-    int32_t i = d.efree[q.ebase + --q.freeN];
+    return d.efree[q.ebase + --q.freeN];
+}
+__device__ __forceinline__ bool hk_before(const Dev &d, const DQ &q, const HK &a, const HK &b)
+{
+    if (a.ts != b.ts)
+        return a.ts < b.ts;
+    return ent_before(d.cx, d.ent[q.ebase + a.idx], d.ent[q.ebase + b.idx]);
+}
+__device__ void heap_insert(const Dev &d, DQ &q, int32_t i)
+{
+    SECT_BEGIN
+    HK *h = d.heap + q.ebase;
+    HK x{d.ent[q.ebase + i].ts, i, 0};
+    int32_t k = q.heapN++;
+#ifdef UB_NODE_PROF
+    atomicMax(&g_hmax, (unsigned long long)q.heapN);
+    atomicAdd(&g_hsum, (unsigned long long)q.heapN);
+#endif
+    while (k > 0) {
+        int32_t p = (k - 1) / 2;
+        if (!hk_before(d, q, x, h[p]))
+            break;
+        h[k] = h[p];
+        k = p;
+    }
+    h[k] = x;
+    SECT_END(0)
+}
+__device__ void heap_push(const Dev &d, DQ &q, const DEnt &e)
+{
+    int32_t i = pool_get(d, q);
     DEnt &slot = d.ent[q.ebase + i];
     slot = e;
     slot.seq = q.seqc++;
-    int32_t *h = d.heap + q.ebase;
-    int32_t k = q.heapN++;
-    h[k] = i;
-    while (k > 0) {
-        int32_t p = (k - 1) / 2;
-        if (!ent_before(d.cx, d.ent[q.ebase + h[k]], d.ent[q.ebase + h[p]]))
-            break;
-        int32_t t = h[k];
-        h[k] = h[p];
-        h[p] = t;
-        k = p;
-    }
+    heap_insert(d, q, i);
 }
-__device__ int32_t heap_pop(DQ &q)
+__device__ int32_t heap_pop(const Dev &d, DQ &q)
 {
-    Dev &d = g_d;
-    int32_t *h = d.heap + q.ebase;
-    int32_t top = h[0];
-    h[0] = h[--q.heapN];
+    SECT_BEGIN
+    HK *h = d.heap + q.ebase;
+    int32_t top = h[0].idx;
+    HK x = h[--q.heapN];
     int32_t k = 0, n = q.heapN;
     for (;;) {
-        int32_t l = 2 * k + 1, r = l + 1, m = k;
-        if (l < n && ent_before(d.cx, d.ent[q.ebase + h[l]], d.ent[q.ebase + h[m]])) m = l;
-        if (r < n && ent_before(d.cx, d.ent[q.ebase + h[r]], d.ent[q.ebase + h[m]])) m = r;
-        if (m == k)
+        int32_t l = 2 * k + 1;
+        if (l >= n)
             break;
-        int32_t t = h[k];
+        int32_t m = l;
+        if (l + 1 < n && hk_before(d, q, h[l + 1], h[l]))
+            m = l + 1;
+        if (!hk_before(d, q, h[m], x))
+            break;
         h[k] = h[m];
-        h[m] = t;
         k = m;
     }
+    if (n)
+        h[k] = x;
+    SECT_END(1)
     return top;
 }
-__device__ void inbox_put(int32_t node, const DEnt &e)
+// a slot in a node's inbox, to fill in place
+__device__ DEnt *inbox_slot(const Dev &d, int32_t node)
 {
-    Dev &d = g_d;
     DQ &q = d.q[node];
     uint32_t pos = atomicAdd(&q.inTail, 1u);
     if (pos - q.inHead >= (uint32_t)q.icap) {
         UB_ATOMIC_ADD(&d.counters[4], 1ull);
         UB_FAIL(d.w, 101);
-        return;
+        return &d.inbox[q.ibase];   // (the run stops)
     }
-    d.inbox[q.ibase + pos % q.icap] = e;
+    return &d.inbox[q.ibase + pos % q.icap];
 }
 
 struct GEngine {
-    Dev &d;
+    const Dev &d;
     World &w;
     int32_t node;
     int64_t now_;
-    Chain cur;
+    const Chain *cur;
     uint64_t ord;
-    Chain lastChild;
+    const Chain *lastChild;
     int64_t lastChildTs;
     GM *M;
-    __device__ GEngine(Dev &dd, int32_t n) : d(dd), w(dd.w), node(n), now_(0), ord(0), lastChildTs(0), M(nullptr) {}
+    __device__ GEngine(const Dev &dd, int32_t n) : d(dd), w(const_cast<World &>(dd.w)), node(n), now_(0), cur(nullptr), ord(0), lastChild(nullptr), lastChildTs(0), M(nullptr) {}
     __device__ int64_t now() const { return now_; }
-    __device__ void child(Chain &out, int64_t delay) { cpush(d.cx, &out, ccode(delay, ord++), cur); }
+    __device__ void child(Chain &out, int64_t delay) { cpush(d.cx, &out, ccode(delay, ord++), *cur); }
     __device__ void sched(Node &n, int64_t delay, Ev ev)
     {
-        DEnt e;
+        DQ &q = d.q[n.id];
+        int32_t i = pool_get(d, q);
+        DEnt &e = d.ent[q.ebase + i];
         e.ts = now_ + delay;
         child(e.c, delay);
         e.ev = ev;
-        heap_push(d.q[n.id], e);
+        e.seq = q.seqc++;
+        if (delay == 0) {
+            // this instant's zero-delay events run after all of its scheduled-earlier ones, in
+            // the order they were scheduled (their uids)
+            d.fifo[q.ebase + (q.ftail++ % q.ecap)] = i;
+        } else
+            heap_insert(d, q, i);
     }
     __device__ void link(Node &n, int32_t p, const Pkt &pk, int64_t delay)
     {
         Port &pt = port_of(w, n, p);
-        DEnt e;
+        DEnt &e = *inbox_slot(d, pt.peerNode);
         e.ts = now_ + delay;
         child(e.c, delay);
         e.ev = Ev{E_RECV, pt.peerPort, 0, 0, 0};
         e.pk = pk;
-        inbox_put(pt.peerNode, e);
     }
     __device__ void tg(Node &, int64_t delay, Ev ev)
     {
-        DEnt e;
+        DEnt &e = *inbox_slot(d, w.nnode);
         e.ts = now_ + delay;
         child(e.c, delay);
         e.ev = ev;
-        inbox_put(w.nnode, e);
     }
     __device__ void at_node(int32_t nd, int64_t delay, Ev ev)
     {
-        DEnt e;
+        DEnt &e = *inbox_slot(d, nd);
         e.ts = now_ + delay;
         child(e.c, delay);
         e.ev = ev;
-        lastChild = e.c;
+        lastChild = &e.c;
         lastChildTs = e.ts;
-        inbox_put(nd, e);
     }
     __device__ void at_node_twin(int32_t nd, Ev ev)
     {
-        DEnt e;
+        DEnt &e = *inbox_slot(d, nd);
         e.ts = lastChildTs;
-        e.c = lastChild;
+        e.c = *lastChild;
         e.ev = ev;
-        inbox_put(nd, e);
     }
     __device__ void lc_peer(int32_t, int32_t, int) {}
     __device__ void lc_destroy2(int32_t nd, int32_t ci)
@@ -238,7 +278,7 @@ struct GEngine {
         }
         d.late[i].node = nd;
         d.late[i].ts = now_;
-        d.late[i].c = cur;
+        d.late[i].c = *cur;
         d.late[i].ev = Ev{E_LCDESTROY2, ci, 0, 0, 0};
     }
     __device__ bool port_has_held_tp(Node &n, int32_t p, int32_t vi)
@@ -261,7 +301,7 @@ struct GEngine {
         }
         DSel &L = d.sel[q.sbase + q.selN++];
         L.ts = now_;
-        L.c = cur;
+        L.c = *cur;
         L.port = p;
         L.vi = vi;
         L.start = start;
@@ -319,45 +359,81 @@ struct GEngine {
 };
 
 // ----------------------------------------------------------------------------------------------
+#ifdef UB_NODE_PROF
+__device__ unsigned long long g_evn2[4096];
+#endif
 __device__ void run_queue(int32_t id, int64_t end)
 {
-    Dev &d = g_d;
+    Dev d = g_d;          // read-only: a private copy keeps the base pointers in registers
     World &w = d.w;
     DQ &q = d.q[id];
     // inbox -> heap
     uint32_t tail = q.inTail;
     for (uint32_t i = q.inHead; i != tail; ++i)
-        heap_push(q, d.inbox[q.ibase + i % q.icap]);
+        heap_push(d, q, d.inbox[q.ibase + i % q.icap]);
     q.inHead = tail;
     GEngine E(d, id);
     GM M(E, w);
     E.M = &M;
     TrafficGen<GEngine> G(E, w);
     uint64_t n = 0;
-    while (q.heapN > 0) {
-        const DEnt &top = d.ent[q.ebase + d.heap[q.ebase]];
-        if (top.ts >= end)
-            break;
-        if (d.stopAt >= 0 && top.ts == d.stopAt && ((top.c.r[0].code >> ORD_BITS) - 1) == 0)
-            break;
-        int32_t i = heap_pop(q);
-        DEnt e = d.ent[q.ebase + i];
-        d.efree[q.ebase + q.freeN++] = i;
+    (void)G;
+    for (;;) {
+        int32_t i;
+        bool fromFifo = false;
+        if (q.fhead != q.ftail) {
+            // the FIFO holds events of the current instant; a heap event of the same instant runs
+            // first if it was scheduled earlier (a lead) or its chain says so (zero-delay events
+            // of other entities, such as task starts and cleanups)
+            int32_t fi = d.fifo[q.ebase + (q.fhead % q.ecap)];
+            const DEnt &fe = d.ent[q.ebase + fi];
+            if (d.stopAt >= 0 && fe.ts == d.stopAt)
+                break;
+            bool heapFirst = false;
+            if (q.heapN > 0 && d.heap[q.ebase].ts == fe.ts) {
+                const DEnt &he = d.ent[q.ebase + d.heap[q.ebase].idx];
+                heapFirst = ((he.c.r[0].code >> ORD_BITS) - 1) > 0 || ent_before(d.cx, he, fe);
+            }
+            if (heapFirst)
+                i = heap_pop(d, q);
+            else {
+                i = fi;
+                q.fhead++;
+                fromFifo = true;
+            }
+        } else {
+            if (q.heapN == 0)
+                break;
+            const DEnt &top = d.ent[q.ebase + d.heap[q.ebase].idx];
+            if (top.ts >= end)
+                break;
+            if (d.stopAt >= 0 && top.ts == d.stopAt && ((top.c.r[0].code >> ORD_BITS) - 1) == 0)
+                break;
+            i = heap_pop(d, q);
+        }
+        (void)fromFifo;
+        DEnt &e = d.ent[q.ebase + i];
         E.now_ = e.ts;
-        E.cur = e.c;
+        E.cur = &e.c;
         E.ord = 0;
         ++n;
+        SECT_BEGIN
         if (id == w.nnode)
             G.apply(e.ev.a);
         else if (e.ev.kind == E_RECV)
             M.receive(w.node[id], e.ev.a, e.pk);
         else
             M.dispatch(w.node[id], e.ev);
-        if (w.err)
+        SECT_END(2)
+        d.efree[q.ebase + q.freeN++] = i;   // the event's slot is reused only after it ran
+        if (w.mut->err)
             break;
     }
     if (n)
         UB_ATOMIC_ADD(&d.counters[0], n);
+#ifdef UB_NODE_PROF
+    if (id < 4096) g_evn2[id] += n;
+#endif
 }
 
 __global__ void tg_slot(int64_t end)
@@ -365,10 +441,21 @@ __global__ void tg_slot(int64_t end)
     if (threadIdx.x == 0)
         run_queue(g_d.w.nnode, end);
 }
+__device__ unsigned long long g_cyc[4096], g_evn[4096];
 __global__ void node_slot(int64_t end)
 {
-    if (threadIdx.x == 0 && (int32_t)blockIdx.x < g_d.w.nnode)
+    if (threadIdx.x == 0 && (int32_t)blockIdx.x < g_d.w.nnode) {
+#ifdef UB_NODE_PROF
+        long long c0 = clock64();
+        unsigned long long e0 = g_d.counters[0];
+#endif
         run_queue(blockIdx.x, end);
+#ifdef UB_NODE_PROF
+        if (blockIdx.x < 4096) {
+            g_cyc[blockIdx.x] += clock64() - c0;
+        }
+#endif
+    }
 }
 
 // the late destroy notices, in event order, with the allocator repair (see par.cc apply_late)
@@ -376,7 +463,7 @@ __global__ void late_slot()
 {
     if (threadIdx.x || blockIdx.x)
         return;
-    Dev &d = g_d;
+    Dev d = g_d;
     World &w = d.w;
     uint32_t nl = *d.lateN;
     if (nl > d.lateCap)
@@ -403,7 +490,7 @@ __global__ void late_slot()
         GM M(E, w);
         E.M = &M;
         E.now_ = m.ts;
-        E.cur = m.c;
+        E.cur = &m.c;
         E.ord = 0;
         int32_t ci = m.ev.a;
         int32_t ti = w.conn[ci].ep[2];
@@ -495,14 +582,19 @@ __global__ void late_slot()
 // the earliest pending event (heap tops and inboxes)
 __global__ void next_slot(unsigned long long *out)
 {
-    Dev &d = g_d;
+    const Dev &d = g_d;
     int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= d.nq)
         return;
     DQ &q = d.q[i];
     int64_t m = INT64_MAX;
     if (q.heapN)
-        m = d.ent[q.ebase + d.heap[q.ebase]].ts;
+        m = d.heap[q.ebase].ts;
+    if (q.fhead != q.ftail) {
+        int64_t t = d.ent[q.ebase + d.fifo[q.ebase + (q.fhead % q.ecap)]].ts;
+        if (t < m)
+            m = t;
+    }
     for (uint32_t k = q.inHead; k != q.inTail; ++k) {
         int64_t t = d.inbox[q.ibase + k % q.icap].ts;
         if (t < m)
@@ -601,7 +693,7 @@ int main(int argc, char **argv)
     std::vector<DEnt> inbox(ioff);
     {
         int32_t nroot = 0;
-        for (int32_t k = 0; k < hw.nready; ++k) {
+        for (int32_t k = 0; k < H.mut.nready; ++k) {
             int32_t ti = H.ready[k];
             TaskG &t = H.task[ti];
             if (t.state != 1)
@@ -625,7 +717,7 @@ int main(int argc, char **argv)
             }
             inbox[qq.ibase + qq.inTail++ % qq.icap] = e;
         }
-        hw.nready = 0;
+        H.mut.nready = 0;
     }
     // device copies
     Dev d{};
@@ -649,6 +741,7 @@ int main(int argc, char **argv)
     d.w.phase = dcopy(H.phase);
     d.w.phaseDeps = dcopy(H.phaseDeps);
     d.w.ready = dcopy(H.ready);
+    d.w.mut = dcopy(std::vector<WorldMut>{H.mut});
     d.rtOff = dcopy(H.rtOff);
     d.rtCnt = dcopy(H.rtCnt);
     d.rtPorts = dcopy(H.rtPorts);
@@ -668,12 +761,13 @@ int main(int argc, char **argv)
     d.cx.walk = dalloc<unsigned long long>(WALKN);
     CK(cudaMemset(d.cx.walk, 0, 8 * WALKN));
     d.cx.walkMask = WALKN - 1;
-    d.cx.stat = dalloc<unsigned long long>(4);
-    CK(cudaMemset(d.cx.stat, 0, 32));
+    d.cx.stat = dalloc<unsigned long long>(8);
+    CK(cudaMemset(d.cx.stat, 0, 64));
     // queues
     d.q = dcopy(q);
     d.ent = dalloc<DEnt>(eoff);
-    d.heap = dalloc<int32_t>(eoff);
+    d.heap = dalloc<HK>(eoff);
+    d.fifo = dalloc<int32_t>(eoff);
     d.efree = dcopy(efree);
     d.inbox = dcopy(inbox);
     d.sel = dalloc<DSel>(soff);
@@ -701,16 +795,26 @@ int main(int argc, char **argv)
     int64_t slotStart = 0, stopAt = -1;
     uint64_t slots = 0;
     int32_t completed = 0, errc = 0;
-    size_t offCompleted = offsetof(Dev, w) + offsetof(World, completed);
-    size_t offErr = offsetof(Dev, w) + offsetof(World, err);
+    WorldMut *dmut = d.w.mut;
     size_t offStop = offsetof(Dev, stopAt);
     int64_t lastApply = 0;
+    bool prof = getenv("UB_PROF") != nullptr;
+    double pt[5] = {};
+    auto tick = [&](int k, std::chrono::steady_clock::time_point &tp) {
+        if (!prof) return;
+        CK(cudaDeviceSynchronize());
+        auto t = std::chrono::steady_clock::now();
+        pt[k] += std::chrono::duration<double>(t - tp).count();
+        tp = t;
+    };
     for (;;) {
+        auto tp = std::chrono::steady_clock::now();
         int64_t end = slotStart + S;
         if (stopAt >= 0 && end > stopAt)
             end = stopAt + 1;
         tg_slot<<<1, 32>>>(end);
-        CK(hipMemcpyFromSymbol(&completed, HIP_SYMBOL(g_d), 4, offCompleted));
+        tick(0, tp);
+        CK(cudaMemcpy(&completed, &dmut->completed, 4, cudaMemcpyDeviceToHost));
         if (completed == hw.ntask && stopAt < 0) {
             // the last completion became visible in this slot
             lastApply = end - 1;
@@ -718,15 +822,18 @@ int main(int argc, char **argv)
             CK(hipMemcpyToSymbol(HIP_SYMBOL(g_d), &stopAt, 8, offStop));
         }
         node_slot<<<NN, 32>>>(end);
+        tick(1, tp);
         late_slot<<<1, 1>>>();
+        tick(2, tp);
         ++slots;
-        CK(hipMemcpyFromSymbol(&errc, HIP_SYMBOL(g_d), 4, offErr));
+        CK(cudaMemcpy(&errc, &dmut->err, 4, cudaMemcpyDeviceToHost));
         if (errc || (stopAt >= 0 && end > stopAt))
             break;
         unsigned long long nx = ~0ull;
         CK(cudaMemcpy(dnext, &nx, 8, cudaMemcpyHostToDevice));
         next_slot<<<(NQ + 127) / 128, 128>>>(dnext);
         CK(cudaMemcpy(&nx, dnext, 8, cudaMemcpyDeviceToHost));
+        tick(3, tp);
         int64_t next = (int64_t)nx;
         if (nx == ~0ull || next == INT64_MAX) {
             if (stopAt < 0)
@@ -737,13 +844,35 @@ int main(int argc, char **argv)
     }
     CK(cudaDeviceSynchronize());
     auto t2 = std::chrono::steady_clock::now();
-    unsigned long long cnt[8], st[4], tailCnt, trN;
+    if (prof)
+        fprintf(stderr, "twins-ub: prof tg %.3f node %.3f late %.3f next %.3f s\n", pt[0], pt[1], pt[2], pt[3]);
+#ifdef UB_NODE_PROF
+    {
+        std::vector<unsigned long long> cyc(4096);
+        CK(hipMemcpyFromSymbol(cyc.data(), HIP_SYMBOL(g_cyc), 8 * 4096));
+        unsigned long long mx = 0, sum = 0; int arg = 0;
+        for (int i = 0; i < NN && i < 4096; ++i) { sum += cyc[i]; if (cyc[i] > mx) mx = cyc[i], arg = i; }
+        std::vector<unsigned long long> ev(4096);
+        CK(hipMemcpyFromSymbol(ev.data(), HIP_SYMBOL(g_evn2), 8 * 4096));
+        unsigned long long sc[8];
+        CK(hipMemcpyFromSymbol(sc, HIP_SYMBOL(g_sect), 64));
+        unsigned long long hmax, hsum;
+        CK(hipMemcpyFromSymbol(&hmax, HIP_SYMBOL(g_hmax), 8));
+        CK(hipMemcpyFromSymbol(&hsum, HIP_SYMBOL(g_hsum), 8));
+        fprintf(stderr, "twins-ub: heap max %llu, mean at insert %.1f\n", hmax, (double)hsum / 144843.0);
+        fprintf(stderr, "twins-ub: sections: heap_push %llu, heap_pop %llu, dispatch(incl. pushes) %llu\n", sc[0], sc[1], sc[2]);
+        fprintf(stderr, "twins-ub: node cycles: max %llu (node %d, %s, %llu events, %.0f cycles/event), sum %llu, nodes %d\n", mx, arg, H.node[arg].sw ? "switch" : "host", ev[arg], (double)mx / std::max(1ull, ev[arg]), sum, NN);
+        for (int i = 0; i < NN && i < 4096; i += NN / 8 + 1) fprintf(stderr, "   node %d: %llu cycles, %llu events, %.0f c/e\n", i, cyc[i], ev[i], (double)cyc[i] / std::max(1ull, ev[i]));
+    }
+#endif
+    unsigned long long cnt[8], st[8], tailCnt, trN;
     CK(cudaMemcpy(cnt, d.counters, 64, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(st, d.cx.stat, 32, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(st, d.cx.stat, 64, cudaMemcpyDeviceToHost));
+    if (prof) fprintf(stderr, "twins-ub: ccmp %llu, walks %llu, walk steps %llu\n", st[4], st[2], st[3]);
     CK(cudaMemcpy(&tailCnt, d.cx.cnt, 8, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&trN, d.trN, 8, cudaMemcpyDeviceToHost));
-    World fw;
-    CK(hipMemcpyFromSymbol(&fw, HIP_SYMBOL(g_d), sizeof(World), offsetof(Dev, w)));
+    WorldMut fm;
+    CK(cudaMemcpy(&fm, dmut, sizeof fm, cudaMemcpyDeviceToHost));
     if (trace) {
         if (trN > d.trCap) {
             fprintf(stderr, "twins-ub: trace buffer overflow (%llu records)\n", trN);
@@ -765,13 +894,13 @@ int main(int argc, char **argv)
         fclose(ft);
     }
     double tset = std::chrono::duration<double>(t1 - t0).count(), trun = std::chrono::duration<double>(t2 - t1).count();
-    if (fw.err) {
-        fprintf(stderr, "twins-ub: stopped with error %d\n", fw.err);
+    if (fm.err) {
+        fprintf(stderr, "twins-ub: stopped with error %d\n", fm.err);
         return 2;
     }
     fprintf(stderr, "twins-ub: %d/%d tasks, %llu events, %llu slots of %lld ps, end %lld ps; late %llu, repaired %llu, "
                     "conflicts %llu, overflow %llu; undecided %llu, inexact %llu, tail nodes %llu; set-up %.2f s, run %.3f s\n",
-            fw.completed, fw.ntask, cnt[0], (unsigned long long)slots, (long long)S, (long long)stopAt, cnt[1], cnt[2],
+            fm.completed, hw.ntask, cnt[0], (unsigned long long)slots, (long long)S, (long long)stopAt, cnt[1], cnt[2],
             cnt[3], cnt[4], st[0], st[1], tailCnt, tset, trun);
-    return fw.completed == fw.ntask && cnt[3] == 0 && st[0] == 0 ? 0 : 3;
+    return fm.completed == hw.ntask && cnt[3] == 0 && st[0] == 0 ? 0 : 3;
 }

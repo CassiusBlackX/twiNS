@@ -57,7 +57,7 @@ struct ChainCtx {
     uint64_t memoMask;
     unsigned long long *walk;
     uint64_t walkMask;
-    unsigned long long *stat; // [0] undecided ties, [1] inexact (lost tail), [2] ordinal overflow
+    unsigned long long *stat; // [0] undecided ties, [1] inexact (lost tail); UB_CHAIN_PROF: [2] walks [3] walk steps [4] ccmp calls
 };
 
 UB_HD inline uint64_t ccode(int64_t lead, uint64_t ord)
@@ -93,13 +93,17 @@ inline unsigned long long ub_cas_host(unsigned long long *p, unsigned long long 
 #endif
 
 // the chain of an event scheduled with code by the event whose chain is par
-UB_HD inline void cpush(const ChainCtx &x, Chain *dst, uint64_t code, const Chain &par)
+// (dst must not alias par)
+UB_HD inline void cpush(const ChainCtx &x, Chain *__restrict__ dst, uint64_t code, const Chain &__restrict__ par)
 {
-    Chain c;
+    Chain &c = *dst;
     if (par.r[0].code == code) {
-        c = par;
+        for (int i = 0; i < RUNS; i++)
+            c.r[i] = par.r[i];
         c.r[0].cnt++;
-        c.hash = chash(par.hash, code);
+        c.root = par.root;
+        c.tail = par.tail;
+        c.pad = 0;
     } else {
         c.r[0].code = code;
         c.r[0].cnt = 1;
@@ -107,7 +111,6 @@ UB_HD inline void cpush(const ChainCtx &x, Chain *dst, uint64_t code, const Chai
             c.r[i] = par.r[i - 1];
         c.root = par.root;
         c.tail = par.tail;
-        c.hash = chash(par.hash, code);
         c.pad = 0;
         if (par.r[RUNS - 1].code) {
             uint64_t pos = UB_ATOMIC_ADD(x.cnt, 1ull) + 1;
@@ -119,10 +122,10 @@ UB_HD inline void cpush(const ChainCtx &x, Chain *dst, uint64_t code, const Chai
             c.tail = pos;
         }
     }
+    c.hash = chash(par.hash, code);
     c.anc[0] = par.hash;
     for (int i = 1; i < NANC; i++)
         c.anc[i] = par.anc[i - 1];
-    *dst = c;
 }
 
 UB_HD inline void chain_root(Chain *c, uint32_t root)
@@ -229,7 +232,13 @@ UB_HD inline int ccmp_walk(const ChainCtx &x, const Chain &a, const Chain &b, bo
     B.init(x, b);
     uint64_t seen[WALK_KEEP];
     int nseen = 0;
+#ifdef UB_CHAIN_PROF
+    UB_ATOMIC_ADD(&x.stat[2], 1ull);
+#endif
     for (;;) {
+#ifdef UB_CHAIN_PROF
+        UB_ATOMIC_ADD(&x.stat[3], 1ull);
+#endif
         uint64_t ca = A.code, cb = B.code;
         if (ca == 0 || cb == 0) {
             *inexact = (ca == 0 && A.lost) || (cb == 0 && B.lost);
@@ -279,8 +288,55 @@ UB_HD inline int ccmp_walk(const ChainCtx &x, const Chain &a, const Chain &b, bo
     }
 }
 
+// the order decided by the inline runs alone: the first differing lead, or a chain that ends
+// within its inline runs (no tail); 2 if the inline runs do not decide
+UB_HD inline int ccmp_inline(const Chain &a, const Chain &b)
+{
+    int ia = 0, ib = 0;
+    uint64_t ra = a.r[0].cnt, rb = b.r[0].cnt;
+    for (;;) {
+        uint64_t ca = ia < RUNS ? a.r[ia].code : 0, cb = ib < RUNS ? b.r[ib].code : 0;
+        bool ea = ca == 0, eb = cb == 0;
+        if (ea || eb) {
+            // an end: decided only if that chain truly ends here (no tail behind its runs)
+            bool enda = ea && (ia < RUNS ? true : a.tail == 0) && (ia < RUNS || a.tail == 0);
+            bool endb = eb && (ib < RUNS ? true : b.tail == 0) && (ib < RUNS || b.tail == 0);
+            if (ea && ia >= RUNS && a.tail)
+                return 2;
+            if (eb && ib >= RUNS && b.tail)
+                return 2;
+            if (enda && endb)
+                return 2;   // both end: roots and ordinals decide (the full comparison)
+            return enda ? -1 : 1;
+        }
+        if (ca >> ORD_BITS != cb >> ORD_BITS)
+            return ca > cb ? -1 : 1;
+        uint64_t m = ra < rb ? ra : rb;
+        ra -= m;
+        rb -= m;
+        if (ra == 0) {
+            ++ia;
+            ra = ia < RUNS ? a.r[ia].cnt : 0;
+        }
+        if (rb == 0) {
+            ++ib;
+            rb = ib < RUNS ? b.r[ib].cnt : 0;
+        }
+    }
+}
+
 UB_HD inline int ccmp(const ChainCtx &x, const Chain &a, const Chain &b, bool *inexact)
 {
+    {
+        int r = ccmp_inline(a, b);
+        if (r != 2) {
+            *inexact = false;
+            return r;
+        }
+    }
+#ifdef UB_CHAIN_PROF
+    UB_ATOMIC_ADD(&x.stat[4], 1ull);
+#endif
     uint64_t ha[NANC + 1], hb[NANC + 1];
     ha[0] = a.hash;
     hb[0] = b.hash;
