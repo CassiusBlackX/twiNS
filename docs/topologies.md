@@ -11,7 +11,8 @@ and 8192 hosts. `workloads/gen_topo_eval.sh` makes every topology and workload b
   32 of 32 RDMA runs (DCQCN, and HPCC where its INT fits) identical per flow, on the same 12.
 - **Faster everywhere.** At 512–1,056 hosts, TwiNS (RX 9060 XT) against ns-3 on one core: 301–790×
   on the all-to-all workloads, 5–10× on the 160-flow incasts; against Unison on 32 threads: 14–71×
-  and 6–17×. At about 128 hosts: 41–158× and 5–7× against ns-3.
+  and 6–17×. At about 128 hosts: 41–158× and 5–7× against ns-3. At about 8192 hosts, against
+  Unison: 102–129× on all-to-all workloads (event loops), and Unison needs over 60 GB on two of them.
   twins-rdma against the HPCC fork on one core: 28–314×.
 - **What each simulator can run.**
   - GeDES builds only FatTrees (`topology.cc`: the other branch is empty), so it is not in these tables.
@@ -77,7 +78,7 @@ sequential runs 8 at a time, the Unison ones alone. a87 was shared with another 
 | HyperX 4x4, 8 hosts a switch | 128 | incast16 | dctcp | 160 | 0.7 | — | 0.124 | 6× | — |
 | HyperX 4x4, 8 hosts a switch | 128 | incast16 | newreno | 160 | 0.7 | — | 0.148 | 5× | — |
 | HyperX 4x4, 8 hosts a switch | 128 | hdp30 | dctcp | 3910 | 35.1 | — | 0.541 | 65× | — |
-| HyperX 4x4, 8 hosts a switch | 128 | hdp30 | newreno | 3910 | 53.6 | — | 0.606 | 88× | — |
+| HyperX 4x4, 8 hosts a switch | 128 | hdp30 | newreno | 3910 | 53.6 | — | 0.714 | 75× | — |
 | Xpander, d=4, lift 8, 3 hosts a switch | 120 | a2a30 | dctcp | 259 | 26.4 | — | 0.588 | 45× | — |
 | Xpander, d=4, lift 8, 3 hosts a switch | 120 | a2a30 | newreno | 259 | 47.1 | — | 0.677 | 70× | — |
 | Xpander, d=4, lift 8, 3 hosts a switch | 120 | incast16 | dctcp | 160 | 0.8 | — | 0.131 | 6× | — |
@@ -132,7 +133,26 @@ sequential runs 8 at a time, the Unison ones alone. a87 was shared with another 
 | Xpander, d=8, lift 28, 4 hosts a switch | 1008 | incast16 | newreno | 160 | 0.8 | 2.2 | 0.154 | 5× | 14× |
 | Xpander, d=8, lift 28, 4 hosts a switch | 1008 | hdp30 | dctcp | 30551 | 345.8 | 19.2 | 0.632 | 547× | 30× |
 | Xpander, d=8, lift 28, 4 hosts a switch | 1008 | hdp30 | newreno | 30551 | — | 48.2 | 0.916 | — | 53× |
+| Jellyfish, 2048 switches, 12 network ports | 8192 | a2a30 | dctcp | 17914 | — | 179.4 | 1.715 | — | 105× |
+| Jellyfish, 2048 switches, 12 network ports | 8192 | hdp30 | dctcp | 247557 | — | 166.9 | 1.450 | — | 115× |
+| 2-D torus 32x32, 8 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | 566.5 | 4.489 | — | 126× |
+| 2-D torus 32x32, 8 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | 723.5 | 5.588 | — | 129× |
+| 3-D torus 16x16x16, 2 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | over 60 GB | 2.918 | — | — |
+| 3-D torus 16x16x16, 2 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | over 60 GB | 2.832 | — | — |
+| Dragonfly a=16 g=65 h=8 p=8 | 8320 | a2a30 | dctcp | 18170 | — | 203.6 | 1.787 | — | 114× |
+| Dragonfly a=16 g=65 h=8 p=8 | 8320 | hdp30 | dctcp | 251925 | — | 162.5 | 1.414 | — | 115× |
+| HyperX 4x4x8x8, 8 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | 222.9 | 1.749 | — | 127× |
+| HyperX 4x4x8x8, 8 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | 170.2 | 1.422 | — | 120× |
 | HyperX 4x4x8x8, 8 hosts a switch | 8192 | incast16 | dctcp | 160 | — | 19.2 | 0.165 | — | 117× |
+| Xpander, d=16, lift 120, 4 hosts a switch | 8160 | a2a30 | dctcp | 17862 | — | 176.4 | 1.725 | — | 102× |
+| Xpander, d=16, lift 120, 4 hosts a switch | 8160 | hdp30 | dctcp | 245928 | — | over 60 GB | 1.374 | — | — |
+
+At about 8192 hosts there is no sequential ns-3 (set-up alone takes about an hour), so these runs are
+not checked against it; Unison, deterministic but not equal to sequential ns-3 per flow, gives speed
+only. Its times are its event loop on 32 threads; before it, ns-3's set-up (topology and global routing
+tables) runs on one thread for 1–6 hours and is not counted, as TwiNS's set-up is not. Unison ran out
+of a 60 GB cap on the 3-D torus and on Xpander with hdp30 (its peak was already 62.8 GB, in set-up or
+early in the run). Those rows will be filled from runs with a 93 GiB cap.
 
 ## RDMA: exactness and speed
 
