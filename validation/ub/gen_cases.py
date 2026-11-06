@@ -59,6 +59,19 @@ def rand_traffic(out, hosts, flows=64, size="65536", seed=1, start="10ns", op="U
             f.write(f"{i},{s},{d},{sz},{op},{pri},{start},0,\n")
 
 
+def incast_traffic(out, hosts, flows=64, size="65536", seed=1, start="10ns", dsts=4, op="URMA_WRITE", pri=7, **_):
+    rnd = random.Random(int(seed))
+    D = rnd.sample(range(hosts), int(dsts))
+    with open(os.path.join(out, "traffic.csv"), "w") as f:
+        f.write("taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases\n")
+        for i in range(int(flows)):
+            d = D[i % len(D)]
+            s = rnd.randrange(hosts - 1)
+            s += s >= d
+            sz = int(size) if not str(size).startswith("r") else rnd.randrange(1, int(size[1:]))
+            f.write(f"{i},{s},{d},{sz},{op},{pri},{start},0,\n")
+
+
 def main():
     out, name, kind = sys.argv[1], sys.argv[2], sys.argv[3]
     kv = dict(a.split("=", 1) for a in sys.argv[4:] if not a.startswith("set:"))
@@ -69,7 +82,9 @@ def main():
     hosts = {"clos": clos}[kind](d, **kv)
     tr = kv.get("traffic", "rand")
     if tr == "rand":
-        rand_traffic(d, hosts, **kv)
+        rand_traffic(d, hosts, **{k: v for k, v in kv.items() if k != "hosts"})
+    elif tr == "incast":
+        incast_traffic(d, hosts, **{k: v for k, v in kv.items() if k != "hosts"})
     else:
         args = [sys.executable, os.path.join(TOOLS, "ub_tools.py"), "traffic", tr, "--host-count", str(hosts),
                 "--data-size", kv.get("size", "64KB"), "--algorithm", kv.get("algo", "pairwise"),
