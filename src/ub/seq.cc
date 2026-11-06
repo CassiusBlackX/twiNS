@@ -160,17 +160,7 @@ struct SeqEngine {
     }
     int32_t route_candidates(Node &n, uint32_t dip, int32_t inPort, int32_t *cand)
     {
-        int32_t dn = ip_node(dip);
-        uint32_t last = dip & 0xff;
-        int32_t dp = last ? (int32_t)last - 1 : 0;
-        size_t key = ((size_t)n.id * w.nnode + dn) * HostWorld::MAXHP + dp;
-        int32_t c = 0;
-        for (int32_t i = 0; i < H.rtCnt[key]; ++i) {
-            int32_t p = H.rtPorts[H.rtOff[key] + i];
-            if (p != inPort)
-                cand[c++] = p;
-        }
-        return c;
+        return ub_route(w, n.id, dip, inPort, cand);
     }
     void trace_tx(Node &n, int32_t p, const Pkt &pk)
     {

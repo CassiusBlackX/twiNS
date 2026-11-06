@@ -324,17 +324,7 @@ struct GEngine {
     }
     __device__ int32_t route_candidates(Node &n, uint32_t dip, int32_t inPort, int32_t *cand)
     {
-        int32_t dn = ip_node(dip);
-        uint32_t lastb = dip & 0xff;
-        int32_t dp = lastb ? (int32_t)lastb - 1 : 0;
-        size_t key = ((size_t)n.id * w.nnode + dn) * HostWorld::MAXHP + dp;
-        int32_t c = 0;
-        for (int32_t i = 0; i < d.rtCnt[key]; ++i) {
-            int32_t p = d.rtPorts[d.rtOff[key] + i];
-            if (p != inPort)
-                cand[c++] = p;
-        }
-        return c;
+        return ub_route(w, n.id, dip, inPort, cand);
     }
     __device__ void trace(uint8_t kind, int32_t nd, int32_t a, uint32_t size)
     {
@@ -742,9 +732,11 @@ int main(int argc, char **argv)
     d.w.phaseDeps = dcopy(H.phaseDeps);
     d.w.ready = dcopy(H.ready);
     d.w.mut = dcopy(std::vector<WorldMut>{H.mut});
-    d.rtOff = dcopy(H.rtOff);
-    d.rtCnt = dcopy(H.rtCnt);
-    d.rtPorts = dcopy(H.rtPorts);
+    d.w.hostPort0 = dcopy(H.hostPort0);
+    d.w.rtList = dcopy(H.rtList);
+    d.w.rlOff = dcopy(H.rlOff);
+    d.w.rlCnt = dcopy(H.rlCnt);
+    d.w.rlPorts = dcopy(H.rlPorts);
     // chains
     const uint64_t TAILN = 1ull << 24, MEMON = 1ull << 22, WALKN = 1ull << 20;
     d.cx.tail = dalloc<TailNode>(TAILN);

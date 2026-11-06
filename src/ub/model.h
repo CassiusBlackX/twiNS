@@ -242,7 +242,32 @@ struct World {
     int32_t *phaseDeps;
     int32_t *taskByJettyOp;     // unused
     int32_t *ready;             // traffic gen ready list (task indices)
+    // routes: key = node * hostPorts + hostPort0[dst] + dstPort -> a shared candidate list
+    int64_t hostPorts;
+    int32_t *hostPort0;         // by node: first host-port index (-1: a switch)
+    int32_t *rtList;            // by key: list id (-1: none)
+    int32_t *rlOff, *rlCnt, *rlPorts;
 };
+
+// the shortest-path candidates toward (dst node, dst port), without the ingress port
+UB_HD inline int32_t ub_route(const World &w, int32_t node, uint32_t dip, int32_t inPort, int32_t *cand)
+{
+    int32_t dn = ((int32_t)(((dip - 0x0a000000u) & 0x00ff0000u) >> 16)) * 256 + (int32_t)(((dip - 0x0a000000u) & 0xff00u) >> 8);
+    uint32_t lastb = dip & 0xff;
+    int32_t dp = lastb ? (int32_t)lastb - 1 : 0;
+    if (dn < 0 || dn >= w.nnode || w.hostPort0[dn] < 0)
+        return 0;
+    int32_t l = w.rtList[(int64_t)node * w.hostPorts + w.hostPort0[dn] + dp];
+    if (l < 0)
+        return 0;
+    int32_t c = 0;
+    for (int32_t i = 0; i < w.rlCnt[l]; ++i) {
+        int32_t p = w.rlPorts[w.rlOff[l] + i];
+        if (p != inPort)
+            cand[c++] = p;
+    }
+    return c;
+}
 
 // ----------------------------------------------------------------------------------------------
 // small helpers

@@ -34,9 +34,8 @@ struct HostWorld {
     std::vector<TaskG> task;
     std::vector<PhaseG> phase;
     std::vector<int32_t> phaseDeps, ready;
-    // routes: (node * nnode + dst) * MAXHP + dstPort -> candidates (shortest, sorted)
-    static constexpr int MAXHP = 8;
-    std::vector<int32_t> rtOff, rtCnt, rtPorts;
+    // routes (see World::rtList)
+    std::vector<int32_t> hostPort0, rtList, rlOff, rlCnt, rlPorts;
     std::vector<int32_t> rootTasks;   // tasks ready at load, in task id order
 
     void fill_world()
@@ -61,6 +60,11 @@ struct HostWorld {
         w.phase = phase.data();
         w.phaseDeps = phaseDeps.data();
         w.ready = ready.data();
+        w.hostPort0 = hostPort0.data();
+        w.rtList = rtList.data();
+        w.rlOff = rlOff.data();
+        w.rlCnt = rlCnt.data();
+        w.rlPorts = rlPorts.data();
         w.nnode = (int32_t)node.size();
         w.ntask = (int32_t)task.size();
         w.nphase = (int32_t)phase.size();
@@ -345,7 +349,7 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
     std::vector<int32_t> psz(NN), ssz(NN), esz(NN);
     for (int i = 0; i < NN; ++i) {
         Node &n = H.node[i];
-        double cap = n.sw ? n.P * 7000.0 : 8192.0 + n.ntp * 1100.0;
+        double cap = n.sw ? n.P * 1600.0 : 4096.0 + n.ntp * 300.0;   // --pool scales (a run stops if exhausted)
         psz[i] = (int32_t)(cap * poolScale);
         ssz[i] = (int32_t)((64 + n.ntp * 80 + n.njetty * 4) * poolScale);
         esz[i] = (int32_t)((64 + n.ntp * 4 + n.njetty * 2) * poolScale);
@@ -353,14 +357,34 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
     mkpool(H.pkt, psz, [](Node &n, int32_t h) { n.pktFree = h; });
     mkpool(H.seg, ssz, [](Node &n, int32_t h) { n.segFree = h; });
     mkpool(H.ent, esz, [](Node &n, int32_t h) { n.entFree = h; });
-    // routes (UbUtils::AddRoutingTable + TryGetIndexedCandidatesWithPrimaryFallback; shortest only)
-    H.rtOff.assign((size_t)NN * NN * HostWorld::MAXHP, -1);
-    H.rtCnt.assign((size_t)NN * NN * HostWorld::MAXHP, 0);
+    // routes (UbUtils::AddRoutingTable + TryGetIndexedCandidatesWithPrimaryFallback; shortest only),
+    // one shared list per distinct port set
+    H.hostPort0.assign(NN, -1);
+    int64_t HP = 0;
+    for (int b = 0; b < NN; ++b)
+        if (!H.node[b].sw) {
+            H.hostPort0[b] = (int32_t)HP;
+            HP += H.node[b].P;
+        }
+    H.w.hostPorts = HP;
+    H.rtList.assign((size_t)NN * HP, -1);
+    std::map<std::vector<uint16_t>, int32_t> lists;
+    auto intern = [&](const std::vector<uint16_t> &v) {
+        auto it = lists.find(v);
+        if (it != lists.end())
+            return it->second;
+        int32_t id = (int32_t)H.rlOff.size();
+        H.rlOff.push_back((int32_t)H.rlPorts.size());
+        H.rlCnt.push_back((int32_t)v.size());
+        for (auto p : v) H.rlPorts.push_back(p);
+        lists.emplace(v, id);
+        return id;
+    };
     for (int a = 0; a < NN; ++a)
         for (int b = 0; b < NN; ++b) {
             if (H.node[b].sw)
                 continue;
-            for (int dp = 0; dp < H.node[b].P && dp < HostWorld::MAXHP; ++dp) {
+            for (int dp = 0; dp < H.node[b].P; ++dp) {
                 std::vector<uint16_t> sh, ot;
                 bool foundExact = false;
                 auto it = C.exact.find({a, b, dp});
@@ -376,12 +400,15 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
                         if (ot.empty()) ot = jt->second.other;
                     }
                 }
-                size_t key = ((size_t)a * NN + b) * HostWorld::MAXHP + dp;
-                H.rtOff[key] = (int32_t)H.rtPorts.size();
-                H.rtCnt[key] = (int32_t)sh.size();
-                for (auto p : sh) H.rtPorts.push_back(p);
+                if (!sh.empty())
+                    H.rtList[(size_t)a * HP + H.hostPort0[b] + dp] = intern(sh);
             }
         }
+    {
+        // the case's route maps are no longer needed
+        decltype(C.exact)().swap(C.exact);
+        decltype(C.primary)().swap(C.primary);
+    }
     H.w.P = P;
     H.fill_world();
     return "";

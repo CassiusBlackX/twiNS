@@ -107,6 +107,27 @@ matches the sequential run.
   on separate lanes with LDS-resident state; or CPU threads for the heavy nodes and the GPU only
   for very wide, light work.
 
+### 512 hosts (2026-11-07)
+
+Case c512_ga: 2-layer Clos with 16 leaves × 32 hosts and 32 spines at 400 Gbps; grouped all-to-all
+(64 per group, 2 MB per rank), 32 256 tasks, 11 M events. Identical to ns-3-ub: 3.53 M port events
+and every task line.
+
+| engine (9950X unless noted) | run time |
+|---|---|
+| ns-3-ub, 1 thread | 20.5 s |
+| twins-ubmt, 1 / 2 / 4 / 8 / 16 threads | 2.02 / 1.18 / 0.88 / 0.89 / 0.95 s (up to 23x) |
+| twins-ub on the GPU (RX 9060 XT) | 73.1 s |
+
+Where the GPU time goes:
+- Kernel launches and host copies take ~7 s (~10%); at this size, launch overhead is not the
+  bottleneck.
+- The node kernels take 66 s. They are bound by the busiest leaf switch: 348 280 events in
+  sequence, at ~115 µs each.
+- Larger topologies make this worse, because switches get more ports and events.
+- Even if every switch port had its own lane, the GPU would only reach the CPU's single-thread speed
+  unless the per-event cost also fell by an order of magnitude.
+
 ## Pitfalls met
 
 - **TP teardown.** ns-3-ub destroys TP connections after their last planned use by default. Leaving
