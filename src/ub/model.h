@@ -101,6 +101,8 @@ struct Port {
     int32_t txfree[VLN], toReturn[VLN];
     uint32_t rrIdx[VLN];
     int32_t tpcnt[MAXV];  // registered TPs by VL index
+    uint64_t outBuf[MAXV];  // QueueManager m_outPortBuffer: VOQ bytes toward this port, by VL
+    uint64_t outProc[MAXV]; // m_outPortProcessingBytes: bytes in in-port processing toward it
     uint64_t vmask[MAXV]; // bit in: VOQ (this port, VL index, in) is not empty
     int32_t tplist;       // offset in World::tplist: [vlIdx][capacity] TP ids, registration order
 };
@@ -170,7 +172,14 @@ struct Conn {
     uint8_t destroyRequested, pad[3];
 };
 
+struct RrSlot {               // UbRoutingProcess::m_rrNextIndexByCandidates, one entry
+    uint64_t key;               // 0: empty
+    uint64_t next;
+};
+constexpr int RR_SLOTS = 64;    // per node (open addressing)
+
 struct Node {
+    RrSlot rr[RR_SLOTS];
     int32_t id;
     uint8_t sw, nv, pad[2];
     int32_t P;
@@ -208,9 +217,19 @@ struct Params {
     int32_t cbfcInit, cbfcThld, cbfcGrainData, cbfcGrainCtrl, cbfcCellBytes;
     uint32_t reservePerQueue, inflightMax, wqeSegMax;
     int64_t depDelay;
+    uint32_t oooThreshold;      // UbTransportChannel::TpOooThreshold
+    uint8_t perPacket;          // UbTransportChannel::RoutingType PER_PACKET_*: UDP sport = PSN
+    uint8_t selector;           // UbRoutingProcess::MultipathSelector: SEL_*
+    uint8_t pad[2];
 };
+enum : uint8_t { SEL_HASH64 = 0, SEL_RR = 3, SEL_ADAPTIVE = 4 };
 
 // the few scalars the model writes (the World itself is read-only: pointers and parameters)
+struct DoneUnit {
+    int32_t jetty, task;
+    uint32_t taSsn;
+    uint8_t resp, pad[3];
+};
 struct WorldMut {
     int32_t completed, nready, err, pad;
     uint64_t drops;
@@ -247,6 +266,8 @@ struct World {
     int32_t *hostPort0;         // by node: first host-port index (-1: a switch)
     int32_t *rtList;            // by key: list id (-1: none)
     int32_t *rlOff, *rlCnt, *rlPorts;
+    DoneUnit *done;             // per node: scratch for recv_data, doneCap entries
+    int32_t doneCap;
 };
 
 // the shortest-path candidates toward (dst node, dst port), without the ingress port
@@ -526,7 +547,7 @@ template <class E> struct Model {
         p.vl = (uint8_t)t.pri;
         p.sip = t.sip;
         p.dip = t.dip;
-        p.usport = 0;
+        p.usport = w.P.perPacket ? (uint16_t)(t.psnSndNxt & 0xffffff) : 0;   // m_lbHashSalt
         p.udport = (uint16_t)t.dport;
         p.srcTpn = t.tpn;
         p.dstTpn = t.peerTpn;
@@ -720,6 +741,7 @@ template <class E> struct Model {
                 int32_t in = (q - n.voq0) % n.P;
                 Pkt &pk = w.pkt[k];
                 ingress_of(w, n, in, n.vlIdx[pk.vl]) -= pk.size;
+                pt.outBuf[n.vlIdx[pk.vl]] -= pk.size;   // PopFromVoq
                 if (in != p) {
                     accumulate_returned_credit(n, in, pk);
                     maybe_queue_control_return(n, in);
@@ -806,6 +828,23 @@ template <class E> struct Model {
             UB_FAIL(w, ERR_ROUTE);
             return 0;
         }
+        if (w.P.selector == SEL_RR) {
+            // one counter per candidate-port set, shared by all flows (no phase hash)
+            uint64_t key = 1469598103934665603ull;
+            for (int32_t i = 0; i < nc; ++i)
+                key = (key ^ (uint64_t)(cand[i] + 1)) * 1099511628211ull;
+            key = key ? key : 1;
+            uint32_t h0 = (uint32_t)(key % RR_SLOTS);
+            for (int t = 0; t < RR_SLOTS; ++t) {
+                RrSlot &sl = n.rr[(h0 + t) % RR_SLOTS];
+                if (sl.key == key || sl.key == 0) {
+                    sl.key = key;
+                    return cand[sl.next++ % (uint64_t)nc];
+                }
+            }
+            UB_FAIL(w, ERR_ROUTE);
+            return 0;
+        }
         uint8_t b[17];
         uint32_t salt = node_ip(n.id);
         b[0] = pk.sip >> 24; b[1] = pk.sip >> 16; b[2] = pk.sip >> 8; b[3] = pk.sip;
@@ -814,11 +853,32 @@ template <class E> struct Model {
         b[12] = pk.vl;
         b[13] = salt >> 24; b[14] = salt >> 16; b[15] = salt >> 8; b[16] = salt;
         uint64_t h = ns3_hash64(b, 17);
+        if (w.P.selector == SEL_ADAPTIVE) {
+            // SelectAdaptive: least VOQ + processing bytes (this VL) + egress bytes; ties by hash
+            int32_t vi = n.vlIdx[pk.vl];
+            uint64_t best = ~0ull;
+            int32_t ties[64], nt = 0;
+            for (int32_t i = 0; i < nc; ++i) {
+                Port &op = port_of(w, n, cand[i]);
+                uint64_t sc = op.outBuf[vi] + op.outProc[vi] + op.egressBytes;
+                if (sc < best) {
+                    best = sc;
+                    nt = 0;
+                }
+                if (sc == best)
+                    ties[nt++] = cand[i];
+            }
+            return ties[h % (uint64_t)nt];
+        }
         return cand[h % (uint64_t)nc];
     }
     UB_HD void voq_enqueue(Node &n, int32_t in, int32_t out, int32_t k)
     {
-        voq_push(w, n, out, n.vlIdx[w.pkt[k].vl], in, k);
+        int32_t vi = n.vlIdx[w.pkt[k].vl];
+        Port &op = port_of(w, n, out);
+        op.outProc[vi] -= w.pkt[k].size;   // MoveInPortProcessingToVoq
+        op.outBuf[vi] += w.pkt[k].size;
+        voq_push(w, n, out, vi, in, k);
         port_trigger(n, out);
     }
     UB_HD void forward(Node &n, int32_t in, int32_t k)
@@ -837,6 +897,7 @@ template <class E> struct Model {
             return;
         }
         ib += pk.size;
+        port_of(w, n, out).outProc[vi] += pk.size;   // PushToInPortProcessing
         if (n.fwd <= 0)
             voq_enqueue(n, in, out, k);
         else {
@@ -1328,9 +1389,19 @@ template <class E> struct Model {
             return;
         }
         if (pk.psn > t.psnRecvNxt) {
-            // out of order without retransmission: buffered, no response
+            // out of order without retransmission: buffered, no response; beyond the
+            // TpOooThreshold window ns-3 drops it ("Over Out-of-Order")
+            if (pk.psn - t.psnRecvNxt >= w.P.oooThreshold) {
+                w.mut->drops++;
+                UB_FAIL(w, ERR_DROP);
+                return;
+            }
             int32_t k = pkt_alloc(w, n);
             w.pkt[k] = pk;
+            if (t.buffered.tail >= 0 && w.pkt[t.buffered.tail].psn < pk.psn) {
+                UB_LIST_PUSH(t.buffered, w.pkt, k);   // the usual case: beyond all buffered
+                return;
+            }
             int32_t prev = -1, cur = t.buffered.head;
             while (cur >= 0 && w.pkt[cur].psn < pk.psn)
                 prev = cur, cur = w.pkt[cur].next;
@@ -1344,16 +1415,19 @@ template <class E> struct Model {
             t.buffered.n++;
             return;
         }
-        // contiguous: complete the TA units whose last packet arrived
-        int32_t doneJ[8], doneT[8];
-        uint32_t doneS[8];
-        uint8_t doneR[8];
+        // contiguous: complete the TA units whose last packet arrived (a closed gap can complete
+        // up to a window's worth at once)
+        DoneUnit *done = w.done + (int64_t)n.id * w.doneCap;
         int nd = 0;
         Pkt cur = pk;
         for (;;) {
             t.inOpen = !cur.last;
-            if (cur.last && nd < 8) {
-                doneJ[nd] = cur.jetty, doneT[nd] = cur.task, doneS[nd] = cur.taSsn, doneR[nd] = cur.resp;
+            if (cur.last) {
+                if (nd >= w.doneCap) {
+                    UB_FAIL(w, ERR_POOL_REM);
+                    return;
+                }
+                done[nd].jetty = cur.jetty, done[nd].task = cur.task, done[nd].taSsn = cur.taSsn, done[nd].resp = cur.resp;
                 ++nd;
             }
             t.psnRecvNxt++;
@@ -1381,10 +1455,11 @@ template <class E> struct Model {
         UB_LIST_PUSH(t.ackQ, w.pkt, a);
         port_trigger(n, t.port);
         for (int i = 0; i < nd; ++i) {
-            if (doneR[i])
-                process_ta_response(n, doneJ[i], doneT[i], doneS[i]);
+            DoneUnit u = done[i];
+            if (u.resp)
+                process_ta_response(n, u.jetty, u.task, u.taSsn);
             else {
-                Ev ev{E_TARGET, ti, doneJ[i], doneT[i], (int32_t)doneS[i]};
+                Ev ev{E_TARGET, ti, u.jetty, u.task, (int32_t)u.taSsn};
                 e.sched(n, 0, ev);
             }
         }
@@ -1455,6 +1530,8 @@ template <class E> struct Model {
             UB_FAIL(w, ERR_NOTP);
             return;
         }
+        if (w.tp[ti].dead)
+            return;   // ResolveInboundTp: RETIRED_EXACT, a stale packet (spray reorders) is ignored
         if (!w.tp[ti].live)
             ti = local_tp(n, w.tp[ti].conn);
         if (pk.type == P_ACK)

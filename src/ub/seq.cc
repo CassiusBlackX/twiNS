@@ -265,16 +265,44 @@ int main(int argc, char **argv)
     G.schedule_ready();
     E.in_root_batch = false;
     bool stopped = false;
+    bool progress = getenv("UB_PROGRESS") != nullptr;
     while (!E.q.empty() && !stopped && !w.mut->err) {
         QEv x = E.q.top();
         E.q.pop();
         E.now_ = x.ts;
         ++E.events;
+        if (progress && E.events % 200000 == 0)
+            fprintf(stderr, "  %llu events, t=%lld ps, queue %zu, completed %d\n", (unsigned long long)E.events,
+                    (long long)E.now_, E.q.size(), w.mut->completed);
         if (x.node == -1) {
             if (x.ev.kind == E_STOP)
                 stopped = true;
-            else if (w.mut->completed < w.ntask)
+            else if (w.mut->completed < w.ntask) {
+                if (E.q.empty()) {
+                    // nothing left but this check: a task can never complete (ns-3 would spin too)
+                    fprintf(stderr, "twins-ubseq: deadlock at %lld ps: %d/%d tasks complete\n", (long long)E.now_,
+                            w.mut->completed, w.ntask);
+                    int shown = 0;
+                    for (int32_t i = 0; i < w.ntask && shown < 5; ++i) {
+                        TaskG &t = w.task[i];
+                        if (t.state == 3)
+                            continue;
+                        ++shown;
+                        fprintf(stderr, "  task %d %d->%d state %d jetty %d\n", t.id, t.src, t.dst, t.state, t.jetty);
+                        for (int side = 0; side < 2; ++side) {
+                            Conn &c = w.conn[t.conn];
+                            int32_t ti = c.ep[side + 1];
+                            if (ti < 0) continue;
+                            Tp &p = w.tp[ti];
+                            fprintf(stderr, "    ep%d node %d tpn %d live %d dead %d snd nxt %u una %u cnt %u segs %d ackQ %d recvNxt %u buffered %d (head psn %u) pending %d active %d waiting %d\n",
+                                    side + 1, p.node, p.tpn, p.live, p.dead, p.psnSndNxt, p.psnSndUna, p.tpPsnCnt, p.segs.n, p.ackQ.n,
+                                    p.psnRecvNxt, p.buffered.n, p.buffered.n ? w.pkt[p.buffered.head].psn : 0, p.pending.n, p.txEntryActive, p.waiting);
+                        }
+                    }
+                    break;
+                }
                 E.push(-1, 100000000, Ev{E_CHECK, 0, 0, 0, 0});
+            }
             else
                 E.push(-1, 0, Ev{E_STOP, 0, 0, 0, 0});
             continue;

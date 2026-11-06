@@ -36,6 +36,7 @@ struct HostWorld {
     std::vector<int32_t> phaseDeps, ready;
     // routes (see World::rtList)
     std::vector<int32_t> hostPort0, rtList, rlOff, rlCnt, rlPorts;
+    std::vector<DoneUnit> done;
     std::vector<int32_t> rootTasks;   // tasks ready at load, in task id order
 
     void fill_world()
@@ -65,6 +66,7 @@ struct HostWorld {
         w.rlOff = rlOff.data();
         w.rlCnt = rlCnt.data();
         w.rlPorts = rlPorts.data();
+        w.done = done.data();
         w.nnode = (int32_t)node.size();
         w.ntask = (int32_t)task.size();
         w.nphase = (int32_t)phase.size();
@@ -85,11 +87,27 @@ inline std::string check_attrs(Case &C, Params &P)
     need("ns3::UbTransportChannel::EnableRetrans", "false", "false");
     need("UB_FAULT_ENABLE", "false", "false");
     need("ns3::UbApp::EnableMultiPath", "false", "false");
-    need("ns3::UbApp::RoutingType", "PER_FLOW_SHORTEST_PATHS", "PER_FLOW_SHORTEST_PATHS");
-    need("ns3::UbTransportChannel::RoutingType", "PER_FLOW_SHORTEST_PATHS", "PER_FLOW_SHORTEST_PATHS");
+    {
+        std::string app = A.get("ns3::UbApp::RoutingType", "PER_FLOW_SHORTEST_PATHS");
+        std::string tp = A.get("ns3::UbTransportChannel::RoutingType", "PER_FLOW_SHORTEST_PATHS");
+        std::string sel = A.get("ns3::UbRoutingProcess::MultipathSelector", "HASH64");
+        auto shortest = [](const std::string &v) {
+            return v == "PER_FLOW_SHORTEST_PATHS" || v == "PER_PACKET_SHORTEST_PATHS";
+        };
+        if ((!shortest(app) || !shortest(tp)) && err.empty())
+            err = "only *_SHORTEST_PATHS routing types are supported (UbApp " + app + ", TP " + tp + ")";
+        P.perPacket = tp == "PER_PACKET_SHORTEST_PATHS";
+        if (sel == "HASH64")
+            P.selector = SEL_HASH64;
+        else if (sel == "ROUND_ROBIN" && P.perPacket)
+            P.selector = SEL_RR;
+        else if (sel == "ADAPTIVE" && P.perPacket)
+            P.selector = SEL_ADAPTIVE;
+        else if (err.empty())
+            err = "unsupported MultipathSelector " + sel + " with TP routing " + tp;
+    }
     need("ns3::UbPort::UbInterframeGap", "+0ns", "+0ns");
     need("ns3::UbSwitch::VlScheduler", "SP", "SP");
-    need("ns3::UbRoutingProcess::MultipathSelector", "HASH64", "HASH64");
     need("UB_ALLOCATOR_RR_PHASE_HASH_ENABLE", "false", "false");
     need("ns3::UbSwitchAllocator::EnableDirectAllocationCompletion", "true", "true");
     need("ns3::UbTransaction::InitiatorProtocolDispatchDelay", "+0ns", "+0ns");
@@ -106,6 +124,7 @@ inline std::string check_attrs(Case &C, Params &P)
     P.reservePerQueue = (uint32_t)A.geti("ns3::UbQueueManager::ReservePerQueueBytes", 1048576);
     P.inflightMax = (uint32_t)A.geti("ns3::UbTransportChannel::DefaultMaxInflightPacketSize", 1000);
     P.wqeSegMax = (uint32_t)A.geti("ns3::UbTransportChannel::DefaultMaxWqeSegNum", 1000);
+    P.oooThreshold = (uint32_t)A.geti("ns3::UbTransportChannel::TpOooThreshold", 2048);
     return err;
 }
 
@@ -409,6 +428,8 @@ inline std::string build_world(Case &C, HostWorld &H, int64_t depDelay, double p
         decltype(C.exact)().swap(C.exact);
         decltype(C.primary)().swap(C.primary);
     }
+    H.w.doneCap = (int32_t)P.oooThreshold + 2;
+    H.done.assign((size_t)NN * H.w.doneCap, DoneUnit{});
     H.w.P = P;
     H.fill_world();
     return "";

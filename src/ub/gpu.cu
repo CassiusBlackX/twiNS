@@ -737,6 +737,7 @@ int main(int argc, char **argv)
     d.w.rlOff = dcopy(H.rlOff);
     d.w.rlCnt = dcopy(H.rlCnt);
     d.w.rlPorts = dcopy(H.rlPorts);
+    d.w.done = dcopy(H.done);
     // chains
     const uint64_t TAILN = 1ull << 24, MEMON = 1ull << 22, WALKN = 1ull << 20;
     d.cx.tail = dalloc<TailNode>(TAILN);
