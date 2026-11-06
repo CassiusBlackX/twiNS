@@ -75,7 +75,7 @@ UB_HD inline uint64_t chash(uint64_t h, uint64_t code)
     return z ^ (z >> 31);
 }
 
-#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #define UB_ATOMIC_ADD(p, v) atomicAdd((unsigned long long *)(p), (unsigned long long)(v))
 #define UB_CAS(p, o, n) atomicCAS((unsigned long long *)(p), (unsigned long long)(o), (unsigned long long)(n))
 #else
