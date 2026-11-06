@@ -138,7 +138,7 @@ sequential runs 8 at a time, the Unison ones alone. a87 was shared with another 
 | 2-D torus 32x32, 8 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | 566.5 | 4.489 | — | 126× |
 | 2-D torus 32x32, 8 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | 723.5 | 5.588 | — | 129× |
 | 3-D torus 16x16x16, 2 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | 404.2 | 2.918 | — | 139× |
-| 3-D torus 16x16x16, 2 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | over 60 GB | 2.832 | — | — |
+| 3-D torus 16x16x16, 2 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | 391.7 | 2.832 | — | 138× |
 | Dragonfly a=16 g=65 h=8 p=8 | 8320 | a2a30 | dctcp | 18170 | — | 203.6 | 1.787 | — | 114× |
 | Dragonfly a=16 g=65 h=8 p=8 | 8320 | hdp30 | dctcp | 251925 | — | 162.5 | 1.414 | — | 115× |
 | HyperX 4x4x8x8, 8 hosts a switch | 8192 | a2a30 | dctcp | 17914 | — | 222.9 | 1.749 | — | 127× |
