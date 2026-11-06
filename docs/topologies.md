@@ -12,7 +12,7 @@ and 8192 hosts. `workloads/gen_topo_eval.sh` makes every topology and workload b
 - **Faster everywhere.** At 512–1,056 hosts, TwiNS (RX 9060 XT) against ns-3 on one core: 301–790×
   on the all-to-all workloads, 5–10× on the 160-flow incasts; against Unison on 32 threads: 14–71×
   and 6–17×. At about 128 hosts: 41–158× and 5–7× against ns-3. At about 8192 hosts, against
-  Unison: 102–139× on all-to-all workloads (event loops); Unison needs up to 70 GB or more there.
+  Unison: 102–139× on all-to-all workloads (event loops); Unison needs up to about 78 GiB there.
   twins-rdma against the HPCC fork on one core: 28–314×.
 - **What each simulator can run.**
   - GeDES builds only FatTrees (`topology.cc`: the other branch is empty), so it is not in these tables.
@@ -145,15 +145,15 @@ sequential runs 8 at a time, the Unison ones alone. a87 was shared with another 
 | HyperX 4x4x8x8, 8 hosts a switch | 8192 | hdp30 | dctcp | 247557 | — | 170.2 | 1.422 | — | 120× |
 | HyperX 4x4x8x8, 8 hosts a switch | 8192 | incast16 | dctcp | 160 | — | 19.2 | 0.165 | — | 117× |
 | Xpander, d=16, lift 120, 4 hosts a switch | 8160 | a2a30 | dctcp | 17862 | — | 176.4 | 1.725 | — | 102× |
-| Xpander, d=16, lift 120, 4 hosts a switch | 8160 | hdp30 | dctcp | 245928 | — | over 60 GB | 1.374 | — | — |
+| Xpander, d=16, lift 120, 4 hosts a switch | 8160 | hdp30 | dctcp | 245928 | — | 157.1 | 1.374 | — | 114× |
 
 At about 8192 hosts there is no sequential ns-3 (set-up alone takes about an hour), so these runs are
 not checked against it; Unison, deterministic but not equal to sequential ns-3 per flow, gives speed
 only. Its times are its event loop on 32 threads; before it, ns-3's set-up (topology and global routing
 tables) runs on one thread for 1–6 hours and is not counted, as TwiNS's set-up is not. That set-up
-also holds most of Unison's memory: on the 3-D torus it grew for 6 hours to about 70 GiB before a
-404 s run. Unison ran out of a 60 GB cap there and on Xpander with hdp30; those rows come from
-runs with a 93 GiB cap.
+also holds most of Unison's memory: on the 3-D torus it grew for 6–7 hours to about 70 GiB (a2a30)
+and 78 GiB (hdp30) before runs of under 7 minutes; Xpander with hdp30 reached about 61 GiB. These
+three ran out of a 60 GB cap and were rerun alone with a 93 GiB cap.
 
 ## RDMA: exactness and speed
 
