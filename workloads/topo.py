@@ -9,7 +9,9 @@ Links are installed in file order, so a node's ports (ns-3 devices) are numbered
 its links appear. Every host has exactly one link; all links run at 100 Gbps with 1 us delay.
 
 usage: topo.py fattree K | leafspine LEAVES SPINES HPL | jellyfish SWITCHES NETPORTS HPS SEED
-              | torus X Y HPS | dragonfly A G H P    > topo.txt
+              | jellyfish2 SWITCHES NETPORTS HPS SEED | torus X Y HPS | torus3 X Y Z HPS
+              | dragonfly A G H P | hyperx HPS D1 D2 [D3 ...] | xpander D LIFT HPS SEED    > topo.txt
+(jellyfish2: the same random regular graph family, built in near-linear time for large sizes)
 """
 import random
 import sys
@@ -122,6 +124,99 @@ def dragonfly(a, g, h, p):
     emit(n * p, n, links)
 
 
+def jellyfish2(n, d, hps, seed):
+    # Jellyfish for thousands of switches: random stub matching (pick two random switches with free
+    # ports that are not yet neighbours, a bounded number of tries), then the NSDI 2012 repair (break
+    # a random link and join both ends to a switch left with two or more free ports)
+    rng = random.Random(seed)
+    free = [d] * n
+    adj = [set() for _ in range(n)]
+    edges = set()
+    avail = list(range(n))
+    misses = 0
+    while len(avail) > 1 and misses < 50 * n:
+        a, b = rng.sample(avail, 2)
+        if b in adj[a]:
+            misses += 1
+            continue
+        adj[a].add(b)
+        adj[b].add(a)
+        edges.add((min(a, b), max(a, b)))
+        for z in (a, b):
+            free[z] -= 1
+        avail = [z for z in avail if free[z] > 0] if free[a] == 0 or free[b] == 0 else avail
+    for s in range(n):
+        while free[s] >= 2:
+            el = list(edges)
+            for _ in range(1000):
+                x, y = rng.choice(el)
+                if s not in (x, y) and x not in adj[s] and y not in adj[s]:
+                    break
+            else:
+                break
+            edges.discard((x, y))
+            adj[x].discard(y)
+            adj[y].discard(x)
+            for z in (x, y):
+                adj[s].add(z)
+                adj[z].add(s)
+                edges.add((min(s, z), max(s, z)))
+            free[s] -= 2
+    links = [("h%d" % h, "s%d" % (h // hps)) for h in range(n * hps)]
+    links += [("s%d" % a, "s%d" % b) for a, b in sorted(edges)]
+    emit(n * hps, n, links)
+
+
+def torus3(x, y, z, hps):
+    # a 3-D torus (TPU and HPC machines): every switch joined to its 6 neighbours, wrapping around
+    n = x * y * z
+    sid = lambda i, j, l: (i * y + j) * z + l
+    links = [("h%d" % h, "s%d" % (h // hps)) for h in range(n * hps)]
+    for i in range(x):
+        for j in range(y):
+            for l in range(z):
+                s = sid(i, j, l)
+                for t in (sid((i + 1) % x, j, l), sid(i, (j + 1) % y, l), sid(i, j, (l + 1) % z)):
+                    if t != s:
+                        links.append(("s%d" % s, "s%d" % t))
+    emit(n * hps, n, links)
+
+
+def hyperx(hps, *dims):
+    # HyperX (Ahn et al., SC 2009): switches on a grid of the given dimensions, each joined to every
+    # switch that differs from it in exactly one coordinate
+    n = 1
+    for d in dims:
+        n *= d
+    links = [("h%d" % h, "s%d" % (h // hps)) for h in range(n * hps)]
+    stride = [1] * len(dims)
+    for i in range(len(dims) - 2, -1, -1):
+        stride[i] = stride[i + 1] * dims[i + 1]
+    for s in range(n):
+        for i, d in enumerate(dims):
+            c = s // stride[i] % d
+            for q in range(c + 1, d):
+                links.append(("s%d" % s, "s%d" % (s + (q - c) * stride[i])))
+    emit(n * hps, n, links)
+
+
+def xpander(d, lift, hps, seed):
+    # Xpander (Valadarsky et al., CoNEXT 2016): a random lift of the complete graph K_{d+1}; each
+    # of its edges becomes a random perfect matching between the lift copies of its two ends, so
+    # every switch has d network links
+    rng = random.Random(seed)
+    n = (d + 1) * lift
+    links = [("h%d" % h, "s%d" % (h // hps)) for h in range(n * hps)]
+    for u in range(d + 1):
+        for v in range(u + 1, d + 1):
+            perm = list(range(lift))
+            rng.shuffle(perm)
+            for c in range(lift):
+                links.append(("s%d" % (u * lift + c), "s%d" % (v * lift + perm[c])))
+    emit(n * hps, n, links)
+
+
 if __name__ == "__main__":
     kind, args = sys.argv[1], [int(v) for v in sys.argv[2:]]
-    {"fattree": fattree, "leafspine": leafspine, "jellyfish": jellyfish, "torus": torus, "dragonfly": dragonfly}[kind](*args)
+    {"fattree": fattree, "leafspine": leafspine, "jellyfish": jellyfish, "jellyfish2": jellyfish2, "torus": torus,
+     "torus3": torus3, "dragonfly": dragonfly, "hyperx": hyperx, "xpander": xpander}[kind](*args)

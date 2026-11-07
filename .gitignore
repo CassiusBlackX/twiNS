@@ -1,3 +1,24 @@
 build*/
 out/
 __pycache__/
+# made again by workloads/gen_topo_eval.sh and gen_cdf_eval.sh (the large ones)
+data/flows/jf2048_*
+data/flows/tor32_*
+data/flows/t3d16_*
+data/flows/df16_*
+data/flows/hx4d_*
+data/flows/xp16_*
+data/flows/k16_ws*
+data/flows/k16_hdp*
+data/flows/k16_luna*
+data/flows/k16_dm*
+data/flows/k8_hdp*
+data/flows/k8_luna*
+data/flows/k32_p*
+data/topo/jf2048.txt
+data/topo/tor32.txt
+data/topo/t3d16.txt
+data/topo/df16.txt
+data/topo/hx4d.txt
+data/topo/xp16.txt
+.rocprofv3/
