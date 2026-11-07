@@ -226,8 +226,10 @@ At k=32 (8,192 hosts), DCTCP:
 
 **Other topologies and workloads.** On the 8 topologies of 512–1,056 hosts, TwiNS is 301–790×
 ns-3 and 14–71× Unison on the all-to-all workloads (`docs/topologies.md`). With measured flow-size
-distributions on FatTrees it is 42–1967× ns-3, and 2.4–112× GeDES on GeDES's own pairing, where
-GeDES's mean FCT is off by 5–96% (`docs/workloads.md`).
+distributions on FatTrees it is 29–1714× ns-3, and 2.4–90× GeDES on GeDES's own pairing, where
+GeDES's mean FCT is off by 5–96% (`docs/workloads.md`). On an RTX 5090 every one of these runs is
+identical too; the TCP model is 1.4–2.9× faster there on the topologies (600–1432× ns-3, 27–142×
+Unison at about 1024 hosts) and 0.85–2.1× on the FatTree workloads.
 
 **Parameter sweeps.** `bench/sweep.py` runs a grid as batches of worlds;
 `bench/sweep_report.py` tabulates short-flow p99 and long-flow mean FCT per configuration.
