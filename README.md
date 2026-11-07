@@ -46,9 +46,11 @@ up to 18%). Run side by side on a 32-core server, SimAI matches one GPU on a swe
 not on large ones; see [docs/ai/paper.md](docs/ai/paper.md). `src/astra/fetch.sh` gets SimAI's code first. See [docs/ai/whatif.md](docs/ai/whatif.md).
 With `--nvl-islands=P`, the flows between GPUs of one server run on P CPU processes
 (`twins-island`, the same model built for the CPU) beside the GPU, still identical on all of these:
-GPT-3 13B at 128 GPUs goes from 6× to 12× SimAI on this machine's 4 cores, and to 42× on a 16-core
-Ryzen 9950X with an RTX 5090. Runs that are not NVLink-bound gain nothing or lose; see
-[docs/ai/speed.md](docs/ai/speed.md).
+GPT-3 13B at 128 GPUs goes from 6× to 12× SimAI on this machine's 4 cores, and to 32× (probe) and
+42× (full iteration) on a 16-core Ryzen 9950X with an RTX 5090. Runs that are not NVLink-bound gain
+nothing or lose; see [docs/ai/speed.md](docs/ai/speed.md). On that host the 42 paper runs are 11–72×
+faster than SimAI on one core and 5.9–14× faster than SimAI with threads, all identical
+([docs/ai/paper.md](docs/ai/paper.md), "On an RTX 5090").
 
 ## Build
 

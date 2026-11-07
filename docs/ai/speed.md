@@ -256,24 +256,35 @@ validation above (one run each; repeats of the 13B probe vary by about 5%):
 On 4 cores the islands help where NVLink dominates (GPT-3 13B: its 5.8× against SimAI becomes
 12.2×), and cost time elsewhere: the four islands and twins-ai's own thread share four cores.
 
-**Speed, the 5090 host** (Ryzen 9950X, 16 islands; RTX 5090). Shared machine: another user's GPU job
-kept the GPU at 100% and other jobs loaded the CPU, so these are for direction only. Measured with
-the build before the two fixes under "What went wrong on the way" (the table of GPU nodes, which they
-added, cost the 13B run at 128 GPUs about 4% on this machine).
+**Speed, the 5090 host** (Ryzen 9950X, 16 cores, 16 islands; RTX 5090), final build, 2026-11-07,
+with the GPU otherwise idle (another user's CPU jobs took about 1.5 cores at times). All 42 paper runs,
+with and without islands, identical to SimAI. Selected runs (all: `paper.md`, "On an RTX 5090"):
 
-| run | without | with 16 islands | | against SimAI |
-|---|---|---|---|---|
-| GPT-3 13B probe, 128 GPUs | 53.9 s | 12.2 s | 4.4× | 42× |
-| LLaMA 65B probe, 128 GPUs | 28.1 s | 17.5 s | 1.6× | 35× |
-| GPT-3 175B probe, 128 GPUs | 87.7 s | 45.0 s | 1.9× | 47× |
-| GPT-3 13B probe, 512 GPUs | 117 s | 57.3 s | 2.0× | 52× |
-| LLaMA 65B probe, 512 GPUs | 105 s | 105 s | 1.0× | 34× |
-| GPT-3 13B probe, 1024 GPUs | 206 s | 157 s | 1.3× | 39× |
-| LLaMA 65B probe, 1024 GPUs | 104 s | 118 s | 0.88× | (68× without) |
+| run | without | with 16 islands | | SimAI, 1 core (fastest) | against SimAI |
+|---|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 55.9 s | 15.5 s | 3.6× | 497 s | 32× |
+| GPT-3 13B full, 128 GPUs | 530 s | 124 s | 4.3× | 5221 s | 42× |
+| LLaMA 65B probe, 128 GPUs | 29.9 s | 17.6 s | 1.7× | 620 s | 35× |
+| GPT-3 175B probe, 128 GPUs | 93.1 s | 44.6 s | 2.1× | 2125 s | 48× |
+| GPT-3 13B probe, 512 GPUs | 125 s | 63.8 s | 2.0× | 2987 s | 47× |
+| GPT-3 13B mid, 512 GPUs | 289 s | 159 s | 1.8× | 6638 s | 42× |
+| LLaMA 65B probe, 512 GPUs | 116 s | 112 s | 1.04× | 3290 s | 30× |
+| GPT-3 13B probe, 1024 GPUs | 217 s | 159 s | 1.4× | 6139 s | 39× |
+| LLaMA 65B probe, 1024 GPUs | 109 s | 129 s | 0.85× | 7027 s | 65× (without) |
+| GPT-3 175B probe, 1024 GPUs | 328 s | 390 s | 0.84× | 23326 s | 71× (without) |
 
-All 14 runs identical to SimAI. The 13B run at 128 GPUs lands near the estimate above (17 s
-estimated, 12.2 s measured). At 1024 GPUs the system layer and the syncs, on one core, are most
-of what is left (13B: GPU 85 s, system layer 20 s, sync 30 s), and islands do not touch them.
+**The fixes cost more with 16 islands.** The build before the two fixes under "What went wrong on the
+way" ran the 13B probe at 128 GPUs in 12.2 s with 16 islands here, although another user's GPU job was
+running; the final build takes 15.3–15.6 s on the idle machine (4 runs), and 55.7 s without islands
+(53.9 s before). So with 16 islands the fixes cost about 25% on that run, against about 4% with 4
+islands on the RX host. Where that goes (more islands reading the shared table, or waiting on
+multi-part commands) has not been measured.
+
+Against the RX 9060 XT host (best of with and without islands on each), the 5090 host is 2.2–3.3×
+faster on training and 1.0–1.9× on collectives. The 13B run at 128 GPUs lands near the estimate
+above (17 s estimated, 15.5 s measured). At 1024 GPUs the system layer and the syncs, on one core,
+are most of what is left (175B probe with islands: GPU 95 s, system layer 74 s, sync 137 s), and
+islands do not touch them.
 
 **When to use it.** On a machine with many cores, for runs whose time is in the NVLinks (GPT-3 13B
 at any size, any run at 128 GPUs). Without spare cores, or on LLaMA-like runs at 512 GPUs and
@@ -344,3 +355,7 @@ jobs had the GPU at 100% whenever it was checked, and sync time was inflated. Un
 to 3.1× faster than the code before these changes on window-heavy cases (`c_allreduce_512m_hpn128` 43.2 →
 13.9 s, LLaMA probe at 1024 GPUs 425.7 → 147.9 s) and unchanged on GPT-3 13B. Those figures compare this
 work's two builds on a shared GPU; they are not TwiNS against SimAI.
+
+Measured again with the final build on 2026-11-07, the GPU otherwise idle (`paper.md`, "On an RTX
+5090"): all 42 paper runs and all 47 what-if runs identical, with and without 16 islands; against the
+RX 9060 XT host, 2.2–3.3× faster on training and 1.0–1.9× on collectives.

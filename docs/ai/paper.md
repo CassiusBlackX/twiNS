@@ -19,6 +19,8 @@ These runs replay SimAI's recordings. `whatif.md` runs the same workloads with n
   - 15–44× faster on 512- and 1024-GPU training.
 - SimAI's single-threaded runs take up to 6.5 h (GPT-3 175B probe at 1024 GPUs); TwiNS's take
   10 min.
+- On an RTX 5090 host, closed loop with start-up: 11–49× on collectives, 32–48× on 128-GPU
+  training, 30–72× on 512- and 1024-GPU training, all identical; see "On an RTX 5090".
 - These times are the simulation loop, without start-up (about 0.5 s at 128 GPUs, 1.4 s at 1024), which
   matters only for the smallest runs.
 
@@ -208,6 +210,79 @@ run many SimAI processes at once, as many as memory allows.
 - On large runs it does not. A run cannot be split, and memory limits how many fit (16–28 GB each at
   1024 GPUs). The 15 training runs above took a87 9.4 h, the time of its longest run (GPT-3 175B probe
   at 1024 GPUs, 6.5 h on a quiet machine); TwiNS runs all 15 one after another in 1.4 h.
+
+## On an RTX 5090
+
+The 5090 host (RTX 5090, Ryzen 9950X with 16 cores), final ai-nvl build, 2026-11-07, the GPU otherwise
+idle (another user's CPU jobs took about 1.5 cores at times). Closed loop, wall clock with start-up,
+one run each; "RX" is this machine (i5-7500, RX 9060 XT), the same build (`whatif.md`, "Speed", and
+`--nvl-islands=4`). SimAI is its fastest single-core time, as above. Raw results, outside the
+repository: `../twiNS/out/5090/r1107` (`run5090.sh`; table by `out/tmp/ai_tab5090.py` there).
+
+- **Exact.** All 42 paper runs identical to SimAI per message and per DAG line, on the GPU alone and
+  with 16 islands; all 47 what-if runs too, both ways, with no undecided ties. Replay (`twins-rdma` on
+  SimAI's recordings): 42 of 42 identical, 1.1–2.9× faster than on the RX host on collectives and
+  1.5–3.5× on training (GPT-3 175B probe at 1024 GPUs: 183 s against 632 s).
+- **Against sequential SimAI** (best of the GPU alone and 16 islands): collectives 15–17× at 128
+  GPUs, 13–39× at 512, 11–49× at 1024; training 32–48× at 128 GPUs, 30–56× at 512, 39–72× at 1024.
+  The RX host gives 8.5–16×, 9.5–26×, 6.8–29×; 11.7–14.7×, 17.6–23.7×, 17.6–28.8×.
+- **Against SimAI with threads** (the runs in "How fair", 2.): 6.9–14× on training, 5.9–12× on the
+  collectives (RX: 3.2–5.1×, 3.6–7.7×). Still exact, where the threads are not.
+- **Throughput.** The 47 what-if runs: 849 s one at a time on the GPU alone, 620 s one at a time with
+  16 islands, 827 s two at a time, 523 s two at a time with 8 islands each, **502 s four at a time with
+  4 islands each** (all identical to SimAI), against a87's 794 s for 47 SimAI processes at once. The
+  15 training runs, one after another: 0.57 h (RX: 1.4 h; a87, all at once: 9.4 h).
+- **Where the time goes.** Islands pay where NVLink dominates (GPT-3 13B: 3.6–4.3× over the GPU
+  alone at 128 GPUs) and cost at 1024 GPUs on LLaMA and GPT-3 175B (0.84–0.85×), where the system
+  layer and the syncs, on one core, are most of what is left. Collectives gain 1.0–1.9× over the RX
+  host, the shortest runs least (start-up); training 2.2–3.3×.
+
+| run | SimAI, 1 core, fastest (s) | RX: GPU (s) | RX: 4 islands (s) | 5090: GPU (s) | 5090: 16 islands (s) | 5090 best vs RX best | RX vs SimAI | 5090 vs SimAI |
+|---|---|---|---|---|---|---|---|---|
+| c_allgather_512m_hpn128 | 54.4 | 5.50 | 5.30 | 3.20 | 3.20 | 1.66× | 10.3× | 17.0× |
+| c_allgather_64m_hpn128 | 10.2 | 1.10 | 0.80 | 0.60 | 0.60 | 1.33× | 12.7× | 17.0× |
+| c_allgather_8m_hpn128 | 4.8 | 0.70 | 0.30 | 0.30 | 0.30 | 1.00× | 16.0× | 16.0× |
+| c_allreduce_512m_hpn128 | 102.6 | 12.20 | 12.10 | 6.90 | 6.80 | 1.78× | 8.5× | 15.1× |
+| c_allreduce_64m_hpn128 | 16.6 | 1.70 | 1.30 | 1.00 | 1.00 | 1.30× | 12.8× | 16.6× |
+| c_allreduce_8m_hpn128 | 6.2 | 0.80 | 0.40 | 0.40 | 0.40 | 1.00× | 15.5× | 15.5× |
+| c_reducescatter_512m_hpn128 | 54.0 | 5.50 | 5.20 | 3.10 | 3.10 | 1.68× | 10.4× | 17.4× |
+| c_reducescatter_64m_hpn128 | 10.2 | 1.20 | 0.80 | 0.70 | 0.60 | 1.33× | 12.7× | 17.0× |
+| c_reducescatter_8m_hpn128 | 4.8 | 0.70 | 0.30 | 0.40 | 0.30 | 1.00× | 16.0× | 16.0× |
+| gpt3_13b_probe_hpn128 | 497.1 | 89.90 | 42.40 | 55.90 | 15.50 | 2.74× | 11.7× | 32.1× |
+| gpt3_175b_probe_hpn128 | 2125.2 | 154.20 | 145.90 | 93.10 | 44.60 | 3.27× | 14.6× | 47.7× |
+| llama_65b_probe_hpn128 | 620.4 | 49.90 | 50.70 | 29.90 | 17.60 | 2.84× | 12.4× | 35.2× |
+| c_allgather_512m_hpn512 | 258.1 | 10.40 | 10.00 | 6.80 | 6.70 | 1.49× | 25.8× | 38.5× |
+| c_allgather_64m_hpn512 | 39.4 | 2.60 | 2.00 | 1.70 | 1.60 | 1.25× | 19.7× | 24.6× |
+| c_allgather_8m_hpn512 | 13.0 | 1.70 | 1.10 | 1.00 | 0.90 | 1.22× | 11.8× | 14.4× |
+| c_allreduce_512m_hpn512 | 490.0 | 35.20 | 35.10 | 20.30 | 20.20 | 1.74× | 14.0× | 24.3× |
+| c_allreduce_64m_hpn512 | 74.1 | 4.20 | 3.60 | 2.90 | 2.70 | 1.33× | 20.6× | 27.4× |
+| c_allreduce_8m_hpn512 | 19.0 | 2.50 | 2.00 | 1.50 | 1.50 | 1.33× | 9.5× | 12.7× |
+| c_reducescatter_512m_hpn512 | 250.8 | 10.60 | 10.20 | 6.90 | 6.70 | 1.52× | 24.6× | 37.4× |
+| c_reducescatter_64m_hpn512 | 38.7 | 2.60 | 2.10 | 1.70 | 1.70 | 1.24× | 18.4× | 22.8× |
+| c_reducescatter_8m_hpn512 | 12.9 | 1.70 | 1.20 | 1.00 | 0.90 | 1.33× | 10.8× | 14.3× |
+| c_allgather_512m_hpn1024 | 542.8 | 19.60 | 18.90 | 11.30 | 11.00 | 1.72× | 28.7× | 49.3× |
+| c_allgather_64m_hpn1024 | 92.4 | 6.20 | 5.30 | 3.80 | 3.70 | 1.43× | 17.4× | 25.0× |
+| c_allgather_8m_hpn1024 | 34.2 | 4.80 | 4.10 | 2.70 | 2.60 | 1.58× | 8.3× | 13.2× |
+| c_allreduce_512m_hpn1024 | 1079.0 | 72.10 | 72.20 | 39.40 | 38.70 | 1.86× | 15.0× | 27.9× |
+| c_allreduce_64m_hpn1024 | 171.6 | 11.30 | 10.40 | 6.80 | 6.50 | 1.60× | 16.5× | 26.4× |
+| c_allreduce_8m_hpn1024 | 53.2 | 8.70 | 7.80 | 5.10 | 4.80 | 1.62× | 6.8× | 11.1× |
+| c_reducescatter_512m_hpn1024 | 530.5 | 22.30 | 21.80 | 13.10 | 12.90 | 1.69× | 24.3× | 41.1× |
+| c_reducescatter_64m_hpn1024 | 86.4 | 6.40 | 5.50 | 4.00 | 3.80 | 1.45× | 15.7× | 22.7× |
+| c_reducescatter_8m_hpn1024 | 32.1 | 5.20 | 4.30 | 2.90 | 2.80 | 1.54× | 7.5× | 11.5× |
+| gpt3_13b_full_hpn128 | 5220.5 | 835.30 | 354.60 | 530.30 | 123.90 | 2.86× | 14.7× | 42.1× |
+| llama_65b_full_hpn128 | 6520.9 | 503.10 | 492.10 | 308.10 | 178.50 | 2.76× | 13.3× | 36.5× |
+| gpt3_175b_full_hpn128 | 6384.6 | 499.90 | 493.00 | 307.30 | 172.90 | 2.85× | 13.0× | 36.9× |
+| gpt3_13b_probe_hpn512 | 2986.5 | 214.20 | 156.30 | 125.20 | 63.80 | 2.45× | 19.1× | 46.8× |
+| llama_65b_probe_hpn512 | 3289.7 | 153.70 | 197.30 | 115.90 | 111.60 | 1.38× | 21.4× | 29.5× |
+| llama_65b_mid_hpn512 | 5380.8 | 227.30 | 287.80 | 105.60 | 96.30 | 2.36× | 23.7× | 55.9× |
+| gpt3_13b_probe_hpn1024 | 6139.4 | 409.40 | 349.30 | 216.50 | 158.80 | 2.20× | 17.6× | 38.7× |
+| gpt3_13b_mid_hpn1024 | 16032.2 | 823.00 | 702.10 | 411.70 | 288.30 | 2.44× | 22.8× | 55.6× |
+| llama_65b_mid_hpn1024 | 12517.3 | 434.60 | 593.60 | 173.20 | 203.50 | 2.51× | 28.8× | 72.3× |
+| gpt3_175b_probe_hpn1024 | 23325.9 | 887.40 | 1377.10 | 328.20 | 389.80 | 2.70× | 26.3× | 71.1× |
+| gpt3_13b_mid_hpn512 | 6638.1 | 504.00 | 376.50 | 289.10 | 158.90 | 2.37× | 17.6× | 41.8× |
+| llama_65b_probe_hpn1024 | 7026.8 | 279.50 | 402.50 | 108.80 | 128.60 | 2.57× | 25.1× | 64.6× |
+
+Times are as `check_closed.sh` prints them (0.1 s), so the shortest collectives are rough.
 
 ## SimAI's event uids wrap after 2^32 events
 
