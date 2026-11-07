@@ -534,6 +534,12 @@ struct Sim
 #ifdef TWINS_ASTRA
     // the closed loop with astra-sim (src/astra/closed.h)
     struct ClCtl *cl;
+    int nvl_oracle; // --nvl-oracle: flows between GPUs of one server are not run (closed.h)
+    // --nvl-record: the messages that start those flows (made in closed_apply), for twins-island
+    Chain *nvl_xc;
+    struct CEvH *nvl_xh; // (t: its time, flow, base: unused; code: the bucket's slot, low 32 bits)
+    int64_t *nvl_xa;     // its bucket's slot
+    unsigned long long *nvl_xn, nvl_xcap;
     struct CEvH *cev_h;
     Chain *cev_c;
     unsigned long long cev_mask;

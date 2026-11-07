@@ -161,6 +161,43 @@ __host__ __device__ __forceinline__ uint32_t ccode(int64_t lead, int ord)
 }
 
 __device__ TailPool g_tail;
+// Tail nodes made elsewhere (--nvl-islands): a pos's top byte names its maker, 0 the GPU, k + 1
+// island k. The GPU reads the islands' rings in mapped host memory; an island reads the others'
+// in shared memory, and the GPU's from the copies it was sent (src/rdma/island.h).
+constexpr int TAIL_SIDE = 56;
+// An island's ring is read by the GPU and the other islands while the island writes it. Islands
+// read each other's as a seqlock: the writer clears a node's pos, writes the node, then sets pos; a
+// reader copies a node and takes it only if pos was the one it wanted before and after. The GPU,
+// where fences cost, takes none older than lo (twins-ai sets it, half a ring below the island's
+// count, before each window, and counts a window in which an island wrote more as a lost tail).
+#ifdef TWINS_CPU
+TailNode island_remote(uint64_t p); // (island.h)
+extern uint64_t g_tail_side;        // this island's top byte, shifted
+#else
+struct RemoteRings
+{
+    const TailNode *n[64];
+    uint64_t mask[64];
+    uint64_t lo[64]; // (a count, without the side byte)
+};
+__device__ const RemoteRings *g_remote;
+#endif
+__device__ __forceinline__ TailNode tail_at(uint64_t p)
+{
+#ifdef TWINS_CPU
+    if ((p >> TAIL_SIDE) != (g_tail_side >> TAIL_SIDE))
+        return island_remote(p);
+#else
+    if (p >> TAIL_SIDE)
+    {
+        const int k = (int)(p >> TAIL_SIDE) - 1;
+        if ((p & ((1ull << TAIL_SIDE) - 1)) <= g_remote->lo[k])
+            return TailNode{}; // (may be overwritten in this window: lost)
+        return g_remote->n[k][(p - 1) & g_remote->mask[k]];
+    }
+#endif
+    return g_tail.n[(p - 1) & g_tail.mask];
+}
 // remembered comparisons (see ccmp): key | result, open addressing
 struct Memo
 {
@@ -214,16 +251,28 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
         c.root = par.root;
         c.tail = par.tail;
         c.hash = chash(par.hash, code);
+#ifdef RDMA_CRIT
+        c.pad = par.pad; // (the scheduler's depth)
+#else
         c.pad = 0;
+#endif
         if (par.r[RUNS - 1].code)
         {
-#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__) || defined(TWINS_CPU)
             uint64_t pos = atomicAdd(g_tail.cnt, 1ull) + 1;
             TailNode &n = g_tail.n[(pos - 1) & g_tail.mask];
+#ifdef TWINS_CPU
+            __atomic_store_n(&n.pos, 0ull, __ATOMIC_RELAXED); // (read by others as it is written: see tail_at)
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
             n.code = par.r[RUNS - 1].code;
             n.cnt = par.r[RUNS - 1].cnt;
             n.next = par.tail;
+#ifdef TWINS_CPU
+            __atomic_store_n(&n.pos, (unsigned long long)pos, __ATOMIC_RELEASE);
+#else
             n.pos = pos;
+#endif
             c.tail = pos;
 #else
             c.tail = 0; // (the host builds short chains only)
@@ -242,6 +291,7 @@ struct RunCursor
     const Chain *c;
     int i;          // inline run, or RUNS: in the tail
     uint64_t node;  // the current tail node's pos
+    uint64_t nxt;   // and its next (from the copy read)
     uint32_t code;  // 0: the end
     uint32_t left;  // repetitions left of the current run
     bool lost;      // the tail was overwritten
@@ -286,7 +336,7 @@ struct RunCursor
             code = 0;
             return;
         }
-        const TailNode &n = g_tail.n[(node - 1) & g_tail.mask];
+        const TailNode n = tail_at(node);
         if (n.pos != node)
         {
             lost = true;
@@ -295,6 +345,7 @@ struct RunCursor
         }
         code = n.code;
         left = n.cnt;
+        nxt = n.next;
     }
     __device__ __forceinline__ void next()
     {
@@ -308,7 +359,7 @@ struct RunCursor
             }
         }
         else
-            node = g_tail.n[(node - 1) & g_tail.mask].next;
+            node = nxt;
         load();
     }
 };
@@ -607,7 +658,27 @@ __device__ __forceinline__ bool before(const Sim &s, int64_t ta, uint32_t pa, co
 
 // debugging: -DRDMA_TRACE_NODE=n -DRDMA_TRACE_FROM=ns -DRDMA_TRACE_UNTIL=ns prints the events node n
 // runs in that window, with their chains
-#ifdef RDMA_TRACE_NODE
+#if defined(RDMA_CRIT)
+// -DRDMA_CRIT: the critical path of the run's dependences, in events. An event's depth is one more than
+// the larger of its scheduler's (carried in its chain's pad) and the previous event's of its node;
+// its frames and the events it schedules carry it on. (A node's ports count as one entity.)
+__device__ uint32_t *g_crit_last; // [N]
+__constant__ int c_crit_h;
+__device__ unsigned int g_crit_max;
+__device__ unsigned long long g_crit_ev;
+__device__ unsigned long long *g_crit_n; // [N * 4]: a node's events, by device (hosts) or 3 (switches)
+__device__ __forceinline__ void trace_event(int node, int64_t, const char *what, int port, const Chain &cc)
+{
+    atomicAdd(&g_crit_n[node * 4 + (node < c_crit_h && port >= 0 && port < 3 ? port : 3)], 1ull);
+    Chain &c = const_cast<Chain &>(cc);
+    const uint32_t last = atomicAdd(&g_crit_last[node], 0u);
+    const uint32_t d = (c.pad > last ? c.pad : last) + 1;
+    c.pad = d;
+    atomicMax(&g_crit_last[node], d);
+    atomicMax(&g_crit_max, d);
+    atomicAdd(&g_crit_ev, 1ull);
+}
+#elif defined(RDMA_TRACE_NODE)
 __device__ __forceinline__ void trace_event(int node, int64_t now, const char *what, int port, const Chain &c)
 {
     if (node != RDMA_TRACE_NODE || now < RDMA_TRACE_FROM || now > RDMA_TRACE_UNTIL)
@@ -616,6 +687,22 @@ __device__ __forceinline__ void trace_event(int node, int64_t now, const char *w
     for (int i = 0; i < RUNS && c.r[i].code; i++)
         printf(" %u.%u:%u", (c.r[i].code >> CODE_ORD_BITS) - 1, CODE_ORD_MAX - (c.r[i].code & CODE_ORD_MAX), c.r[i].cnt);
     printf(" root %u%s\n", c.root, c.tail ? " +tail" : "");
+}
+#elif defined(TWINS_ASTRA) && defined(TWINS_NVL_EV)
+// --nvl-record's F.ev (a -DTWINS_NVL_EV build: a load and a branch on every event): the events inside
+// each server (at a GPU's NVLink device, or an NVSwitch), counted per server (g_nvl_mask: a host's
+// NVLink devices as bits, 0x80 an NVSwitch; g_nvl_srv: the server)
+__device__ uint32_t *g_nvl_cnt;
+__device__ const uint8_t *g_nvl_mask;
+__device__ const int *g_nvl_srv;
+__device__ __forceinline__ void trace_event(int node, int64_t, const char *, int port, const Chain &)
+{
+    if (g_nvl_cnt)
+    {
+        const uint8_t m = g_nvl_mask[node];
+        if ((m & 0x80) || (port >= 0 && port < 7 && ((m >> port) & 1)))
+            atomicAdd(&g_nvl_cnt[g_nvl_srv[node]], 1u);
+    }
 }
 #else
 __device__ __forceinline__ void trace_event(int, int64_t, const char *, int, const Chain &) {}
@@ -640,6 +727,27 @@ __device__ __noinline__ void dag_msg(const Sim &s, int f, int64_t tE, int64_t tI
 {
     int64_t ts = tI + s.send_lat;
     int64_t a = (int64_t)fdiv(s.fD, tE + s.send_lat);
+#if defined(TWINS_ASTRA) && !defined(TWINS_CPU)
+    if ((s.nvl_xc || s.nvl_oracle) && s.fi[f].fast)
+    {
+        // a flow within a server: its message for the recording or for its island (--nvl-record,
+        // --nvl-islands); not run here with --nvl-oracle or --nvl-islands
+        Chain x, c;
+        cpush(&x, ccode(0, ord), E);
+        cpush(&c, ccode(s.send_lat, 0), x);
+        if (s.nvl_xc)
+        {
+            // (a ring, read every sync: nvl_xcap a power of two, more in one sync is reported there)
+            const unsigned long long i = atomicAdd(s.nvl_xn, 1ull) & (s.nvl_xcap - 1);
+            s.nvl_xc[i] = c;
+            s.nvl_xh[i].t = ts;
+            s.nvl_xh[i].flow = f;
+            s.nvl_xa[i] = a;
+        }
+        if (s.nvl_oracle)
+            return;
+    }
+#endif
     int b = (int)fmod(s.fnbi, a);
     unsigned int n = atomicAdd(&s.dmsg_n[b], 1u);
     if (n >= (unsigned)s.dcap)
@@ -3907,6 +4015,7 @@ __device__ __forceinline__ bool block_entry(const Sim &s, const BlockInfo *tab, 
     return !fin;
 #endif
 }
+#ifndef TWINS_CPU
 template <bool MULTI>
 __global__ void __launch_bounds__(BLOCK) rdma_slot()
 {
@@ -3919,10 +4028,12 @@ __global__ void __launch_bounds__(BLOCK) rdma_slot()
         return;
     slot_entity<MULTI>(s, blockIdx.x, bi, slot, smem, gk);
 }
+#endif
 
 // the switches with many ports (spines), alongside rdma_slot: a lane per port, up to BLOCK_BIG
 // lanes (their ports' loads and stores in one round, not one per BLOCK ports)
 constexpr int BLOCK_BIG = 256;
+#ifndef TWINS_CPU
 template <bool GW>
 __global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
 {
@@ -3935,6 +4046,7 @@ __global__ void __launch_bounds__(BLOCK_BIG) rdma_slot_big()
         return;
     switch_block<true, GW>(s, bi, slot, smem, s.kb, gk);
 }
+#endif
 
 // Ranks ahead, alongside a launch's kernels every rank_every launches (a block per wide switch and
 // slot): the arrivals of slot + rank_ahead + i (i < rank_every) are all filed when the in-links
@@ -3950,6 +4062,7 @@ struct RankArr
     int port, rank, hard;
 };
 constexpr int RPOOL = 256, RPAIRS = 2048;
+#ifndef TWINS_CPU
 __global__ void rdma_rank()
 {
     const Sim &s = c_sim;
@@ -4051,10 +4164,12 @@ __global__ void rdma_rank()
         if (ra[j].hard)
             s.frank[ra[j].frame] = a << 20 | ra[j].rank;
 }
+#endif
 
 // Persistent (when every block fits on the GPU at once, and no switch is wide): a launch runs up to
 // `slots` slots, rdma_slot's blocks waiting for the slot's last one (slot_end) instead of the next
 // launch.
+#ifndef TWINS_CPU
 template <bool MULTI>
 __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
 {
@@ -4097,10 +4212,12 @@ __global__ void __launch_bounds__(BLOCK) rdma_persist(int slots)
         __syncthreads();
     }
 }
+#endif
 
 #ifdef TWINS_ASTRA
 // a sync's actions in the order they were made (a timer's chain before its children's), then the
 // host's bounds on what runs next. On one lane: they are few, and chains build on each other.
+#ifndef TWINS_CPU
 __global__ void closed_apply(int n, int64_t limit, int64_t cap, int single, unsigned long long seen, unsigned long long floor)
 {
     const Sim &s = c_sim;
@@ -4125,8 +4242,72 @@ __global__ void closed_apply(int n, int64_t limit, int64_t cap, int single, unsi
         *s.gk = single || c.k <= 1 || room <= 1 ? 1 : (int)(c.k < room ? c.k : room);
     }
 }
+#endif
+
+constexpr int NVL_DEPTH = 1024; // tail nodes of a chain recorded (beyond: lost, if a comparison reaches it)
+// --nvl-record: the tail nodes of completions' chains (ring slots idx[e]) not recorded before, each
+// chain's newest first (seg[e] its first in out); mark[slot] is the pos recorded there. err: 1 a tail
+// overwritten, 2 more than cap nodes
+#ifndef TWINS_CPU
+__global__ void nvl_walk(const Chain *base, const uint32_t *idx, int n, TailNode *out, int cap, int *seg, int *nout, uint64_t *mark, int *err,
+                         int depth_max)
+{
+    int k = 0;
+    for (int e = 0; e < n; e++)
+    {
+        seg[e] = k;
+        uint64_t p = base[idx[e]].tail;
+        for (int depth = 0; p && depth < depth_max; depth++)
+        {
+            const uint64_t slot = (p - 1) & g_tail.mask;
+            if (mark[slot] == p)
+                break;
+            const TailNode &t = g_tail.n[slot];
+            if (t.pos != p)
+                break; // (overwritten: nothing the recording run compared reached it)
+            if (k == cap)
+            {
+                *err = 2;
+                return;
+            }
+            mark[slot] = p;
+            out[k++] = t;
+            p = t.next;
+        }
+    }
+    seg[n] = k;
+    *nout = k;
+}
+#endif
+
+#ifndef TWINS_CPU
+// --nvl-islands: the tail nodes of chains base[idx[e]] not found before, a thread a chain (each node
+// once: mark[slot] holds the pos taken there), up to depth_max of a chain; their order is any
+__global__ void nvl_walk_par(const Chain *base, const uint32_t *idx, int n, TailNode *out, int cap, unsigned int *nout,
+                             unsigned long long *mark, int depth_max)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n)
+        return;
+    uint64_t p = base[idx[e]].tail;
+    for (int d = 0; p && !(p >> TAIL_SIDE) && d < depth_max; d++)
+    {
+        const uint64_t slot = (p - 1) & g_tail.mask;
+        const TailNode t = g_tail.n[slot];
+        if (t.pos != p)
+            break; // (overwritten)
+        if (atomicExch(&mark[slot], (unsigned long long)p) == p)
+            break; // (taken: by an earlier walk, or another thread now)
+        const unsigned int i = atomicAdd(nout, 1u);
+        if (i < (unsigned)cap)
+            out[i] = t;
+        p = t.next;
+    }
+}
+#endif
 
 // a timer against a completion of its time and lead: their chains decide (in cl->cmp)
+#ifndef TWINS_CPU
 __global__ void closed_cmp(int tslot, int j)
 {
     const Sim &s = c_sim;
@@ -4138,8 +4319,10 @@ __global__ void closed_cmp(int tslot, int j)
         atomicAdd(&s.ev[8], 1ull);
     s.cl->cmp = c;
 }
+#endif
 
 // the order of the completions of one time, as ccmp decides it
+#ifndef TWINS_CPU
 __global__ void closed_sort(int n)
 {
     const Sim &s = c_sim;
@@ -4166,6 +4349,7 @@ __global__ void closed_sort(int n)
     }
     x.rank = r;
 }
+#endif
 #endif
 
 } // namespace rdma

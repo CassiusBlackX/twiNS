@@ -123,6 +123,187 @@ at 128 GPUs and 1.4 s at 1024.
 - **Training at 1024 GPUs (15–29×).** GPU time is 75–90% of the wall clock. GPT-3 13B again costs the most:
   frames are few and spread out, and NVLink stays busy.
 
+## The bound: the critical path
+
+`-DRDMA_CRIT` (a counting build; results unchanged) gives each event a depth: one more than the
+larger of its scheduler's depth (carried in its chain) and the previous event's at its node. The
+deepest event is the run's critical path, the most any exact execution must do one after another.
+A node's ports count as one entity; the path follows scheduling and per-node order, so it is a lower
+bound. Replays of four paper runs (identical to SimAI):
+
+| run | critical path (events) | events | events per step | dependent events per 25 ns slot | wall | wall per critical event |
+|---|---|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 8.43 M | 656 M | 78 | 3.7 | 89.9 s | 10.7 µs |
+| LLaMA 65B probe, 128 GPUs | 4.16 M | 839 M | 202 | 1.3 | 44.0 s | 10.6 µs |
+| GPT-3 175B probe, 128 GPUs | 12.5 M | 2759 M | 221 | 1.6 | 136.7 s | 11.0 µs |
+| AllReduce 512 MB, 128 GPUs | 1.21 M | 115 M | 95 | 0.5 | 10.2 s | 8.4 µs |
+
+TwiNS's time is about 10 µs per event of the critical path in all four. So it already runs close to
+the bound its event latency sets: another way of running the same events in parallel gains little.
+Only a lower latency per dependent event can. SimAI, on one core of a87, spends about 0.8 µs per
+event (518 s for the 13B run's 656 M events, counted as TwiNS counts them).
+
+**Where the events are.** In the 13B run, 77.7% of the events are inside servers: 258 M at the GPUs'
+NVLink devices and 252 M at the NVSwitches, against 37 M at the NICs and 110 M at ToRs and spines.
+LLaMA 65B: 82.1%. That is 31.9 M events per server (13B), 43.1 M (LLaMA).
+
+## The servers on their own: an oracle
+
+Flows between the GPUs of one server use only the server's NVLinks and NVSwitch, and flows between
+servers never touch them (`FlowInfo::fast`; ports are counted per host pair, so the two kinds never
+share one). They meet only in the system layer, through completions and actions, which the closed
+loop already carries every send_lat. So a server's NVLink part could run elsewhere, on a CPU core,
+exchanging completions with the GPU at each sync.
+
+`twins-ai --nvl-record=F` writes every completion of such a flow with its chain and the tail nodes
+the chain reaches (each once, up to 1024 deep). `--nvl-oracle=F` then does not run those flows: it
+puts the recorded completions into the ring as the GPU passes them, with their tails rebuilt in the
+new run's ring, and NVSwitches no longer force single slots. A comparison that needs a tail deeper
+than recorded counts as on a lost tail.
+
+| run | GPU, closed loop | GPU, oracle | against SimAI (messages, DAG lines) |
+|---|---|---|---|
+| AllReduce 512 MB, 128 GPUs | 11.9 s | 11.5 s | identical (no NVLink flows) |
+| GPT-3 13B probe, 128 GPUs | 90.1 s | 14.3 s | identical; 4096 ties reached a cut tail (reported) |
+| LLaMA 65B probe, 128 GPUs | 45.2 s | 13.2 s | identical, no lost tails |
+
+So the separation holds, and without the NVLinks the GPU does the 13B run's network in a sixth of the
+time. The oracle's own wall time (36 s and 69 s) is mostly copying tens of millions of tail nodes
+into the ring, which running the servers elsewhere would not need.
+
+**What running them on CPU cores would take.** `--nvl-record` also writes each server's count of
+such events per sync (`F.ev`, in a `-DTWINS_NVL_EV` build: the count costs about 1% on every run otherwise); `validation/simai/nvl_project.py` spreads the servers over P cores
+and charges each window its busiest core (events × c) and a barrier, before the window ends. With
+the oracle's GPU time and the system layer and sync on top:
+
+| run, now | cores | c = 0.2 µs | c = 0.4 µs | c = 0.8 µs |
+|---|---|---|---|---|
+| 13B probe, 89.9 s | 16 | 17–28 s | 25–40 s | 48–62 s |
+| 13B probe | 4 | 33–48 s | 64–78 s | 126–140 s |
+| LLaMA probe, 49.9 s | 16 | 18–27 s | 22–35 s | 39–52 s |
+| LLaMA probe | 4 | 39–52 s | 74–87 s | 143–156 s |
+
+The ranges run from GPU and CPU fully overlapped to one after the other. c is the cost of one event
+on a core: SimAI spends 0.8 µs on a87 (Xeon Gold 5218); a 9950X core is about twice as fast, and an
+engine without ns-3's overheads faster again, but no CPU version of TwiNS's server model exists to
+measure it. So on 16 cores and at 0.4 µs or less, running the servers on the CPU would gain 2.3–3.6×
+for the 13B run and 1.4–2.3× for LLaMA. On 4 cores it gains little, or loses.
+
+**c, measured.** `validation/simai/nvl_island_bench.cc` is a sequential event loop with SimAI's
+NVLink behaviour (QPs paced at line rate within their window, an ACK per frame, the NVSwitch a FIFO
+per egress port, a chain pushed per event), fed the 13B run's recorded flows within servers. It is
+not exact, but it does the same work: 503.5 M events against the GPU's 509.9 M, and it ends at
+56.372 ms against 56.374. On this machine's i5-7500 it takes 0.141 µs per event on one thread and
+0.177 µs with 4 threads (71.1 s and 22.5 s for the 16 servers). On the 5090 host's Ryzen 9950X
+(shared with another user's jobs, load about 2): 0.068 µs on one thread, 0.076 µs with 16 (2.7 s for
+the 16 servers). An exact engine also compares chains
+at ties; at 0.2 µs, the table gives 33–48 s for the 13B run on these 4 cores (1.9–2.7×) and 17–28 s
+on 16 (3.2–5.4×). On the 9950X the servers' part shrinks to a few seconds, and the GPU's part, 14 s on the
+RX 9060 XT, sets the time: about 17 s against 90 (5×).
+
+## The servers on CPU cores: islands
+
+`twins-ai --nvl-islands=P` runs the flows within servers on P `twins-island` processes, each a
+batch of servers, and the network between servers on the GPU. An island is rstep.cuh's own device
+code built for the CPU (`TWINS_CPU` in `src/gpu_runtime.h`: one lane a block, blocks in turn, so
+switches run serially, which is exact), so it makes the same events and chains as the GPU would.
+- **Exchange.** At each sync, twins-ai sends each island the messages that start its flows (with
+  their chains) and runs every island to the sync's limit while the GPU runs its window. The
+  islands' completions go into the GPU's ring of completions and through `closed_sort` with the
+  GPU's own, so the system layer sees them in the same order.
+- **Chains across processes.** A tail node's position names its maker in its top byte (0 the GPU,
+  k + 1 island k). The GPU reads the islands' rings in mapped host memory, an island reads the
+  other islands' in shared memory. The GPU nodes a start reaches (all of them, each once) go into
+  one table in shared memory that every island reads, not only the start's: a chain can go from one
+  island's ring into another's and on into GPU nodes that came with the other's start. twins-ai
+  writes the table only while every island waits for its next command. A node that is overwritten or
+  not in the table is a lost tail, counted as on the GPU.
+- **Safety.** The islands die with twins-ai (`PR_SET_PDEATHSIG`). Their shared memory is removed at
+  the end, and also when twins-ai is killed (SIGTERM, SIGINT, SIGHUP, as from `timeout`): it lives in
+  /dev/shm, that is in memory.
+
+**Exact.** With `--nvl-islands=4` all 47 runs of the what-if matrix and all 42 paper runs are
+identical to SimAI, per message and per DAG line. (GPT-3 175B full at 128 GPUs first seemed to
+differ in 165 messages: the reference beside it had been rebuilt from SimAI's 32-bit-uid trace,
+which `check_e2e.sh` no longer does. Against its 64-bit-uid reference, islands and the GPU alone
+give the same output, byte for byte.)
+- **Rings wrap, and that is checked.** An island makes up to 1.76 G tail nodes in that run, against
+  a ring of 2^24 (`--nvl-ringlog`), while others read it. Islands read each other's as a seqlock (a
+  node's pos is cleared, the node written, pos set; a copy counts only if pos matched before and
+  after). The GPU, where fences cost, takes no node within half a ring of the island's count when
+  the window began, and twins-ai counts a window in which an island wrote more than that. Either
+  way a comparison that reaches such a node counts as on a lost tail. The islands' counts of those
+  ties (and of undecided ties and overflows) are added to twins-ai's own, so its warning and its
+  automatic rerun, now also with larger island rings, cover them. With the fixes below, no run here
+  has any.
+
+**Speed, this machine** (i5-7500, 4 cores for 4 islands and twins-ai; RX 9060 XT). Wall clock of
+the closed loop, against the same build without islands; with islands, the final build's runs in the
+validation above (one run each; repeats of the 13B probe vary by about 5%):
+
+| run | without | with 4 islands | | SimAI, 1 core |
+|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 89.9 s | 42.4 s | 2.12× | 518 s |
+| GPT-3 13B full, 128 GPUs | 835 s | 355 s | 2.35× | 5221 s |
+| GPT-3 13B probe, 512 GPUs | 214 s | 156 s | 1.37× | 2987 s |
+| GPT-3 13B mid, 512 GPUs | 504 s | 377 s | 1.34× | 7157 s |
+| GPT-3 13B probe, 1024 GPUs | 409 s | 349 s | 1.17× | 6139 s |
+| LLaMA 65B probe, 128 GPUs | 49.9 s | 50.7 s | 0.98× | 620 s |
+| GPT-3 175B probe, 128 GPUs | 154 s | 146 s | 1.06× | 2125 s |
+| LLaMA 65B probe, 512 GPUs | 154 s | 197 s | 0.78× | 3526 s |
+| GPT-3 175B probe, 1024 GPUs | 887 s | 1377 s | 0.64× | 23326 s |
+
+On 4 cores the islands help where NVLink dominates (GPT-3 13B: its 5.8× against SimAI becomes
+12.2×), and cost time elsewhere: the four islands and twins-ai's own thread share four cores.
+
+**Speed, the 5090 host** (Ryzen 9950X, 16 cores, 16 islands; RTX 5090), final build, 2026-11-07,
+with the GPU otherwise idle (another user's CPU jobs took about 1.5 cores at times). All 42 paper runs,
+with and without islands, identical to SimAI. Selected runs (all: `paper.md`, "On an RTX 5090"):
+
+| run | without | with 16 islands | | SimAI, 1 core (fastest) | against SimAI |
+|---|---|---|---|---|---|
+| GPT-3 13B probe, 128 GPUs | 55.9 s | 15.5 s | 3.6× | 497 s | 32× |
+| GPT-3 13B full, 128 GPUs | 530 s | 124 s | 4.3× | 5221 s | 42× |
+| LLaMA 65B probe, 128 GPUs | 29.9 s | 17.6 s | 1.7× | 620 s | 35× |
+| GPT-3 175B probe, 128 GPUs | 93.1 s | 44.6 s | 2.1× | 2125 s | 48× |
+| GPT-3 13B probe, 512 GPUs | 125 s | 63.8 s | 2.0× | 2987 s | 47× |
+| GPT-3 13B mid, 512 GPUs | 289 s | 159 s | 1.8× | 6638 s | 42× |
+| LLaMA 65B probe, 512 GPUs | 116 s | 112 s | 1.04× | 3290 s | 30× |
+| GPT-3 13B probe, 1024 GPUs | 217 s | 159 s | 1.4× | 6139 s | 39× |
+| LLaMA 65B probe, 1024 GPUs | 109 s | 129 s | 0.85× | 7027 s | 65× (without) |
+| GPT-3 175B probe, 1024 GPUs | 328 s | 390 s | 0.84× | 23326 s | 71× (without) |
+
+**The fixes cost more with 16 islands.** The build before the two fixes under "What went wrong on the
+way" ran the 13B probe at 128 GPUs in 12.2 s with 16 islands here, although another user's GPU job was
+running; the final build takes 15.3–15.6 s on the idle machine (4 runs), and 55.7 s without islands
+(53.9 s before). So with 16 islands the fixes cost about 25% on that run, against about 4% with 4
+islands on the RX host. Where that goes (more islands reading the shared table, or waiting on
+multi-part commands) has not been measured.
+
+Against the RX 9060 XT host (best of with and without islands on each), the 5090 host is 2.2–3.3×
+faster on training and 1.0–1.9× on collectives. The 13B run at 128 GPUs lands near the estimate
+above (17 s estimated, 15.5 s measured). At 1024 GPUs the system layer and the syncs, on one core,
+are most of what is left (175B probe with islands: GPU 95 s, system layer 74 s, sync 137 s), and
+islands do not touch them.
+
+**When to use it.** On a machine with many cores, for runs whose time is in the NVLinks (GPT-3 13B
+at any size, any run at 128 GPUs). Without spare cores, or on LLaMA-like runs at 512 GPUs and
+beyond, leave it off. P is not chosen automatically.
+
+## The other ways considered for NVLink
+
+- **Lower latency per event on the GPU (state in LDS, lanes comparing chains together, software
+  pipelining).** Not tried. The critical path says the GPU is within about 10 µs per dependent
+  event of its bound on every run, so this is the only GPU-side way left, but it would need the
+  event cost cut to about a quarter to match what the CPU islands now give on 16 cores, and the
+  wave traces above show no single hot spot to cut.
+- **Server islands on the GPU** (a server's events run serially by one block, in more slots per
+  launch): see "Dynamic server islands" below; it needs the same fourfold cut first.
+- **Optimistic islands** (run ahead, roll back on a late message): not built. All it could hide
+  is the time twins-ai waits for the islands at each sync: on the 13B run at 128 GPUs, 1.2 of 12.2 s
+  on the 9950X and about 10 of 40 s on this machine's 4 cores. It would bring state saving and the
+  rollback of chains and tail rings with it.
+
 ## Rejected, with measurements
 
 - **`--win=32` on GPT-3 13B.** 128 GPUs 97.97 s against 87.95 s; 512 GPUs 252 s against 196 s.
@@ -144,6 +325,19 @@ at 128 GPUs and 1.4 s at 1024.
 
 ## What went wrong on the way
 
+- **Islands: GPU nodes sent to one island only, and a short wait.** Two bugs, found once the islands'
+  own tie counts reached twins-ai's report. (1) twins-ai sent a GPU tail node only to the island
+  whose start reached it (and only 64 deep). A chain on island A that went through island B's ring
+  reached GPU nodes A never had. Seven matrix runs counted ties on such lost tails (up to 21,606, on
+  MoE) and undecided ties (up to 960, on microAR), and reran twice with larger rings, to no effect.
+  Every output was still identical: the ties fell the right way, but nothing guaranteed it. GPU nodes
+  now go, all of them, into one table all islands read. (Sending each island its own copy also fixed
+  it, but cost 19% on the 13B run: 18 M items moved instead of 34 thousand.) (2) A command longer than an island's input (2^18 items) goes
+  in parts, each answered. twins-ai waited for an answer counted from before the first part, so it
+  went on after the first answer and wrote the next command over the input the island was still
+  reading. MoE on 200 Gb/s lost two flow starts this way and never ended (1590 s, then over the
+  1800 s cap; 17 s now).
+
 - **A hang from `2b362e1`.** In a sparse window, a switch could stay marked busy with no frame to come, so
   the network never went idle. Three DCN+ 4 MB runs that strand flows (`ar64`, `llp`, `a2a`) then timed
   out. The gate had no case with stranded flows, and the commit went in before its gate finished; the
@@ -161,3 +355,7 @@ jobs had the GPU at 100% whenever it was checked, and sync time was inflated. Un
 to 3.1× faster than the code before these changes on window-heavy cases (`c_allreduce_512m_hpn128` 43.2 →
 13.9 s, LLaMA probe at 1024 GPUs 425.7 → 147.9 s) and unchanged on GPT-3 13B. Those figures compare this
 work's two builds on a shared GPU; they are not TwiNS against SimAI.
+
+Measured again with the final build on 2026-11-07, the GPU otherwise idle (`paper.md`, "On an RTX
+5090"): all 42 paper runs and all 47 what-if runs identical, with and without 16 islands; against the
+RX 9060 XT host, 2.2–3.3× faster on training and 1.0–1.9× on collectives.

@@ -55,8 +55,11 @@
 #include <unistd.h>
 #include <vector>
 #include "rstep.cuh"
-#if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__)
+#if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__) && !defined(TWINS_ISLAND)
 #define TWINS_ASTRA_HOST
+#endif
+#ifdef TWINS_CPU
+thread_local twins_dim3 threadIdx, blockIdx, blockDim, gridDim;
 #endif
 
 using namespace rdma;
@@ -74,6 +77,9 @@ using std::vector;
         }                                                                                           \
     } while (0)
 
+#ifdef RDMA_CRIT
+static unsigned long long *g_crit_host;
+#endif
 template <typename T>
 static T *dev_alloc(size_t n)
 {
@@ -229,8 +235,13 @@ struct World
     double stop_ns = 0;     // SIMULATOR_STOP_TIME
 };
 
+static int g_argc;
+static char **g_argv;
 #ifdef TWINS_ASTRA_HOST
 #include "astra/closed.h"
+#endif
+#ifdef TWINS_ISLAND
+#include "rdma/island.h"
 #endif
 
 // a traced DAG (docs/ai/dag.md): its actions by cause; main's, and their timers', expanded here
@@ -671,6 +682,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.base_rtt = max_rtt;
     const int has_win = cfg.u32("HAS_WIN", 1);
     P.win = has_win ? (uint32_t)max_bdp : 0;
+    // (twins-island: a server alone, with the whole cluster's maxRtt and maxBdp, which SimAI's
+    // GLOBAL_T gives every flow)
+    if (cfg.u32("NVL_BASE_RTT", 0))
+        P.base_rtt = cfg.u32("NVL_BASE_RTT", 0);
+    if (cfg.u32("NVL_WIN", 0) && has_win)
+        P.win = cfg.u32("NVL_WIN", 0);
 
     // ---- switch ports: headroom, pfc_a_shift (from 3, one less per halving of the rate above the
     // NIC rate, which is host 0's first link's), ECN thresholds by rate
@@ -797,6 +814,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
 #ifdef TWINS_ASTRA_HOST
         if (g_cl)
             g_cl->world(w, (int64_t)cfg.num("SEND_LAT_NS", 3000));
+#endif
+#ifdef TWINS_ISLAND
+        island_world(w);
 #endif
         if (!ons.empty() && !traced_dag(w, ons, !deps.empty(), (int64_t)cfg.num("SEND_LAT_NS", 3000)))
             return false;
@@ -1002,6 +1022,8 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
 
 int main(int argc, char **argv)
 {
+    g_argc = argc;
+    g_argv = argv;
     if (argc < 2)
     {
         fprintf(stderr, "usage: twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns] [KEY=VALUE ...]\n"
@@ -1072,6 +1094,24 @@ int main(int argc, char **argv)
             kw = std::max(1, std::min(255, atoi(v.c_str())));
             gwin = 0; // (per-entity windows instead)
         }
+#ifdef TWINS_ISLAND
+        else if (k == "--isl-shm")
+            g_isl_shm = v;
+        else if (k == "--isl-rings") // the tail rings' names: PREFIX0, PREFIX1, ...
+            g_isl_rings = v;
+        else if (k == "--isl-nrings")
+            g_isl_nrings = atoi(v.c_str());
+        else if (k == "--isl-ringlog")
+            g_isl_ringlog = atoi(v.c_str());
+        else if (k == "--isl-side") // this island's side byte (its index + 1)
+            g_isl_side = atoi(v.c_str());
+        else if (k == "--isl-in")
+            g_isl_in = v;
+        else if (k == "--isl-map")
+            g_isl_map = v;
+        else if (k == "--isl-out")
+            g_isl_out = v;
+#endif
         else if (k == "--gwin")
             gwin = std::max(0, std::min(255, atoi(v.c_str())));
 #ifdef TWINS_ASTRA_HOST
@@ -1081,6 +1121,14 @@ int main(int argc, char **argv)
             astra_dag = v;
         else if (k == "--flows-cache")
             astra_cache = v;
+        else if (k == "--nvl-record") // the completions of flows within a server, to a file
+            g_nvl_record = v;
+        else if (k == "--nvl-oracle") // those flows not run: their completions from such a file
+            g_nvl_oracle = v;
+        else if (k == "--nvl-islands") // those flows run by a twins-island per server, on CPU cores
+            g_nvl_islands = atoi(v.c_str());
+        else if (k == "--nvl-ringlog")
+            g_nvl_ringlog = std::max(16, std::min(32, atoi(v.c_str())));
 #endif
         else if (k == "--dcap")
         {
@@ -1379,6 +1427,41 @@ int main(int argc, char **argv)
             if (g < H && nv == 1)
                 h_srv[g] = srv;
         }
+#if defined(TWINS_ASTRA_HOST) && !defined(TWINS_NVL_EV)
+        if (!g_nvl_record.empty())
+            fprintf(stderr, "nvl: no %s.ev (the events inside servers per sync): a -DTWINS_NVL_EV build counts them\n", g_nvl_record.c_str());
+#endif
+#if defined(TWINS_ASTRA_HOST) && defined(TWINS_NVL_EV)
+        if (!g_nvl_record.empty())
+        {
+            // (each node's server and NVLink devices, for counting the events inside servers)
+            vector<uint8_t> mask(H + S, 0);
+            vector<int> srv(H + S, 0);
+            for (int g = 0; g < H + S; g++)
+            {
+                if (g >= H && si[g - H].nvs)
+                    mask[g] = 0x80, srv[g] = g - H;
+                if (g < H && h_srv[g] >= 0)
+                {
+                    srv[g] = h_srv[g];
+                    for (int p = 0; p < deg[g] && p < 7; p++)
+                    {
+                        int from = link_dst[in_link[(size_t)g * K + p] ^ 1];
+                        if (from >= H && si[from - H].nvs)
+                            mask[g] |= 1 << p;
+                    }
+                }
+            }
+            uint32_t *cnt = dev_alloc<uint32_t>(S);
+            const uint8_t *dm = dev_copy(mask);
+            const int *ds = dev_copy(srv);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_cnt), &cnt, sizeof(cnt)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_mask), &dm, sizeof(dm)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_nvl_srv), &ds, sizeof(ds)));
+            g_nvl_cnt_host = cnt;
+            g_nvl_nsw = S;
+        }
+#endif
     }
     vector<int> srv_rs_off(S + 1, 0);
     vector<int64_t> srv_rs;
@@ -1536,6 +1619,12 @@ int main(int argc, char **argv)
                     dep_t[g] = p.ts;
                     dep_c[g] = p.c;
                     dep_c[g].root += fbase[wi];
+#ifdef TWINS_ASTRA_HOST
+                    if ((!g_nvl_record.empty() || g_nvl_islands) && fi[g].fast)
+                        g_nvl_pre.push_back({g, p.ts, dep_c[g]});
+                    if ((!g_nvl_oracle.empty() || g_nvl_islands) && fi[g].fast)
+                        continue; // (its completions come from the recording, or from its island)
+#endif
                     if (dyn_n[h] >= dyn_cap)
                     {
                         fprintf(stderr, "%s: more than %d flows ready at the start on host %d\n", w.name.c_str(), dyn_cap, h);
@@ -1585,7 +1674,7 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
         if (g_cl)
         {
-            g_cl->setup(s, send_lat_slots(s.send_lat, D));
+            g_cl->setup(s, send_lat_slots(s.send_lat, D), fi, h_srv);
             s.tchain = dev_alloc<Chain>(Closed::TCAP);
             g_cl->init_timers(s.tchain);
         }
@@ -1594,6 +1683,9 @@ int main(int argc, char **argv)
         s.tchain = dev_alloc<Chain>(T);
         s.ttime = dev_alloc<int64_t>(T);
         s.tnext = dev_alloc<int>(T);
+#ifdef TWINS_ISLAND
+        island_setup(s);
+#endif
         s.srv_fpend = dev_copy(srv_fpend);
         s.pnic = dev_copy(pnic);
         s.pcnt = dev_copy(pcnt);
@@ -1882,6 +1974,16 @@ int main(int argc, char **argv)
         tp.cnt = dev_alloc<unsigned long long>(1);
         tp.mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
+#ifdef RDMA_CRIT
+        {
+            uint32_t *last = dev_alloc<uint32_t>(N);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_crit_last), &last, sizeof(last)));
+            unsigned long long *cn = dev_alloc<unsigned long long>((size_t)N * 4);
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(g_crit_n), &cn, sizeof(cn)));
+            CK(hipMemcpyToSymbol(HIP_SYMBOL(c_crit_h), &H, sizeof(H)));
+            g_crit_host = cn;
+        }
+#endif
     }
     if (per_sw(s.ks) > 64 * 1024 || sw_ints(s.kb) * sizeof(int) > 64 * 1024)
     {
@@ -1900,6 +2002,7 @@ int main(int argc, char **argv)
     // (sb is not used: HIP gives streams hardware queues in turn, and with the default 4 queues sa
     // and sc made one after the other shared one, which ran rdma_slot and rdma_slot_big in turn,
     // 1.5x slower)
+#ifndef TWINS_ISLAND
     hipStream_t sa, sb, sc;
     CK(hipStreamCreate(&sa));
     CK(hipStreamCreate(&sb));
@@ -2047,6 +2150,9 @@ int main(int argc, char **argv)
         use_rank = g_rank && (ot - open_ties) * 4 > (unsigned long long)GS;
         open_ties = ot;
     }
+#else
+    island_run(s, D);
+#endif
     CK(cudaDeviceSynchronize());
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
@@ -2058,8 +2164,17 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(fct.data(), s.fct, F * sizeof(int64_t), cudaMemcpyDeviceToHost));
     if (s.dag) // the DAG flows' start times
         CK(cudaMemcpy(fi.data(), s.fi, F * sizeof(FlowInfo), cudaMemcpyDeviceToHost));
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl)
+        g_cl->nvl_fct(fi, fct, done); // (--nvl-record / --nvl-oracle: the flows within servers)
+#endif
     unsigned long long ev[40];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));
+#ifdef TWINS_ASTRA_HOST
+    // the islands' ties and overflows count as the run's (--nvl-islands)
+    for (int i : {4, 5, 6, 7, 8, 9, 12, 14, 15, 32, 33})
+        ev[i] += g_isl_ev[i];
+#endif
     for (int wi = 0; wi < W; wi++)
     {
         string path = batch_file.empty() ? out_file : out_dir + "/" + worlds[wi].name + ".fct";
@@ -2103,6 +2218,24 @@ int main(int argc, char **argv)
             fclose(fo);
         }
     }
+#ifdef RDMA_CRIT
+    {
+        unsigned int cm = 0;
+        unsigned long long ce = 0;
+        CK(hipMemcpyFromSymbol(&cm, HIP_SYMBOL(g_crit_max), sizeof(cm)));
+        CK(hipMemcpyFromSymbol(&ce, HIP_SYMBOL(g_crit_ev), sizeof(ce)));
+        {
+            vector<unsigned long long> cn((size_t)N * 4);
+            CK(cudaMemcpy(cn.data(), g_crit_host, cn.size() * 8, cudaMemcpyDeviceToHost));
+            FILE *fo = fopen("crit_nodes.txt", "w");
+            for (int x = 0; x < N; x++)
+                fprintf(fo, "%d %llu %llu %llu %llu\n", x, cn[x * 4], cn[x * 4 + 1], cn[x * 4 + 2], cn[x * 4 + 3]);
+            fclose(fo);
+        }
+        printf("crit: critical path %u events of %llu (parallelism %.1f), over %lld slots: %.3f dependent events per slot\n", cm, ce,
+               (double)ce / (cm ? cm : 1), (long long)slot_end, (double)cm / (slot_end ? slot_end : 1));
+    }
+#endif
     printf("flows done %u of %d; simulated %.6f s in %.3f s wall (%lld launches)\n", done, F, (double)slot_end * delay * 1e-9,
            wall, launches);
 #ifdef TWINS_ASTRA_HOST
@@ -2197,14 +2330,30 @@ int main(int argc, char **argv)
     // overwritten tail: the run is not exact; it starts again with more room, the same arguments
     // otherwise
     const bool redo_d = ev[14] && !dcap_set && dcap < (1 << 20), redo_t = ev[9] && !tail_set && tail_log2 < tail_max;
-    if (redo_d || redo_t)
+#ifdef TWINS_ASTRA_HOST
+    // (with islands, the lost tail may be one of theirs: their rings grow too, up to 2^26 nodes)
+    const bool redo_i = !redo_d && ev[9] && g_nvl_islands && g_nvl_ringlog < 26;
+#else
+    const bool redo_i = false;
+#endif
+    if (redo_d || redo_t || redo_i)
     {
-        const string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27));
+        string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : redo_t ? "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27)) : "";
+#ifdef TWINS_ASTRA_HOST
+        if (redo_i)
+            more += string(more.empty() ? "" : " ") + "--nvl-ringlog=" + std::to_string(g_nvl_ringlog + 2);
+#endif
         fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
         fflush(stdout);
         fflush(stderr);
         vector<string> av(argv, argv + argc);
-        av.push_back(more);
+        for (size_t i = 0, j; i < more.size(); i = j + 1) // (one argument each)
+        {
+            j = more.find(' ', i);
+            if (j == string::npos)
+                j = more.size();
+            av.push_back(more.substr(i, j - i));
+        }
         vector<char *> pv;
         for (auto &a : av)
             pv.push_back(const_cast<char *>(a.c_str()));

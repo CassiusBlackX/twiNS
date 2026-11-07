@@ -3,7 +3,106 @@
 #ifndef TWINS_GPU_RUNTIME_H
 #define TWINS_GPU_RUNTIME_H
 
-#if defined(TWINS_USE_HIP)
+#if defined(TWINS_CPU)
+
+// The device code run on the CPU, one lane a block, blocks one after another (twins-island: a
+// server's NVLink part, src/rdma/island.h). Kernels are not launched here: the island calls them.
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
+#define __host__
+#define __device__
+#define __global__
+#define __forceinline__ inline
+#define __noinline__ __attribute__((noinline))
+#define __launch_bounds__(...)
+#define __align__(n) alignas(n)
+#define __shared__ static thread_local
+#define __constant__
+struct twins_dim3
+{
+    unsigned x = 0, y = 0, z = 0;
+};
+extern thread_local twins_dim3 threadIdx, blockIdx, blockDim, gridDim;
+constexpr int warpSize = 1;
+inline void __syncthreads() {}
+inline int __syncthreads_or(int x) { return x; }
+inline void __threadfence() {}
+inline void __nanosleep(unsigned) {}
+inline long long clock64() { return 0; }
+template <typename T>
+inline T __shfl_up(T x, unsigned) { return x; }
+template <typename T, typename U>
+inline T atomicAdd(T *p, U v) { T o = *p; *p = o + (T)v; return o; }
+template <typename T, typename U>
+inline T atomicSub(T *p, U v) { T o = *p; *p = o - (T)v; return o; }
+template <typename T, typename U>
+inline T atomicMin(T *p, U v) { T o = *p; if ((T)v < o) *p = (T)v; return o; }
+template <typename T, typename U>
+inline T atomicMax(T *p, U v) { T o = *p; if ((T)v > o) *p = (T)v; return o; }
+template <typename T, typename U>
+inline T atomicOr(T *p, U v) { T o = *p; *p = o | (T)v; return o; }
+template <typename T, typename U>
+inline T atomicExch(T *p, U v) { T o = *p; *p = (T)v; return o; }
+template <typename T, typename U, typename V>
+inline T atomicCAS(T *p, U c, V v) { T o = *p; if (o == (T)c) *p = (T)v; return o; }
+// (an island is one thread: the atomics are plain)
+
+typedef int hipError_t;
+typedef int cudaError_t;
+#define hipSuccess 0
+#define cudaSuccess 0
+inline const char *hipGetErrorString(int) { return "out of memory"; }
+#define cudaGetErrorString hipGetErrorString
+inline int hipGetLastError() { return 0; }
+#define cudaGetLastError hipGetLastError
+inline int hipDeviceSynchronize() { return 0; }
+#define cudaDeviceSynchronize hipDeviceSynchronize
+inline int hipMalloc(void **p, size_t n)
+{
+    *p = calloc(1, n);
+    return *p ? 0 : 1;
+}
+#define cudaMalloc hipMalloc
+inline int hipFree(void *p)
+{
+    free(p);
+    return 0;
+}
+inline int hipMemset(void *p, int v, size_t n)
+{
+    memset(p, v, n);
+    return 0;
+}
+#define cudaMemset hipMemset
+enum { hipMemcpyHostToDevice, hipMemcpyDeviceToHost, hipMemcpyDeviceToDevice };
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+inline int hipMemcpy(void *d, const void *s, size_t n, int)
+{
+    memmove(d, s, n);
+    return 0;
+}
+#define cudaMemcpy hipMemcpy
+typedef int hipStream_t;
+#define cudaStream_t hipStream_t
+inline int hipMemcpyAsync(void *d, const void *s, size_t n, int k, hipStream_t = 0) { return hipMemcpy(d, s, n, k); }
+inline int hipStreamSynchronize(hipStream_t) { return 0; }
+#define cudaStreamSynchronize hipStreamSynchronize
+inline int hipMemGetInfo(size_t *f, size_t *t)
+{
+    *f = *t = 64ull << 30;
+    return 0;
+}
+#define cudaMemGetInfo hipMemGetInfo
+#define HIP_SYMBOL(x) x
+#define hipMemcpyToSymbol(sym, src, n) (memcpy(&(sym), (src), (n)), 0)
+#define hipMemcpyFromSymbol(dst, sym, n) (memcpy((dst), &(sym), (n)), 0)
+
+#elif defined(TWINS_USE_HIP)
 
 #include <hip/hip_runtime.h>
 
@@ -51,6 +150,11 @@ inline hipError_t twinsGraphInstantiate(hipGraphExec_t *exec, hipGraph_t graph, 
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipMalloc cudaMalloc
 #define hipMemset cudaMemset
+#define hipMemsetAsync cudaMemsetAsync
+#define hipHostRegister cudaHostRegister
+#define hipHostRegisterMapped cudaHostRegisterMapped
+#define hipHostGetDevicePointer cudaHostGetDevicePointer
+#define hipFree cudaFree
 #define hipMemcpy cudaMemcpy
 #define hipMemcpyAsync cudaMemcpyAsync
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
