@@ -272,7 +272,7 @@ __device__ unsigned long long g_ls_stat[4]; // interned new, found, no room, too
 // pos (and the key is interned when there is room). Keys are compared whole, so equal identities
 // are equal lead sequences; a key not found (full table, an entry being written) only costs a
 // later match.
-__host__ __device__ __forceinline__ uint64_t ls_intern(uint64_t pos, uint32_t lead, uint64_t cnt, uint64_t nxt)
+__device__ __forceinline__ uint64_t ls_intern(uint64_t pos, uint32_t lead, uint64_t cnt, uint64_t nxt)
 {
     const uint64_t lossy = (lead_lossy(lead) ? LS_LOSSY : 0) | (nxt & LS_LOSSY);
     if (cnt >> 37)
