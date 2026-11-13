@@ -339,6 +339,11 @@ __host__ __device__ __forceinline__ uint64_t chash(uint64_t h, uint32_t code)
 // the chain of an event scheduled with `code` by the event whose chain is par
 __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const Chain &par)
 {
+#ifdef TWINS_NO_CHAIN
+    // (ablation: no lineages; every tie is undecided and kept in candidate order)
+    *dst = Chain{};
+    return;
+#endif
     Chain c;
     if (par.r[0].code == code)
     {
@@ -804,6 +809,10 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 {
 #ifdef RDMA_PROF
     atomicAdd(&g_prof[0], 1ull);
+#endif
+#ifdef TWINS_NO_CHAIN
+    *inexact = false;
+    return 0; // (ablation: no lineages)
 #endif
 #ifndef TWINS_HASH_MEMO
     // (strict: no decision rests on a hash; the walk, with its exact memo of tail states)
