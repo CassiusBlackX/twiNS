@@ -152,12 +152,40 @@ __device__ __forceinline__ int ring_wrap(int a, int n)
 __device__ __forceinline__ uint64_t rate_of(double d) { return (uint64_t)d; }
 
 // ------------------------------------------------------------------ event order (see Chain)
+#ifndef TWINS_CLZ64
+#define TWINS_CLZ64
+__host__ __device__ __forceinline__ int twins_clz64(uint64_t x)
+{
+#if defined(__CUDA_ARCH__)
+    return __clzll((long long)x);
+#else
+    return __builtin_clzll(x);
+#endif
+}
+#endif
+// The lead part of a code (27 bits), increasing with the lead. Leads below 2^26 ps (67 us) have
+// a code each: lead + 1. Above, a lead L in [2^e, 2^(e+1)), 26 <= e <= 50, keeps its 21 leading
+// bits: bucket (e - 26) * 2^20 + the next 20 bits, code LC_LIN + 1 + 2 bucket + x, where x = 0 iff
+// the dropped bits are zero (an exact code: 1 ms, 55 us, any multiple of 2^(e-20) ps), else 1 (a
+// lossy code). Equal exact codes are equal leads; two equal lossy codes are not known to be, and a
+// comparison that meets them is undecided. Leads of 2^51 ps (37 minutes) or more: LC_SAT, lossy.
+constexpr uint32_t LC_LIN = 1u << 26, LC_SAT = (1u << 27) - 2;
+__host__ __device__ __forceinline__ uint32_t lead_code(int64_t lead)
+{
+    const uint64_t L = (uint64_t)(lead < 0 ? 0 : lead);
+    if (L < LC_LIN)
+        return (uint32_t)L + 1;
+    const int e = 63 - twins_clz64(L);
+    if (e > 50)
+        return LC_SAT;
+    const int sh = e - 20;
+    const uint32_t bucket = (uint32_t)(e - 26) * (1u << 20) + (uint32_t)((L >> sh) - (1ull << 20));
+    return LC_LIN + 1 + 2 * bucket + ((L & ((1ull << sh) - 1)) ? 1 : 0);
+}
+__host__ __device__ __forceinline__ bool lead_lossy(uint32_t lc) { return lc > LC_LIN && ((lc - LC_LIN - 1) & 1); }
 __host__ __device__ __forceinline__ uint32_t ccode(int64_t lead, int ord)
 {
-    uint64_t l = (uint64_t)lead + 1;
-    if (l > CODE_LEAD_MAX)
-        l = CODE_LEAD_MAX;
-    return (uint32_t)(l << CODE_ORD_BITS | (CODE_ORD_MAX - (ord < CODE_ORD_MAX ? ord : CODE_ORD_MAX)));
+    return lead_code(lead) << CODE_ORD_BITS | (CODE_ORD_MAX - (ord < CODE_ORD_MAX ? ord : CODE_ORD_MAX));
 }
 
 __device__ TailPool g_tail;
@@ -207,8 +235,85 @@ struct Memo
     // direct mapped, the last one stays
     unsigned long long *walk;
     uint64_t walk_mask;
+    // (strict build) the same, with exact keys: WalkEnt, written once between clears
+    struct WalkEnt *we;
+    // (strict build) the interned lead sequences of tail nodes (LsEnt, see ls_intern)
+    struct LsEnt *ls;
+    uint64_t ls_mask;
+};
+// An interned lead sequence: key (lead code << 32 | count, the next node's identity), value the
+// identity (a node's pos). state: 0 empty, 1 being written, 2 written. Written once.
+struct LsEnt
+{
+    unsigned long long state, k0, k1, val;
+};
+// A walk state remembered exactly: the two tail nodes (positions) and what is left of their runs.
+// w0 is claimed by a CAS, then w1 and w2 are written; w2 (left counts and the result, nonzero)
+// last. A reader that sees w2 set sees the final w0 and w1. Entries are written once; the table is
+// cleared between launches (twins-rdma: every MEMO_CLEAR launches).
+struct WalkEnt
+{
+    unsigned long long w0, w1, w2;
 };
 __device__ Memo g_memo;
+#ifdef TWINS_MEMO_AUDIT
+__device__ unsigned long long g_memo_audit[4]; // memo hits walked again, disagreements, not walkable (lost tail)
+#endif
+#ifndef TWINS_HASH_MEMO
+constexpr uint64_t LS_LOSSY = 1ull << 63, LS_END = 0x7FFFFFFFFFFFFFFFull;
+#ifdef RDMA_PROF
+__device__ unsigned long long g_ls_stat[4]; // interned new, found, no room, too long
+#define LS_STAT(i) atomicAdd(&g_ls_stat[i], 1ull)
+#else
+#define LS_STAT(i)
+#endif
+// The identity of the leads of a new tail node at pos (lead code, count) followed by those of the
+// node with identity nxt (0: the chain's end): an existing identity if this key was interned, else
+// pos (and the key is interned when there is room). Keys are compared whole, so equal identities
+// are equal lead sequences; a key not found (full table, an entry being written) only costs a
+// later match.
+__host__ __device__ __forceinline__ uint64_t ls_intern(uint64_t pos, uint32_t lead, uint64_t cnt, uint64_t nxt)
+{
+    const uint64_t lossy = (lead_lossy(lead) ? LS_LOSSY : 0) | (nxt & LS_LOSSY);
+    if (cnt >> 37)
+    {
+        LS_STAT(3);
+        return pos | lossy; // (a run too long for the key: not interned)
+    }
+    const unsigned long long k0 = (unsigned long long)lead << 37 | cnt, k1 = nxt;
+    uint64_t h = (k0 * 0x9e3779b97f4a7c15ull) ^ (k1 * 0xbf58476d1ce4e5b9ull);
+    h ^= h >> 29;
+    for (int i = 0; i < 8; i++)
+    {
+        LsEnt &e = g_memo.ls[(h + i) & g_memo.ls_mask];
+        unsigned long long st = atomicAdd(&e.state, 0ull);
+        if (st == 2)
+        {
+            __threadfence();
+            if (e.k0 == k0 && e.k1 == k1)
+            {
+                LS_STAT(1);
+                return e.val;
+            }
+            continue;
+        }
+        if (st == 1)
+            continue;
+        if (atomicCAS(&e.state, 0ull, 1ull) == 0ull)
+        {
+            e.k0 = k0;
+            e.k1 = k1;
+            e.val = pos | lossy;
+            __threadfence();
+            atomicExch(&e.state, 2ull);
+            LS_STAT(0);
+            return pos | lossy;
+        }
+    }
+    LS_STAT(2);
+    return pos | lossy;
+}
+#endif
 #ifdef RDMA_PROF
 __device__ unsigned long long g_prof[8]; // ccmp calls, walks, walk steps, memo hits, inserts
 // launches, their slots, those of one slot, slots jumped; host steps empty, with events: count,
@@ -268,6 +373,28 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             n.code = par.r[RUNS - 1].code;
             n.cnt = par.r[RUNS - 1].cnt;
             n.next = par.tail;
+#ifndef TWINS_HASH_MEMO
+            {
+                const uint32_t L = n.code >> CODE_ORD_BITS;
+                uint64_t mafter = 0, after = LS_END;
+                bool known = true;
+                if (par.tail)
+                {
+                    const TailNode t = tail_at(par.tail);
+                    known = t.pos == par.tail && t.lsid != 0 && t.after != 0;
+                    if ((t.code >> CODE_ORD_BITS) == L)
+                    {
+                        mafter = t.cnt + t.mafter; // (the lead's run goes on in the next node)
+                        after = t.after;
+                    }
+                    else
+                        after = t.lsid;
+                }
+                n.mafter = mafter;
+                n.after = known ? after : 0;
+                n.lsid = known ? ls_intern(pos, L, n.cnt + mafter, after) : 0;
+            }
+#endif
 #ifdef TWINS_CPU
             __atomic_store_n(&n.pos, (unsigned long long)pos, __ATOMIC_RELEASE);
 #else
@@ -294,6 +421,9 @@ struct RunCursor
     uint64_t nxt;   // and its next (from the copy read)
     uint32_t code;  // 0: the end
     uint32_t left;  // repetitions left of the current run
+    uint32_t full;  // (in the tail) the current node's count
+    uint64_t lsid;  // (in the tail) the current node's lead identity (0: none)
+    uint64_t mafter, after; // (in the tail) the current node's (see TailNode)
     bool lost;      // the tail was overwritten
     // the runs of the chain cpush(code, ch) would give (code 0: of ch itself)
     __device__ __forceinline__ void init(const Chain &ch, uint32_t code0 = 0)
@@ -345,6 +475,10 @@ struct RunCursor
         }
         code = n.code;
         left = n.cnt;
+        full = n.cnt;
+        lsid = n.lsid;
+        mafter = n.mafter;
+        after = n.after;
         nxt = n.next;
     }
     __device__ __forceinline__ void next()
@@ -411,8 +545,9 @@ __device__ __forceinline__ void memo_put(uint64_t ha, uint64_t hb, int r)
 // (*by_lead: decided by a lead or by one chain ending first, which depend on the leads only)
 // (inline_only: give up, returning 2, where either chain goes on into its tail)
 constexpr int WALK_EVERY = 16, WALK_KEEP = 4;
-__device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact, bool *by_lead = nullptr,
-                                         bool inline_only = false
+constexpr int ORD_UNKNOWN = 2; // equal saturated ordinals: maybe distinct siblings
+__device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact,
+                                         bool *by_lead = nullptr, bool inline_only = false
 #ifdef RDMA_PROF
                                          ,
                                          unsigned long long *steps = nullptr
@@ -430,15 +565,40 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
     // the two adds a few runs above them. So a walk decided by a lead remembers where it passed: two
     // places in the (immutable) tail nodes, from which only the same walk can follow. One state in
     // WALK_EVERY is looked up and kept, chosen by its bits, so that all walks agree on which.
+#ifdef TWINS_HASH_MEMO
     uint64_t seen[WALK_KEEP];
+#else
+    uint64_t seen[WALK_KEEP][5]; // slot, w0, w1, w2 without the result, 1: for verdicts by the leads only
+#endif
     int nseen = 0;
+    auto remember = [&](int r, bool leads = false) {
+        for (int i = 0; i < nseen; i++)
+        {
+#ifndef TWINS_HASH_MEMO
+            if (seen[i][4] && !leads)
+                continue; // (an end at the roots is not a function of the leads alone)
+#endif
+#ifdef TWINS_HASH_MEMO
+            g_memo.walk[seen[i] >> 2 & g_memo.walk_mask] = seen[i] | (r < 0 ? 1 : 2);
+#else
+            WalkEnt &e = g_memo.we[seen[i][0]];
+            if (atomicCAS(&e.w0, 0ull, (unsigned long long)seen[i][1]) == 0ull)
+            {
+                e.w1 = seen[i][2];
+                __threadfence();
+                atomicExch(&e.w2, (unsigned long long)(seen[i][3] | (r < 0 ? 1 : 2)));
+            }
+#endif
+        }
+        return r;
+    };
     auto by_leads = [&](int r) {
         if (by_lead)
             *by_lead = true;
-        for (int i = 0; i < nseen; i++)
-            g_memo.walk[seen[i] >> 2 & g_memo.walk_mask] = seen[i] | (r < 0 ? 1 : 2);
-        return r;
+        return remember(r, true);
     };
+    // the deepest ordinal difference: 0 none, -1/1, or unknown (an undecided tie)
+    auto by_ord = [&]() { return ord == ORD_UNKNOWN ? 0 : ord; };
     for (;;)
     {
 #ifdef RDMA_PROF
@@ -456,22 +616,158 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
                 // distinct roots: the lineages never meet, so the ordinals compared above were not
                 // siblings'; the flows' starts decide
                 if (a.root && b.root && a.root != b.root)
-                    return a.root < b.root ? -1 : 1;
-                return ord;
+                {
+                    const int r = root_rank[a.root - 1] < root_rank[b.root - 1] ? -1 : 1;
+#ifndef TWINS_HASH_MEMO
+                    // (strict: remembered too. Tail nodes are shared only by chains of the root they
+                    // were made under, so the roots are a function of the walk state)
+                    if (!*inexact)
+                        return remember(r);
+#endif
+                    return r;
+                }
+                return by_ord();
             }
             // a complete chain ends at an event scheduled before everything after it
             if (ca == 0)
-                return A.lost ? ord : by_leads(-1);
-            return B.lost ? ord : by_leads(1);
+                return A.lost ? by_ord() : by_leads(-1);
+            return B.lost ? by_ord() : by_leads(1);
         }
         if (ca >> CODE_ORD_BITS != cb >> CODE_ORD_BITS)
             return by_leads(ca > cb ? -1 : 1);
+        if (lead_lossy(ca >> CODE_ORD_BITS))
+            return 0; // equal lossy leads: maybe different
         if (ca != cb)
             ord = (ca & CODE_ORD_MAX) > (cb & CODE_ORD_MAX) ? -1 : 1;
+        else if ((ca & CODE_ORD_MAX) == 0)
+            ord = ORD_UNKNOWN; // both ordinals saturated
         // at the same tail node, at the same place in it: the rest is one lineage (the chains met at
         // a common ancestor), so the deepest ordinal difference is one seen above
         if (A.i > RUNS && B.i > RUNS && A.node == B.node && A.left == B.left)
-            return ord;
+            return by_ord();
+#ifndef TWINS_HASH_MEMO
+        // both in tail nodes, with equal leads now: if as many repetitions of this lead are left
+        // before the same identity, the rest is one lead sequence, and the walk would go to both
+        // ends without a differing lead
+        if (A.i > RUNS && B.i > RUNS && A.after && A.after == B.after && (uint64_t)A.left + A.mafter == (uint64_t)B.left + B.mafter)
+        {
+            if ((A.after & LS_LOSSY) || lead_lossy(ca >> CODE_ORD_BITS))
+                return 0; // (equal lossy leads ahead)
+            if (a.root && b.root && a.root != b.root)
+            {
+#ifdef RDMA_PROF
+                atomicAdd(&g_prof[7], 1ull);
+#endif
+                return remember(root_rank[a.root - 1] < root_rank[b.root - 1] ? -1 : 1);
+            }
+            // (one root: ordinals below decide; walk on)
+        }
+        // both at the start of interned tail nodes: a walk decided by the leads from here depends
+        // on the two lead sequences only, so it is remembered by their identities (w2 bit 63 tells
+        // these entries from the ones by position)
+        if (A.i > RUNS && B.i > RUNS && A.left == A.full && B.left == B.full && A.lsid && B.lsid && A.lsid != B.lsid)
+        {
+            uint64_t h = (A.lsid * 0x9e3779b97f4a7c15ull) ^ (B.lsid * 0xc2b2ae3d27d4eb4full);
+            h ^= h >> 31;
+            if ((h & (WALK_EVERY - 1)) == 0)
+            {
+                const uint64_t slot = (h >> 4) & g_memo.walk_mask;
+                WalkEnt &e = g_memo.we[slot];
+                const unsigned long long v = atomicAdd(&e.w2, 0ull);
+                if (v)
+                {
+                    __threadfence();
+                    if ((v >> 63) && e.w0 == A.lsid && e.w1 == B.lsid)
+                    {
+#ifdef RDMA_PROF
+                        atomicAdd(&g_prof[7], 1ull);
+#endif
+                        return by_leads((v & 3) == 1 ? -1 : 1);
+                    }
+                }
+                else if (nseen < WALK_KEEP)
+                {
+                    seen[nseen][0] = slot;
+                    seen[nseen][1] = A.lsid;
+                    seen[nseen][2] = B.lsid;
+                    seen[nseen][3] = 1ull << 63;
+                    seen[nseen][4] = 1; // (by leads only)
+                    nseen++;
+                }
+            }
+        }
+        if (A.i > RUNS && B.i > RUNS && A.left < (1u << 30) && B.left < (1u << 30))
+        {
+            // an exact key: the two nodes and the counts left
+            const uint64_t w2 = (uint64_t)A.left << 33 | (uint64_t)B.left << 2;
+            uint64_t h = (A.node * 0x9e3779b97f4a7c15ull) ^ (B.node * 0xbf58476d1ce4e5b9ull) ^ (w2 * 0x94d049bb133111ebull);
+            h ^= h >> 31;
+            if ((h & (WALK_EVERY - 1)) == 0)
+            {
+                const uint64_t slot = (h >> 4) & g_memo.walk_mask;
+                WalkEnt &e = g_memo.we[slot];
+                const unsigned long long v = atomicAdd(&e.w2, 0ull);
+                if (v)
+                {
+                    __threadfence();
+                    if ((v & ~3ull) == w2 && e.w0 == A.node && e.w1 == B.node)
+                    {
+#ifdef RDMA_PROF
+                        atomicAdd(&g_prof[7], 1ull);
+#endif
+#ifdef TWINS_MEMO_AUDIT
+                        // (audit build: walk on without the memo from here, and count disagreements)
+                        {
+                            RunCursor A2 = A, B2 = B;
+                            int r2 = 0;
+                            for (;;)
+                            {
+                                uint32_t xa = A2.code, xb = B2.code;
+                                if (xa == 0 || xb == 0)
+                                {
+                                    if (xa == 0 && xb == 0)
+                                        r2 = (a.root && b.root && a.root != b.root) ? (root_rank[a.root - 1] < root_rank[b.root - 1] ? -1 : 1) : 9;
+                                    else
+                                        r2 = xa == 0 ? -1 : 1;
+                                    if (A2.lost || B2.lost)
+                                        r2 = 9;
+                                    break;
+                                }
+                                if (xa >> CODE_ORD_BITS != xb >> CODE_ORD_BITS)
+                                {
+                                    r2 = xa > xb ? -1 : 1;
+                                    break;
+                                }
+                                uint32_t m2 = A2.left < B2.left ? A2.left : B2.left;
+                                A2.left -= m2;
+                                B2.left -= m2;
+                                if (A2.left == 0)
+                                    A2.next();
+                                if (B2.left == 0)
+                                    B2.next();
+                            }
+                            atomicAdd(&g_memo_audit[0], 1ull);
+                            if (r2 == 9)
+                                atomicAdd(&g_memo_audit[2], 1ull);
+                            else if (r2 != ((v & 3) == 1 ? -1 : 1))
+                                atomicAdd(&g_memo_audit[1], 1ull);
+                        }
+#endif
+                        return by_leads((v & 3) == 1 ? -1 : 1);
+                    }
+                }
+                else if (nseen < WALK_KEEP)
+                {
+                    seen[nseen][0] = slot;
+                    seen[nseen][1] = A.node;
+                    seen[nseen][2] = B.node;
+                    seen[nseen][3] = w2;
+                    seen[nseen][4] = 0;
+                    nseen++;
+                }
+            }
+        }
+#else
         if (A.i > RUNS && B.i > RUNS)
         {
             const uint64_t k = memo_key(A.node + ((uint64_t)A.left << 40), B.node + ((uint64_t)B.left << 40));
@@ -489,6 +785,7 @@ __device__ __forceinline__ int ccmp_walk(uint32_t pa, const Chain &a, uint32_t p
                     seen[nseen++] = k;
             }
         }
+#endif
         uint32_t m = A.left < B.left ? A.left : B.left;
         A.left -= m;
         B.left -= m;
@@ -507,6 +804,23 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 {
 #ifdef RDMA_PROF
     atomicAdd(&g_prof[0], 1ull);
+#endif
+#ifndef TWINS_HASH_MEMO
+    // (strict: no decision rests on a hash; the walk, with its exact memo of tail states)
+#ifdef RDMA_PROF
+    {
+        long long walk0 = clock64();
+        unsigned long long wsteps = 0;
+        bool bl;
+        int r = ccmp_walk(s.root_rank, pa, a, pb, b, inexact, &bl, false, &wsteps);
+        atomicAdd(&g_prof[1], 1ull);
+        atomicAdd(&g_prof[bl ? 2 : 5], wsteps);
+        atomicAdd(&g_prof[6], (unsigned long long)(clock64() - walk0));
+        return r;
+    }
+#else
+    return ccmp_walk(s.root_rank, pa, a, pb, b, inexact);
+#endif
 #endif
     // the hashes of the chains compared (a virtual push pa on a) and of their ancestors
     uint64_t ha[NANC + 1], hb[NANC + 1];
@@ -550,12 +864,12 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 #ifdef RDMA_PROF
     long long walk0 = clock64();
     unsigned long long wsteps = 0;
-    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead, false, &wsteps);
+    int r = ccmp_walk(s.root_rank, pa, a, pb, b, inexact, &by_lead, false, &wsteps);
     atomicAdd(&g_prof[1], 1ull);
     atomicAdd(&g_prof[by_lead ? 2 : 5], wsteps);
     atomicAdd(&g_prof[6], (unsigned long long)(clock64() - walk0));
 #else
-    int r = ccmp_walk(pa, a, pb, b, inexact, &by_lead);
+    int r = ccmp_walk(s.root_rank, pa, a, pb, b, inexact, &by_lead);
 #endif
     // a decision by the leads: not the end of both chains (roots, ordinals), nor a lost tail
     if (by_lead && !*inexact)
@@ -610,6 +924,8 @@ __device__ __forceinline__ int pcmp(const Run *a, const Run *b)
             return 0;
         if (ca >> CODE_ORD_BITS != cb >> CODE_ORD_BITS)
             return ca > cb ? -1 : 1;
+        if (lead_lossy(ca >> CODE_ORD_BITS))
+            return 0; // (ccmp counts it)
         uint32_t m = ra < rb ? ra : rb;
         ra -= m;
         rb -= m;
@@ -625,8 +941,10 @@ __device__ __forceinline__ int pcmp(const Run *a, const Run *b)
 // their roots (see ccmp), else the prefixes; 0: undecided
 __device__ __forceinline__ int qcmp(const Sim &s, const Run *pa, uint64_t ha, uint32_t ra, const Run *pb, uint64_t hb, uint32_t rb)
 {
+#ifdef TWINS_HASH_MEMO
     if (ra && rb && ra != rb && ha == hb)
         return s.root_rank[ra - 1] < s.root_rank[rb - 1] ? -1 : 1;
+#endif
     return pcmp(pa, pb);
 }
 

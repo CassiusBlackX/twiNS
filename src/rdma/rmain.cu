@@ -80,6 +80,7 @@ using std::vector;
 #ifdef RDMA_CRIT
 static unsigned long long *g_crit_host;
 #endif
+static unsigned long long g_rank_lossy = 0; // root-order comparisons that met equal lossy leads
 template <typename T>
 static T *dev_alloc(size_t n)
 {
@@ -1556,8 +1557,12 @@ int main(int argc, char **argv)
         std::sort(idx.begin(), idx.end(), [&](int a, int b) {
             const vector<uint32_t> &x = L[a], &y = L[b];
             for (size_t i = 0; i < x.size() && i < y.size(); i++)
+            {
                 if (x[i] != y[i])
                     return x[i] > y[i];
+                if (lead_lossy(x[i]))
+                    g_rank_lossy++; // (two start chains with equal lossy leads: their order is a guess)
+            }
             if (x.size() != y.size())
                 return x.size() < y.size();
             return root_chain[a].root < root_chain[b].root;
@@ -1929,9 +1934,19 @@ int main(int argc, char **argv)
     {
         Memo m;
         uint64_t cap = 1ull << 22; // 32 MB
+#ifdef TWINS_HASH_MEMO
         m.t = dev_alloc<unsigned long long>(cap);
+#endif
         m.mask = cap - 1;
+#ifdef TWINS_HASH_MEMO
         m.walk = dev_alloc<unsigned long long>(cap);
+#else
+        m.t = nullptr;
+        m.we = dev_alloc<WalkEnt>(cap); // (96 MB, zeroed)
+        const uint64_t lcap = 1ull << 24;  // (512 MB)
+        m.ls = dev_alloc<LsEnt>(lcap);
+        m.ls_mask = lcap - 1;
+#endif
         m.walk_mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo), &m, sizeof(m)));
     }
@@ -2284,6 +2299,13 @@ int main(int argc, char **argv)
     {
         unsigned long long gp[8];
         CK(hipMemcpyFromSymbol(gp, HIP_SYMBOL(g_prof), sizeof(gp)));
+#ifndef TWINS_HASH_MEMO
+        {
+            unsigned long long ls[4];
+            CK(hipMemcpyFromSymbol(ls, HIP_SYMBOL(g_ls_stat), sizeof(ls)));
+            printf("prof: lead identities: new %llu, found %llu, no room %llu, too long %llu\n", ls[0], ls[1], ls[2], ls[3]);
+        }
+#endif
         printf("prof: chain comparisons %llu: from the memo %llu, walked %llu (remembered %llu), walk steps %llu by leads, %llu others, walks' cycles %.3f G; walks cut short %llu\n", gp[0], gp[3], gp[1], gp[4], gp[2], gp[5], gp[6] * 1e-9, gp[7]);
     }
     {
@@ -2323,6 +2345,18 @@ int main(int argc, char **argv)
     if (ev[13])
         fprintf(stderr, "warning: %llu data frames reached receivers after their flows' last byte; if their senders had "
                         "completed, ns-3 would answer them with NACKs (not modelled)\n", ev[13]);
+#ifdef TWINS_MEMO_AUDIT
+    {
+        unsigned long long au[4];
+        CK(hipMemcpyFromSymbol(au, HIP_SYMBOL(g_memo_audit), sizeof(au)));
+        printf("memo audit: %llu hits walked again, %llu disagree, %llu not walkable\n", au[0], au[1], au[2]);
+    }
+#endif
+    if (g_rank_lossy)
+    {
+        printf("undecided root order: %llu comparisons of start chains met equal lossy leads\n", g_rank_lossy);
+        ev[8] += g_rank_lossy;
+    }
     if (ev[8] || ev[9])
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);

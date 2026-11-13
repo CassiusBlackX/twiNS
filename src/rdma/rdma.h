@@ -119,7 +119,7 @@ enum : uint8_t
 
 // An event's place in ns-3's event order. ns-3 runs simultaneous events in the order they were
 // scheduled. An event's chain is the sequence of leads from it back to its ancestors (run-length
-// encoded): code = (lead + 1) << CODE_ORD_BITS | CODE_ORD_MAX - ordinal, where the ordinal counts
+// encoded): code = lead_code(lead) << CODE_ORD_BITS | CODE_ORD_MAX - ordinal (rstep.cuh), where the ordinal counts
 // the events its parent had scheduled before it (a tick of astra-sim's can start many flows; larger
 // ordinals tie, which is counted as undecided). Two simultaneous events compare by their first differing lead, the
 // larger first (an earlier ancestor); if all leads are equal, by the ordinals at the deepest level
@@ -152,6 +152,13 @@ struct TailNode
 {
     uint32_t code, cnt;
     uint64_t next, pos;
+    // (strict build) lead sequences from here to the chain's end, exactly (rstep.cuh, ls_intern):
+    // mafter: repetitions of this node's lead in the nodes after it (the lead's run goes on);
+    // after: the identity of the leads that follow that run (LS_END: none; 0: unknown);
+    // lsid: the identity of the leads from this node on, the pos of the first node interned with
+    // the same (lead, count to the run's end, after); bit 63 of an identity: a lossy lead code is
+    // among them; 0: unknown
+    uint64_t mafter, after, lsid;
 };
 
 // A frame's contents. The INT hops are IntHop's 64-bit words (lineRate:3 time:24 bytes:20

@@ -646,6 +646,25 @@ int main(int argc, char **argv)
         s.mg.done = dupload(neg);
         s.mg_first_of_world = dupload(mfw);
     }
+    {
+        // root keys of the application starts: ranked by (host, connection) within the world
+        std::vector<uint32_t> key(F);
+        for (int w = 0; w < W; w++)
+        {
+            std::vector<int> cs;
+            for (int c = cfirst[w]; c < cfirst[w + 1]; c++)
+                cs.push_back(c);
+            std::stable_sort(cs.begin(), cs.end(), [&](int a, int b) { return flows[conn_msgs[a][0]].src < flows[conn_msgs[b][0]].src; });
+            for (size_t i = 0; i < cs.size(); i++)
+                key[cs[i]] = 0x40000000u + (uint32_t)i;
+            if (cs.size() >= 0x3FFFFFFFu || wfirst[w + 1] - wfirst[w] >= 0x3FFFFFFF)
+            {
+                fprintf(stderr, "too many connections or messages in a world for the chains' root keys\n");
+                return 1;
+            }
+        }
+        s.app_key = dupload(key);
+    }
     // ---- connection state
     std::vector<FlowRec> recs(F);
     for (auto &r : recs)
@@ -980,7 +999,7 @@ int main(int argc, char **argv)
     s.flows_done = dalloc<unsigned int>(1);
     s.finished = dalloc<int>(1);
     s.error = dalloc<int>(1);
-    s.ev = dalloc<unsigned long long>(32);
+    s.ev = dalloc<unsigned long long>(40);
     s.ties_w = dalloc<unsigned long long>(W);
     s.qtrace = nullptr;
     s.qtrace_cnt = dalloc<unsigned long long>(1);
@@ -1051,7 +1070,7 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(&slots, s.slot, 8, cudaMemcpyDeviceToHost));
     unsigned int fd;
     CHECK(cudaMemcpy(&fd, s.flows_done, 4, cudaMemcpyDeviceToHost));
-    std::vector<unsigned long long> ev = ddown(s.ev, 32);
+    std::vector<unsigned long long> ev = ddown(s.ev, 40);
 #ifdef NS_PROF
     {
         int khz = 0;
@@ -1067,6 +1086,9 @@ int main(int argc, char **argv)
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
            " | undecided-ties %llu\n",
            M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25]);
+    if (ev[25])
+        printf("undecided-ties by cause: lossy %llu trunc %llu same-root %llu count %llu no-root %llu timers %llu short %llu\n", ev[26], ev[27],
+               ev[28], ev[29], ev[30], ev[31], ev[32]);
     if (ev[5] || ev[6] || ev[7] || ev[14] || ev[19])
         fprintf(stderr, "warning: a capacity overflowed (active/ooo/due/rtt/ring-ovf); the results may differ from ns-3\n");
     if (ev[25])

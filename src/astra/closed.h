@@ -860,6 +860,13 @@ struct Closed : astra::Network
             syncs++;
             k = ctl.k;
             busy = ctl.head != seen;
+            // (profiling: TWINS_STOP_SYNCS=n ends the loop after n rounds, results incomplete)
+            static const long long stop_syncs = getenv("TWINS_STOP_SYNCS") ? atoll(getenv("TWINS_STOP_SYNCS")) : 0;
+            if (stop_syncs && (long long)syncs >= stop_syncs)
+            {
+                fprintf(stderr, "stopped after %lld rounds (TWINS_STOP_SYNCS)\n", stop_syncs);
+                break;
+            }
             // a run that will start again with more room (see main) stops here
             if (syncs % 1024 == 0 && (stop_d || stop_t))
             {
@@ -995,7 +1002,9 @@ struct Closed : astra::Network
                         tm = tt < tc;
                     else
                     {
-                        const int64_t lt = fe->timers[fe->next_timer_id()].delay, lc = (int64_t)(ready.front().h.code >> CODE_ORD_BITS) - 1;
+                        // the leads' codes (monotone in the lead): equal codes go to the chains, which
+                        // count equal lossy ones as undecided
+                        const uint32_t lt = lead_code(fe->timers[fe->next_timer_id()].delay), lc = ready.front().h.code >> CODE_ORD_BITS;
                         if (lt == lc)
                         {
                             lead_ties++;

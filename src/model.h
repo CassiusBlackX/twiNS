@@ -358,6 +358,7 @@ struct Sim
     FlowSoA fl;
     MsgSoA mg;
     int *mg_first_of_world; // [worlds] the first message of each world (message keys are world-local)
+    uint32_t *app_key;      // [conns] root key of the connection's application start (see chain_set_root)
     HostSoA hs;
     PortSoA ps;
     nsm_rng::State *sw_rng; // [S] per-packet ECMP: each switch's random variable (null: per-flow ECMP)

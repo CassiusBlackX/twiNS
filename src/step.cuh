@@ -56,107 +56,7 @@ __device__ inline void frame_copy(Frame *d, const Frame *s)
 }
 
 // ------------------------------------------------------------------ ns-3 event order
-// Codes of the lead from a parent event to its child, increasing with the lead:
-//   ScheduleNow (CompleteFork, ConnectionSucceeded) 1
-//   Socket::Send's TimeStep(1) deferral          2
-//   TransmitComplete of a frame of len bytes     len             (lead len * 80 ps)
-//   arrival of a frame of len bytes              2048 + len      (lead 1 us + len * 80 ps)
-//   host timers and other events                 4096 + lead/16 ns, saturating
-__device__ inline uint16_t chain_tc(int len) { return (uint16_t)len; }
-__device__ inline uint16_t chain_arrival(int len) { return (uint16_t)(2048 + len); }
-__device__ inline uint16_t chain_lead(int64_t lead_ps)
-{
-    int64_t c = 4096 + lead_ps / 16000;
-    return (uint16_t)(c < 0xFFFE ? c : 0xFFFE);
-}
-constexpr uint16_t CHAIN_NOW = 1, CHAIN_STEP = 2;
-
-// A chain: the leads from an event back towards its root, run-length encoded as up to
-// CHAIN_RUNS (code, count) pairs (back-to-back transmissions form long runs of TransmitComplete
-// codes), then the root, an event scheduled before the simulation runs, as a 32-bit key in
-// ns-3's scheduling order: the message writes the scenario schedules in main(), by message (key
-// 1 + index), then the application starts, which the nodes schedule as they initialize, by
-// host and connection (key 0x8000 + host + 1, then the connection's low 16 bits; host is
-// world-local). When the runs overflow the oldest are dropped; the root is kept.
-__device__ inline void chain_root(uint16_t *dst, int host_local, int conn)
-{
-    for (int i = 0; i < 2 * CHAIN_RUNS; i++)
-        dst[i] = 0;
-    dst[2 * CHAIN_RUNS] = (uint16_t)(0x8000 | (host_local + 1));
-    dst[2 * CHAIN_RUNS + 1] = (uint16_t)conn;
-}
-
-__device__ inline void chain_root_msg(uint16_t *dst, int msg_local)
-{
-    for (int i = 0; i < 2 * CHAIN_RUNS; i++)
-        dst[i] = 0;
-    dst[2 * CHAIN_RUNS] = (uint16_t)(1 + (msg_local >> 16));
-    dst[2 * CHAIN_RUNS + 1] = (uint16_t)msg_local;
-}
-
-__device__ inline void chain_push(uint16_t *dst, uint16_t code, const uint16_t *parent)
-{
-#ifdef NS_NO_CHAIN
-    return;
-#endif
-    if (parent && parent[0] == code)
-    {
-        for (int i = 0; i < CHAIN; i++)
-            dst[i] = parent[i];
-        if (dst[1] < 0xFFFF)
-            dst[1]++;
-        return;
-    }
-    for (int i = 2 * CHAIN_RUNS - 1; i >= 2; i--)
-        dst[i] = parent ? parent[i - 2] : 0;
-    dst[0] = code;
-    dst[1] = 1;
-    dst[2 * CHAIN_RUNS] = parent ? parent[2 * CHAIN_RUNS] : 0;
-    dst[2 * CHAIN_RUNS + 1] = parent ? parent[2 * CHAIN_RUNS + 1] : 0;
-}
-
-// Order of two events with the same time by their chains: < 0 if a runs first, > 0 if b does,
-// 0 if the chains do not tell. Larger leads (earlier parents) come first. A chain with fewer
-// than CHAIN_RUNS runs is complete: after its last run comes its root, an application start
-// scheduled at setup, which precedes any other parent. Where both end together, or a full
-// (possibly truncated) chain ends, the roots decide.
-__device__ inline int chain_cmp(const uint16_t *a, const uint16_t *b)
-{
-    int ia = 0, ib = 0;
-    uint32_t ra = a[1], rb = b[1];
-    for (;;)
-    {
-        uint16_t ca = a[2 * ia], cb = b[2 * ib];
-        if (ca == 0 && cb != 0 && a[2 * CHAIN_RUNS] != 0)
-            return -1; // a reached its root
-        if (cb == 0 && ca != 0 && b[2 * CHAIN_RUNS] != 0)
-            return 1;
-        if (ca == 0 || cb == 0)
-            break;
-        if (ca != cb)
-            return ca > cb ? -1 : 1;
-        uint32_t m = ra < rb ? ra : rb;
-        ra -= m;
-        rb -= m;
-        if (ra == 0)
-        {
-            if (++ia == CHAIN_RUNS)
-                break;
-            ra = a[2 * ia + 1];
-        }
-        if (rb == 0)
-        {
-            if (++ib == CHAIN_RUNS)
-                break;
-            rb = b[2 * ib + 1];
-        }
-    }
-    uint32_t xa = (uint32_t)a[2 * CHAIN_RUNS] << 16 | a[2 * CHAIN_RUNS + 1];
-    uint32_t xb = (uint32_t)b[2 * CHAIN_RUNS] << 16 | b[2 * CHAIN_RUNS + 1];
-    if (xa == 0 || xb == 0 || xa == xb)
-        return 0;
-    return xa < xb ? -1 : 1;
-}
+#include "chain_tcp.h"
 
 __device__ inline uint32_t payload_of(const Frame &p) { return (p.flags & F_DATA) ? p.len - 42u : 0u; }
 
@@ -362,6 +262,12 @@ __device__ inline void due_insert(HostCtx &c, int64_t at, int f, int kind)
 // a timer scheduled by the current event: its chain is [lead] + the event's chain
 __device__ inline void timer_chain(HostCtx &c, uint16_t *base, int f, int64_t lead)
 {
+    if (lead < 2 * SLOT_PS)
+    {
+        // (no timer of the model is this short: its code would not order above the arrivals')
+        atomicAdd(&c.s->ev[25], 1ull);
+        atomicAdd(&c.s->ev[26 + TIE_SHORT], 1ull);
+    }
     chain_push(base + (size_t)f * CHAIN, chain_lead(lead), c.echain);
 }
 
@@ -2246,15 +2152,31 @@ __device__ inline const uint16_t *due_chain(const FlowSoA &F, const Due &d)
     return base + (size_t)d.flow * CHAIN;
 }
 
+// two timers due at the same instant: does ns-3 run a after b? (undecided: no, counted)
+__device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due &a, const Due &b, int h)
+{
+    int why;
+    int r = chain_cmp(due_chain(F, a), due_chain(F, b), &why);
+    if (r == 0)
+    {
+        atomicAdd(&s.ev[25], 1ull);
+        atomicAdd(&s.ev[26 + TIE_ORDER], 1ull);
+        atomicAdd(&s.ties_w[h / s.H1], 1ull);
+    }
+    return r > 0;
+}
+
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
 __device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p)
 {
     uint16_t arr[CHAIN];
     chain_push(arr, chain_arrival(p.len), p.chain);
-    int r = chain_cmp(due_chain(F, d), arr);
+    int why;
+    int r = chain_cmp(due_chain(F, d), arr, &why);
     if (r == 0)
     {
         atomicAdd(&s.ev[25], 1ull);
+        atomicAdd(&s.ev[26 + why], 1ull);
         atomicAdd(&s.ties_w[(p.dst_node % s.H) / s.H1], 1ull);
     }
     return r <= 0; // (undecided: the timer)
@@ -2337,11 +2259,11 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     }
     if (nd >= MAX_DUE)
         atomicAdd(&s.ev[7], 1ull);
-    for (int i = 1; i < nd; i++) // insertion sort by time
+    for (int i = 1; i < nd; i++) // insertion sort by time, then (equal times) by chain
     {
         Due x = due[i];
         int j = i - 1;
-        while (j >= 0 && due[j].at > x.at)
+        while (j >= 0 && (due[j].at > x.at || (due[j].at == x.at && timer_after(s, F, due[j], x, h))))
         {
             due[j + 1] = due[j];
             j--;
@@ -2387,7 +2309,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         else if (now == tp)
         {
             int m = hs.pend_msg[pn++], f = s.mg.conn[m];
-            chain_root(c.echain, h % s.H1, f); // application starts are scheduled at setup, host by host
+            chain_set_root(c.echain, s.app_key[f]); // application starts are scheduled at setup, host by host
             F.m_due[f] = 1;
             add_active(s, hs.act_snd, hs.n_snd, f, h);
             F.st[f] = S_SYN_SENT;
@@ -2694,10 +2616,12 @@ __device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b
 {
     if (a.len != b.len)
         return a.len > b.len;
-    int c = chain_cmp(a.chain, b.chain);
+    int why;
+    int c = chain_cmp(a.chain, b.chain, &why);
     if (c == 0)
     {
         atomicAdd(&s.ev[25], 1ull); // the recorded histories do not tell: a guess
+        atomicAdd(&s.ev[26 + why], 1ull);
         atomicAdd(&s.ties_w[(a.dst_node % s.H) / s.H1], 1ull);
     }
     return c != 0 ? c < 0 : a.flow < b.flow;

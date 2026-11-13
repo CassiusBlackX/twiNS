@@ -12,6 +12,13 @@ else()
     project(TwiNS LANGUAGES CXX CUDA)
 endif()
 
+# Extra definitions for every target, for audit builds (e.g. "TWINS_CHAIN_RUNS=1" for twins alone,
+# "TWINS_HASH_MEMO" for the hash-keyed comparison memo of the first versions)
+set(TWINS_EXTRA_DEFS "" CACHE STRING "extra compile definitions (audit builds)")
+if(TWINS_EXTRA_DEFS)
+    add_compile_definitions(${TWINS_EXTRA_DEFS})
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
