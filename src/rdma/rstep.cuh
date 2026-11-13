@@ -224,7 +224,30 @@ __device__ __forceinline__ TailNode tail_at(uint64_t p)
         return g_remote->n[k][(p - 1) & g_remote->mask[k]];
     }
 #endif
+#if (defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)) && !defined(TWINS_NO_SEQLOCK)
+    // (a node of this ring may be written by another block in this launch: read it as a seqlock,
+    // with loads that bypass the non-coherent L1, and take it only if its pos held still)
+    TailNode &n = g_tail.n[(p - 1) & g_tail.mask];
+    const unsigned long long p1 = atomicAdd(&n.pos, 0ull);
+    if (p1 != p)
+        return TailNode{};
+    __threadfence();
+    const volatile TailNode *v = &n;
+    TailNode t;
+    t.code = v->code;
+    t.cnt = v->cnt;
+    t.next = v->next;
+#ifdef TWINS_LSID
+    t.mafter = v->mafter;
+    t.after = v->after;
+    t.lsid = v->lsid;
+#endif
+    __threadfence();
+    t.pos = atomicAdd(&n.pos, 0ull) == p1 ? p1 : 0;
+    return t;
+#else
     return g_tail.n[(p - 1) & g_tail.mask];
+#endif
 }
 // remembered comparisons (see ccmp): key | result, open addressing
 struct Memo
@@ -256,7 +279,7 @@ struct WalkEnt
     unsigned long long w0, w1, w2;
 };
 __device__ Memo g_memo;
-#ifdef TWINS_MEMO_AUDIT
+#if defined(TWINS_MEMO_AUDIT) || defined(TWINS_LSID_AUDIT)
 __device__ unsigned long long g_memo_audit[4]; // memo hits walked again, disagreements, not walkable (lost tail)
 #endif
 #ifndef TWINS_HASH_MEMO
@@ -374,11 +397,14 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
 #ifdef TWINS_CPU
             __atomic_store_n(&n.pos, 0ull, __ATOMIC_RELAXED); // (read by others as it is written: see tail_at)
             __atomic_thread_fence(__ATOMIC_RELEASE);
+#else
+            atomicExch(&n.pos, 0ull); // (an old node in this slot is gone: readers see it as lost)
+            __threadfence();
 #endif
             n.code = par.r[RUNS - 1].code;
             n.cnt = par.r[RUNS - 1].cnt;
             n.next = par.tail;
-#ifndef TWINS_HASH_MEMO
+#if !defined(TWINS_HASH_MEMO) && defined(TWINS_LSID)
             {
                 const uint32_t L = n.code >> CODE_ORD_BITS;
                 uint64_t mafter = 0, after = LS_END;
@@ -403,7 +429,8 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
 #ifdef TWINS_CPU
             __atomic_store_n(&n.pos, (unsigned long long)pos, __ATOMIC_RELEASE);
 #else
-            n.pos = pos;
+            __threadfence(); // (publish the fields before pos: see tail_at)
+            atomicExch(&n.pos, (unsigned long long)pos);
 #endif
             c.tail = pos;
 #else
@@ -481,9 +508,11 @@ struct RunCursor
         code = n.code;
         left = n.cnt;
         full = n.cnt;
+#ifdef TWINS_LSID
         lsid = n.lsid;
         mafter = n.mafter;
         after = n.after;
+#endif
         nxt = n.next;
     }
     __device__ __forceinline__ void next()
@@ -626,8 +655,10 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
 #ifndef TWINS_HASH_MEMO
                     // (strict: remembered too. Tail nodes are shared only by chains of the root they
                     // were made under, so the roots are a function of the walk state)
+#ifndef TWINS_NO_ROOTMEMO
                     if (!*inexact)
                         return remember(r);
+#endif
 #endif
                     return r;
                 }
@@ -654,6 +685,7 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
         // both in tail nodes, with equal leads now: if as many repetitions of this lead are left
         // before the same identity, the rest is one lead sequence, and the walk would go to both
         // ends without a differing lead
+#ifdef TWINS_LSID
         if (A.i > RUNS && B.i > RUNS && A.after && A.after == B.after && (uint64_t)A.left + A.mafter == (uint64_t)B.left + B.mafter)
         {
             if ((A.after & LS_LOSSY) || lead_lossy(ca >> CODE_ORD_BITS))
@@ -663,14 +695,54 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
 #ifdef RDMA_PROF
                 atomicAdd(&g_prof[7], 1ull);
 #endif
+#ifdef TWINS_LSID_AUDIT
+                {
+                    RunCursor A2 = A, B2 = B;
+                    long long steps = 0;
+                    int r2 = 9;
+                    for (;;)
+                    {
+                        uint32_t xa = A2.code, xb = B2.code;
+                        if (xa == 0 || xb == 0)
+                        {
+                            r2 = (xa == 0 && xb == 0) ? 0 : (xa == 0 ? -1 : 1);
+                            if (A2.lost || B2.lost)
+                                r2 = 8;
+                            break;
+                        }
+                        if (xa >> CODE_ORD_BITS != xb >> CODE_ORD_BITS)
+                        {
+                            r2 = xa > xb ? -1 : 1;
+                            break;
+                        }
+                        uint32_t m2 = A2.left < B2.left ? A2.left : B2.left;
+                        A2.left -= m2;
+                        B2.left -= m2;
+                        steps++;
+                        if (A2.left == 0)
+                            A2.next();
+                        if (B2.left == 0)
+                            B2.next();
+                    }
+                    if (r2 != 0 && atomicAdd(&g_memo_audit[3], 1ull) < 5)
+                        printf("lsid audit: shortcut says identical, walk says %d after %lld steps; A node %llu left %u mafter %llu after %llx | B node %llu left %u mafter %llu after %llx\n",
+                               r2, steps, (unsigned long long)A.node, A.left, (unsigned long long)A.mafter, (unsigned long long)A.after,
+                               (unsigned long long)B.node, B.left, (unsigned long long)B.mafter, (unsigned long long)B.after);
+                }
+#endif
                 return remember(root_rank[a.root - 1] < root_rank[b.root - 1] ? -1 : 1);
             }
             // (one root: ordinals below decide; walk on)
         }
+#endif
         // both at the start of interned tail nodes: a walk decided by the leads from here depends
         // on the two lead sequences only, so it is remembered by their identities (w2 bit 63 tells
         // these entries from the ones by position)
+#ifndef TWINS_LSID
+        if (false)
+#else
         if (A.i > RUNS && B.i > RUNS && A.left == A.full && B.left == B.full && A.lsid && B.lsid && A.lsid != B.lsid)
+#endif
         {
             uint64_t h = (A.lsid * 0x9e3779b97f4a7c15ull) ^ (B.lsid * 0xc2b2ae3d27d4eb4full);
             h ^= h >> 31;
@@ -701,7 +773,11 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
                 }
             }
         }
+#ifdef TWINS_NO_WALKMEMO
+        if (false)
+#else
         if (A.i > RUNS && B.i > RUNS && A.left < (1u << 30) && B.left < (1u << 30))
+#endif
         {
             // an exact key: the two nodes and the counts left
             const uint64_t w2 = (uint64_t)A.left << 33 | (uint64_t)B.left << 2;

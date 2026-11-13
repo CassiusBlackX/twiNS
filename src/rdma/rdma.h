@@ -158,7 +158,9 @@ struct TailNode
     // lsid: the identity of the leads from this node on, the pos of the first node interned with
     // the same (lead, count to the run's end, after); bit 63 of an identity: a lossy lead code is
     // among them; 0: unknown
+#ifdef TWINS_LSID
     uint64_t mafter, after, lsid;
+#endif
 };
 
 // A frame's contents. The INT hops are IntHop's 64-bit words (lineRate:3 time:24 bytes:20

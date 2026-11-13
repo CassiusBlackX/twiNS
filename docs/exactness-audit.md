@@ -134,3 +134,20 @@ Same engine with `NS_NO_CHAIN` (no lineages; ties in arbitrary order), RX, min o
 paper: 0 of 1,024), and drops and retransmissions change (k16 a2a30 NewReno: 217,550 vs 167,211
 retransmissions), so part of a time difference is different work. (The RDMA ablation build crashes in
 host set-up, which assumes chains with roots; not pursued.)
+
+## Correction (later the same day): the lead-identity shortcut, and tail-node reads
+
+- The 18 SimAI collective runs at 128 and 512 GPUs with the lead-identity shortcut (interned lead
+  sequences, "equal remainders and distinct roots → root order"): **10 of 18 wrong** (flows lost,
+  "late events 16"), with no flag. A build that re-walks on every shortcut (TWINS_LSID_AUDIT)
+  was right, so the cause was not found. The shortcut and the interning are now opt-in
+  (`TWINS_LSID`), and tail nodes are back to 24 bytes.
+- Tail nodes are now published and read as a seqlock on the GPU (pos cleared, fence, fields, fence,
+  pos; readers check pos before and after volatile loads). Before, a block could read a node that
+  another block wrote in the same launch with a stale field and a fresh pos.
+- **Default strict build, final:** 18 of 18 collectives identical (messages and DAG lines);
+  RDMA jobs1 10, jobs2 29, jobs3 8, jobs_dctcp 41, jobs_topo 32, sweep 32 worlds identical. Speed
+  against the hash build: 1.10–1.25× (allreduce 512 MB at 128 GPUs 13.8 vs 12.0 s; all-gather
+  512 MB at 512 GPUs 12.6 vs 10.1 s); the seqlock is about 1.06–1.15× of that.
+- LLaMA 65B probe (training) is still over 400 s strict (52 s hash): open.
+- RTX 5090 (CUDA, the build before these two changes): TCP 306/306, RDMA 120/120, sweep 32/32.
