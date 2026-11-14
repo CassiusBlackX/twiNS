@@ -1,0 +1,22 @@
+# lookahead sensitivity (P0-6): uniform link delay 0.1-10 us; references from jobs_delay_ref.txt (rdma-ref takes "Nns")
+k8_a2a30_cc1_d100 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=100ns
+k8_a2a30_cc3_d100 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=100ns
+k8_incast16_cc1_d100 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=100ns
+k8_a2a30_cc1_d200 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=200ns
+k8_a2a30_cc3_d200 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=200ns
+k8_incast16_cc1_d200 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=200ns
+k8_a2a30_cc1_d500 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=500ns
+k8_a2a30_cc3_d500 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=500ns
+k8_incast16_cc1_d500 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=500ns
+k8_a2a30_cc1_d1000 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=1000ns
+k8_a2a30_cc3_d1000 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=1000ns
+k8_incast16_cc1_d1000 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=1000ns
+k8_a2a30_cc1_d2000 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=2000ns
+k8_a2a30_cc3_d2000 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=2000ns
+k8_incast16_cc1_d2000 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=2000ns
+k8_a2a30_cc1_d5000 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=5000ns
+k8_a2a30_cc3_d5000 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=5000ns
+k8_incast16_cc1_d5000 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=5000ns
+k8_a2a30_cc1_d10000 fattree8.txt k8_a2a30.csv CC_MODE=1 --delay=10000ns
+k8_a2a30_cc3_d10000 fattree8.txt k8_a2a30.csv CC_MODE=3 --delay=10000ns
+k8_incast16_cc1_d10000 fattree8.txt k8_incast16.csv CC_MODE=1 --delay=10000ns

@@ -54,6 +54,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <random>
 #include "rstep.cuh"
 #if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__) && !defined(TWINS_ISLAND)
 #define TWINS_ASTRA_HOST
@@ -331,9 +332,7 @@ static bool traced_dag(World &w, const vector<TracedOn> &ons, bool deps, int64_t
         uint32_t ch = mains[i].second;
         // the root's own event, from main: its chain's hash starts after it
         push(&c, ch & DACT_TIMER ? w.tdelay[ch & ~DACT_TIMER] : 0, 0);
-        c.hash = 0;
-        for (int k = 0; k < NANC; k++)
-            c.anc[k] = 0;
+        chash_reset(c);
         w.troot.push_back(c);
         if (ch & DACT_TIMER)
         {
@@ -909,9 +908,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 host_push(&c, t - prev_t, k == 0 ? 0 : prev_n); // ScheduleFlowInputs (from the previous one, or main)
                 host_push(&c, 0, m - i);                        // Application::Start
                 host_push(&c, 0, 0);                            // StartApplication
-                c.hash = 0; // (the hashes cover what follows the start)
-                for (int k = 0; k < NANC; k++)
-                    c.anc[k] = 0;
+                chash_reset(c); // (the hashes cover what follows the start)
                 x.start_chain = c;
             }
             prev_t = t;
@@ -1045,6 +1042,7 @@ int main(int argc, char **argv)
     string astra_wl, astra_dag, astra_cache;
 #endif
     int dcap = 16384, dcap_set = 0; // (DAG messages a slot holds; on an overflow the run starts again with 4x)
+    int fcap = MAXF, fcap_set = 0;  // (frames a link delivers in a slot, at most: long slots; the same on an overflow)
     for (int i = 2; i < argc; i++)
     {
         string a = argv[i];
@@ -1115,6 +1113,25 @@ int main(int argc, char **argv)
 #endif
         else if (k == "--gwin")
             gwin = std::max(0, std::min(255, atoi(v.c_str())));
+        else if (k == "--fcap" || k == "--fcap-auto")
+        {
+            fcap = std::max(1, std::min(65535, atoi(v.c_str())));
+            fcap_set = k == "--fcap";
+        }
+#ifndef TWINS_HASH_MEMO
+        else if (k == "--fp-bases") // X1,X2: the lead fingerprints' bases (see fp_step; default: at random)
+        {
+            char *e;
+            const uint64_t x1 = strtoull(v.c_str(), &e, 10), x2 = strtoull(*e == ',' ? e + 1 : e, nullptr, 10);
+            if (x1 < 2 || x1 >= FP_P || x2 < 2 || x2 >= FP_P)
+            {
+                fprintf(stderr, "--fp-bases: two numbers in [2, 2^61 - 2]\n");
+                return 1;
+            }
+            fp_set(x1, x2);
+            g_fp_given = true;
+        }
+#endif
 #ifdef TWINS_ASTRA_HOST
         else if (k == "--astra")
             astra_wl = v;
@@ -1154,6 +1171,25 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+#ifndef TWINS_HASH_MEMO
+    if (!g_fp_given)
+    {
+        std::random_device rd;
+        uint64_t x[2];
+        for (auto &xi : x)
+            for (;;)
+            {
+                const uint64_t z = (uint64_t)rd() << 32 | rd();
+                if (z < 8 * (FP_P - 2)) // (8 (p - 2) < 2^64: each value in [2, p - 1] as likely)
+                {
+                    xi = 2 + z % (FP_P - 2);
+                    break;
+                }
+            }
+        fp_set(x[0], x[1]);
+    }
+    printf("lead fingerprints: bases %llu,%llu\n", (unsigned long long)h_fp[0], (unsigned long long)h_fp[1]);
+#endif
     uint64_t bps = parse_rate(rate_s);
 
     // ---- the worlds: one, or a job file's lines "name topo flows [KEY=VALUE ...]" (the files
@@ -1852,7 +1888,7 @@ int main(int argc, char **argv)
                 int64_t nb = 2 + (txmax + x.delay - 1) / D + (ksnd - 1);
                 // (back to back: ACKs, 60 bytes; a link that sends them in 0 ns, as NVLink at 2880
                 // Gb/s, has no bound but its sender's queue; overflows are reported)
-                int64_t cap = txmin == 0 ? MAXF : std::min<int64_t>(MAXF, D / txmin + 2);
+                int64_t cap = txmin == 0 ? MAXF : std::min<int64_t>(fcap, D / txmin + 2);
                 if (nb > 4096)
                 {
                     fprintf(stderr, "a link's delay (%lld ns) is too long for the slot (%lld ns)\n", (long long)x.delay, (long long)D);
@@ -1944,11 +1980,18 @@ int main(int argc, char **argv)
         m.t = nullptr;
         m.we = dev_alloc<WalkEnt>(cap); // (96 MB, zeroed)
         const uint64_t lcap = 1ull << 24;  // (512 MB)
+#ifdef TWINS_LSID
         m.ls = dev_alloc<LsEnt>(lcap);
+#else
+        m.ls = nullptr;
+#endif
         m.ls_mask = lcap - 1;
 #endif
         m.walk_mask = cap - 1;
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo), &m, sizeof(m)));
+#ifndef TWINS_HASH_MEMO
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(c_fp), h_fp, sizeof(h_fp)));
+#endif
     }
     {
         vector<int32_t> txt(rates.size() * TXT_N);
@@ -2352,6 +2395,16 @@ int main(int argc, char **argv)
         printf("memo audit: %llu hits walked again, %llu disagree, %llu not walkable\n", au[0], au[1], au[2]);
     }
 #endif
+#ifndef TWINS_HASH_MEMO
+    if (ev[38])
+    {
+        // a check of two different lead sequences of at most n entries passes with probability at most
+        // (n/(p-2))^2 (Schwartz-Zippel, two independent bases); a union bound over the checks
+        const double n = (double)ev[39], q = n / (double)(FP_P - 2);
+        printf("lead fingerprints: %llu checks, %llu decisions, lineages up to %.0f events; chance of a wrong decision at most %.2e\n",
+               ev[38], ev[35], n, (double)ev[38] * q * q);
+    }
+#endif
     if (g_rank_lossy)
     {
         printf("undecided root order: %llu comparisons of start chains met equal lossy leads\n", g_rank_lossy);
@@ -2370,14 +2423,21 @@ int main(int argc, char **argv)
 #else
     const bool redo_i = false;
 #endif
-    if (redo_d || redo_t || redo_i)
+    const bool redo_f = ev[4] && !fcap_set && fcap < 65535; // (a link's frames overflowed a slot: long slots)
+    if (redo_d || redo_t || redo_i || redo_f)
     {
         string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : redo_t ? "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27)) : "";
+        if (redo_f)
+            more += string(more.empty() ? "" : " ") + "--fcap-auto=" + std::to_string(std::min(65535, 4 * fcap));
+#ifndef TWINS_HASH_MEMO
+        if (!g_fp_given) // (the same bases again)
+            more += string(more.empty() ? "" : " ") + "--fp-bases=" + std::to_string(h_fp[0]) + "," + std::to_string(h_fp[1]);
+#endif
 #ifdef TWINS_ASTRA_HOST
         if (redo_i)
             more += string(more.empty() ? "" : " ") + "--nvl-ringlog=" + std::to_string(g_nvl_ringlog + 2);
 #endif
-        fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : "lost tails", more.c_str());
+        fprintf(stderr, "%s: running again with %s\n", redo_d ? "DAG message overflow" : redo_t || redo_i ? "lost tails" : "frames overflowed a slot", more.c_str());
         fflush(stdout);
         fflush(stderr);
         vector<string> av(argv, argv + argc);

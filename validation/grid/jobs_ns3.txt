@@ -1,0 +1,201 @@
+# randomized grid (gen_grid.py 200 2027): run from the ns-3 work directory with grid/ copied in
+g000 --topo=file --topofile=grid/topo/ft8.txt --queue=100 --ecnK=20 --flows=grid/g000.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g001 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=200 --ecnK=60 --flows=grid/g001.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g002 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=200 --ecnK=10 --flows=grid/g002.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g003 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=400 --ecnK=30 --fin=1 --flows=grid/g003.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g004 --topo=file --topofile=grid/topo/xp6_4_2_74.txt --queue=100 --ecnK=5 --flows=grid/g004.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g005 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=120 --fail=300000:s41:s57 --flows=grid/g005.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g006 --topo=file --topofile=grid/topo/jf32_8_4_84.txt --queue=200 --ecnK=120 --fin=1 --flows=grid/g006.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g007 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=100 --ecnK=60 --flows=grid/g007.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g008 --topo=file --topofile=grid/topo/ls4x4x12.txt --queue=100 --ecnK=80 --fin=1 --flows=grid/g008.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g009 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=80 --fin=1 --flows=grid/g009.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g010 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=50 --ecnK=40 --flows=grid/g010.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g011 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=60 --fail=100000:s16:s32,200000:s60:s12,300000:s16:s32:up,400000:s60:s12:up --flows=grid/g011.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g012 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=400 --ecnK=120 --flows=grid/g012.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g013 --topo=file --topofile=grid/topo/jf32_8_2_28.txt --queue=200 --ecnK=120 --flows=grid/g013.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g014 --topo=file --topofile=grid/topo/df6_3_3.txt --queue=50 --ecnK=30 --flows=grid/g014.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g015 --topo=file --topofile=grid/topo/tor6x6x4.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g015.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g016 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=50 --ecnK=5 --flows=grid/g016.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g017 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=400 --ecnK=60 --flows=grid/g017.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g018 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=10 --fin=1 --flows=grid/g018.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g019 --topo=file --topofile=grid/topo/ft4.txt --queue=400 --ecnK=10 --flows=grid/g019.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g020 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g020.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g021 --topo=file --topofile=grid/topo/ft4.txt --queue=50 --ecnK=30 --fin=1 --flows=grid/g021.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g022 --topo=file --topofile=grid/topo/df6_3_3.txt --queue=100 --ecnK=30 --flows=grid/g022.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g023 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=400 --ecnK=30 --flows=grid/g023.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g024 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=100 --ecnK=60 --flows=grid/g024.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g025 --topo=file --topofile=grid/topo/jf24_8_2_51.txt --queue=50 --ecnK=40 --flows=grid/g025.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g026 --topo=file --topofile=grid/topo/jf16_8_2_49.txt --queue=100 --ecnK=80 --fail=200000:s0:s7,400000:s2:s14,600000:s0:s7:up --flows=grid/g026.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g027 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=100 --ecnK=60 --flows=grid/g027.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g028 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=20 --fin=1 --flows=grid/g028.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g029 --topo=file --topofile=grid/topo/ls4x8x12.txt --queue=100 --ecnK=20 --fin=1 --flows=grid/g029.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g030 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=20 --flows=grid/g030.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g031 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=400 --ecnK=40 --flows=grid/g031.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g032 --topo=file --topofile=grid/topo/df6_3_3.txt --queue=400 --ecnK=20 --flows=grid/g032.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g033 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=100 --ecnK=10 --flows=grid/g033.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g034 --topo=file --topofile=grid/topo/ls16x8x4.txt --queue=50 --ecnK=40 --flows=grid/g034.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g035 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=50 --ecnK=20 --flows=grid/g035.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g036 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=20 --fail=200000:s12:s5,400000:s12:s5:up --flows=grid/g036.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g037 --topo=file --topofile=grid/topo/ft8.txt --queue=200 --ecnK=80 --flows=grid/g037.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g038 --topo=file --topofile=grid/topo/df6_3_3.txt --queue=50 --ecnK=5 --flows=grid/g038.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g039 --topo=file --topofile=grid/topo/ft4.txt --queue=200 --ecnK=80 --flows=grid/g039.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g040 --topo=file --topofile=grid/topo/jf48_4_4_34.txt --queue=100 --ecnK=40 --flows=grid/g040.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g041 --topo=file --topofile=grid/topo/ls8x4x12.txt --queue=100 --ecnK=60 --fin=1 --flows=grid/g041.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g042 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=100 --ecnK=5 --flows=grid/g042.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g043 --topo=file --topofile=grid/topo/ft8.txt --queue=50 --ecnK=10 --fin=1 --flows=grid/g043.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g044 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=400 --ecnK=60 --flows=grid/g044.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g045 --topo=file --topofile=grid/topo/ls16x2x16.txt --queue=400 --ecnK=40 --fin=1 --flows=grid/g045.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g046 --topo=file --topofile=grid/topo/tor6x8x4.txt --queue=100 --ecnK=40 --flows=grid/g046.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g047 --topo=file --topofile=grid/topo/jf24_4_4_45.txt --queue=200 --ecnK=5 --fail=200000:s7:s20 --flows=grid/g047.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g048 --topo=file --topofile=grid/topo/ft4.txt --queue=200 --ecnK=5 --flows=grid/g048.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g049 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=100 --ecnK=60 --flows=grid/g049.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g050 --topo=file --topofile=grid/topo/ls16x4x16.txt --queue=400 --ecnK=10 --flows=grid/g050.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g051 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=50 --ecnK=10 --flows=grid/g051.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g052 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=5 --fail=100000:s19:s11,300000:s19:s9,700000:s19:s9:up --flows=grid/g052.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g053 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=50 --ecnK=40 --flows=grid/g053.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g054 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=50 --ecnK=10 --flows=grid/g054.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g055 --topo=file --topofile=grid/topo/ft8.txt --queue=200 --ecnK=60 --flows=grid/g055.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g056 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=10 --flows=grid/g056.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g057 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=50 --ecnK=10 --fail=200000:s62:s50,400000:s62:s50:up --flows=grid/g057.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g058 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=200 --ecnK=120 --fin=1 --flows=grid/g058.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g059 --topo=file --topofile=grid/topo/ls8x2x4.txt --queue=200 --ecnK=60 --flows=grid/g059.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g060 --topo=file --topofile=grid/topo/tor8x8x4.txt --queue=200 --ecnK=10 --flows=grid/g060.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g061 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=100 --ecnK=30 --flows=grid/g061.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g062 --topo=file --topofile=grid/topo/jf24_8_3_89.txt --queue=400 --ecnK=20 --fin=1 --fail=100000:s1:s12,200000:s2:s15,500000:s1:s12:up --flows=grid/g062.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g063 --topo=file --topofile=grid/topo/xp5_4_3_70.txt --queue=200 --ecnK=80 --flows=grid/g063.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g064 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=200 --ecnK=30 --flows=grid/g064.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g065 --topo=file --topofile=grid/topo/ft8.txt --queue=100 --ecnK=10 --fail=200000:s35:s2,600000:s35:s2:up --flows=grid/g065.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g066 --topo=file --topofile=grid/topo/tor4x6x4.txt --queue=50 --ecnK=5 --fail=200000:s3:s4 --flows=grid/g066.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g067 --topo=file --topofile=grid/topo/ls8x4x12.txt --queue=400 --ecnK=80 --flows=grid/g067.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g068 --topo=file --topofile=grid/topo/ft8.txt --queue=50 --ecnK=40 --flows=grid/g068.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g069 --topo=file --topofile=grid/topo/xp6_6_2_0.txt --queue=400 --ecnK=40 --flows=grid/g069.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g070 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=10 --flows=grid/g070.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g071 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=50 --ecnK=10 --flows=grid/g071.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g072 --topo=file --topofile=grid/topo/jf32_4_2_66.txt --queue=50 --ecnK=10 --flows=grid/g072.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g073 --topo=file --topofile=grid/topo/ft8.txt --queue=200 --ecnK=5 --fail=100000:s72:s50,200000:s57:s27,400000:s57:s27:up --flows=grid/g073.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g074 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=400 --ecnK=30 --flows=grid/g074.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g075 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=200 --ecnK=40 --fin=1 --flows=grid/g075.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g076 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=20 --flows=grid/g076.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g077 --topo=file --topofile=grid/topo/ft4.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g077.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g078 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=10 --flows=grid/g078.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g079 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=80 --fin=1 --fail=100000:s17:s12 --flows=grid/g079.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g080 --topo=file --topofile=grid/topo/tor8x4x2.txt --queue=50 --ecnK=20 --flows=grid/g080.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g081 --topo=file --topofile=grid/topo/tor8x8x4.txt --queue=400 --ecnK=40 --fin=1 --flows=grid/g081.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g082 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=5 --fin=1 --flows=grid/g082.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g083 --topo=file --topofile=grid/topo/ft4.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g083.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g084 --topo=file --topofile=grid/topo/ls4x4x16.txt --queue=100 --ecnK=20 --fin=1 --flows=grid/g084.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g085 --topo=file --topofile=grid/topo/jf48_6_3_35.txt --queue=200 --ecnK=60 --flows=grid/g085.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g086 --topo=file --topofile=grid/topo/tor8x4x4.txt --queue=200 --ecnK=40 --fin=1 --flows=grid/g086.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g087 --topo=file --topofile=grid/topo/xp5_8_3_78.txt --queue=100 --ecnK=20 --flows=grid/g087.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g088 --topo=file --topofile=grid/topo/ls8x4x4.txt --queue=400 --ecnK=20 --flows=grid/g088.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g089 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=10 --flows=grid/g089.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g090 --topo=file --topofile=grid/topo/tor8x6x2.txt --queue=200 --ecnK=120 --fail=300000:s26:s27,500000:s37:s38 --flows=grid/g090.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g091 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=60 --flows=grid/g091.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g092 --topo=file --topofile=grid/topo/ft4.txt --queue=200 --ecnK=5 --fail=100000:s10:s2 --flows=grid/g092.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g093 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=80 --fail=300000:s45:s15 --flows=grid/g093.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g094 --topo=file --topofile=grid/topo/ft4.txt --queue=200 --ecnK=30 --flows=grid/g094.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g095 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=400 --ecnK=60 --fin=1 --flows=grid/g095.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g096 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=80 --flows=grid/g096.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g097 --topo=file --topofile=grid/topo/xp4_6_2_10.txt --queue=200 --ecnK=20 --flows=grid/g097.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g098 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=80 --flows=grid/g098.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g099 --topo=file --topofile=grid/topo/ls4x8x12.txt --queue=200 --ecnK=10 --flows=grid/g099.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g100 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=60 --fin=1 --flows=grid/g100.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g101 --topo=file --topofile=grid/topo/ls8x2x12.txt --queue=100 --ecnK=10 --flows=grid/g101.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g102 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=100 --ecnK=40 --flows=grid/g102.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g103 --topo=file --topofile=grid/topo/xp4_6_2_75.txt --queue=50 --ecnK=5 --fin=1 --flows=grid/g103.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g104 --topo=file --topofile=grid/topo/xp6_6_3_41.txt --queue=100 --ecnK=40 --flows=grid/g104.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g105 --topo=file --topofile=grid/topo/xp5_8_3_71.txt --queue=100 --ecnK=60 --flows=grid/g105.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g106 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=50 --ecnK=5 --fin=1 --flows=grid/g106.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g107 --topo=file --topofile=grid/topo/xp6_8_3_1.txt --queue=100 --ecnK=80 --flows=grid/g107.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g108 --topo=file --topofile=grid/topo/ls4x2x8.txt --queue=50 --ecnK=10 --flows=grid/g108.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g109 --topo=file --topofile=grid/topo/ls16x2x4.txt --queue=100 --ecnK=40 --fin=1 --flows=grid/g109.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g110 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=100 --ecnK=30 --fail=100000:s9:s25,200000:s19:s16 --flows=grid/g110.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g111 --topo=file --topofile=grid/topo/ft8.txt --queue=200 --ecnK=5 --flows=grid/g111.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g112 --topo=file --topofile=grid/topo/ls4x8x16.txt --queue=100 --ecnK=5 --flows=grid/g112.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g113 --topo=file --topofile=grid/topo/jf32_4_4_58.txt --queue=50 --ecnK=30 --fin=1 --flows=grid/g113.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g114 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=60 --flows=grid/g114.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g115 --topo=file --topofile=grid/topo/xp6_4_3_26.txt --queue=400 --ecnK=30 --flows=grid/g115.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g116 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=200 --ecnK=80 --fin=1 --flows=grid/g116.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g117 --topo=file --topofile=grid/topo/ls4x8x4.txt --queue=200 --ecnK=5 --flows=grid/g117.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g118 --topo=file --topofile=grid/topo/ft8.txt --queue=50 --ecnK=20 --flows=grid/g118.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g119 --topo=file --topofile=grid/topo/xp6_8_3_57.txt --queue=50 --ecnK=10 --flows=grid/g119.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g120 --topo=file --topofile=grid/topo/tor8x6x4.txt --queue=50 --ecnK=30 --flows=grid/g120.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g121 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=10 --fail=300000:s17:s21,400000:s16:s20,600000:s16:s20:up,700000:s17:s21:up --flows=grid/g121.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g122 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=120 --flows=grid/g122.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g123 --topo=file --topofile=grid/topo/tor8x6x4.txt --queue=50 --ecnK=40 --flows=grid/g123.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g124 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=100 --ecnK=30 --fin=1 --flows=grid/g124.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g125 --topo=file --topofile=grid/topo/xp5_4_2_42.txt --queue=400 --ecnK=20 --flows=grid/g125.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g126 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=50 --ecnK=30 --flows=grid/g126.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g127 --topo=file --topofile=grid/topo/ls8x4x4.txt --queue=100 --ecnK=10 --flows=grid/g127.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g128 --topo=file --topofile=grid/topo/ls16x8x16.txt --queue=50 --ecnK=10 --flows=grid/g128.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g129 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=200 --ecnK=20 --flows=grid/g129.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g130 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=50 --ecnK=40 --flows=grid/g130.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g131 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=5 --flows=grid/g131.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g132 --topo=file --topofile=grid/topo/xp6_4_2_88.txt --queue=400 --ecnK=80 --flows=grid/g132.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g133 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=100 --ecnK=40 --fin=1 --flows=grid/g133.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g134 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=50 --ecnK=30 --flows=grid/g134.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g135 --topo=file --topofile=grid/topo/jf16_4_4_58.txt --queue=200 --ecnK=120 --fin=1 --flows=grid/g135.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g136 --topo=file --topofile=grid/topo/ls16x8x4.txt --queue=100 --ecnK=20 --fin=1 --flows=grid/g136.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g137 --topo=file --topofile=grid/topo/xp5_6_2_91.txt --queue=100 --ecnK=10 --fin=1 --flows=grid/g137.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g138 --topo=file --topofile=grid/topo/ls16x4x4.txt --queue=50 --ecnK=10 --flows=grid/g138.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g139 --topo=file --topofile=grid/topo/ft8.txt --queue=200 --ecnK=80 --flows=grid/g139.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g140 --topo=file --topofile=grid/topo/xp5_8_2_44.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g140.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g141 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=20 --flows=grid/g141.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g142 --topo=file --topofile=grid/topo/tor4x6x4.txt --queue=50 --ecnK=20 --fin=1 --fail=200000:s22:s23,400000:s22:s23:up --flows=grid/g142.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g143 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=200 --ecnK=80 --flows=grid/g143.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g144 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=5 --fail=200000:s35:s32,600000:s35:s32:up --flows=grid/g144.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g145 --topo=file --topofile=grid/topo/ls4x8x16.txt --queue=100 --ecnK=40 --flows=grid/g145.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g146 --topo=file --topofile=grid/topo/tor4x6x4.txt --queue=400 --ecnK=10 --fin=1 --flows=grid/g146.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g147 --topo=file --topofile=grid/topo/xp5_8_2_70.txt --queue=100 --ecnK=30 --flows=grid/g147.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g148 --topo=file --topofile=grid/topo/xp6_6_3_44.txt --queue=200 --ecnK=30 --flows=grid/g148.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g149 --topo=file --topofile=grid/topo/tor4x6x2.txt --queue=100 --ecnK=30 --fin=1 --flows=grid/g149.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g150 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=50 --ecnK=5 --fin=1 --flows=grid/g150.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g151 --topo=file --topofile=grid/topo/xp5_4_2_61.txt --queue=400 --ecnK=120 --flows=grid/g151.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g152 --topo=file --topofile=grid/topo/ls4x2x4.txt --queue=50 --ecnK=5 --flows=grid/g152.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g153 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=100 --ecnK=5 --flows=grid/g153.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g154 --topo=file --topofile=grid/topo/xp5_4_3_5.txt --queue=400 --ecnK=5 --flows=grid/g154.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g155 --topo=file --topofile=grid/topo/ls8x4x4.txt --queue=50 --ecnK=5 --flows=grid/g155.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g156 --topo=file --topofile=grid/topo/tor6x8x2.txt --queue=50 --ecnK=10 --fail=300000:s40:s41,500000:s40:s41:up,500000:s21:s29,700000:s21:s29:up --flows=grid/g156.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g157 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=40 --fin=1 --flows=grid/g157.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g158 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=100 --ecnK=40 --fin=1 --flows=grid/g158.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g159 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=60 --flows=grid/g159.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g160 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=60 --flows=grid/g160.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g161 --topo=file --topofile=grid/topo/xp5_8_3_46.txt --queue=50 --ecnK=20 --flows=grid/g161.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g162 --topo=file --topofile=grid/topo/ft4.txt --queue=400 --ecnK=40 --fin=1 --flows=grid/g162.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g163 --topo=file --topofile=grid/topo/ft8.txt --queue=50 --ecnK=5 --flows=grid/g163.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g164 --topo=file --topofile=grid/topo/tor4x6x2.txt --queue=200 --ecnK=20 --flows=grid/g164.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g165 --topo=file --topofile=grid/topo/ft4.txt --queue=100 --ecnK=20 --fail=100000:s8:s0,300000:s10:s2 --flows=grid/g165.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g166 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=200 --ecnK=30 --flows=grid/g166.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g167 --topo=file --topofile=grid/topo/xp5_6_3_11.txt --queue=400 --ecnK=60 --flows=grid/g167.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g168 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=200 --ecnK=20 --fin=1 --flows=grid/g168.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g169 --topo=file --topofile=grid/topo/jf48_8_3_82.txt --queue=400 --ecnK=80 --flows=grid/g169.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g170 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=5 --flows=grid/g170.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g171 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=200 --ecnK=80 --flows=grid/g171.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g172 --topo=file --topofile=grid/topo/ls8x2x12.txt --queue=50 --ecnK=30 --fin=1 --flows=grid/g172.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g173 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=400 --ecnK=5 --fin=1 --flows=grid/g173.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g174 --topo=file --topofile=grid/topo/df4_2_4.txt --queue=100 --ecnK=10 --flows=grid/g174.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g175 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=20 --fail=300000:s35:s2,400000:s38:s6,500000:s35:s2:up,600000:s38:s6:up --flows=grid/g175.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g176 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=120 --flows=grid/g176.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g177 --topo=file --topofile=grid/topo/ls4x2x8.txt --queue=100 --ecnK=10 --fin=1 --flows=grid/g177.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g178 --topo=file --topofile=grid/topo/xp4_8_3_45.txt --queue=50 --ecnK=40 --flows=grid/g178.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g179 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=100 --ecnK=20 --fin=1 --flows=grid/g179.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g180 --topo=file --topofile=grid/topo/ft8.txt --queue=100 --ecnK=5 --fin=1 --flows=grid/g180.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g181 --topo=file --topofile=grid/topo/ft8.txt --queue=50 --ecnK=40 --fin=1 --flows=grid/g181.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=0
+g182 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=5 --flows=grid/g182.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g183 --topo=file --topofile=grid/topo/jf16_4_3_99.txt --queue=400 --ecnK=40 --fin=1 --flows=grid/g183.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g184 --topo=file --topofile=grid/topo/jf24_4_4_25.txt --queue=400 --ecnK=5 --fin=1 --flows=grid/g184.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g185 --topo=file --topofile=grid/topo/tor4x8x4.txt --queue=200 --ecnK=40 --flows=grid/g185.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g186 --topo=file --topofile=grid/topo/ft8.txt --queue=400 --ecnK=40 --flows=grid/g186.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g187 --topo=file --topofile=grid/topo/hx4_4x4.txt --queue=50 --ecnK=40 --flows=grid/g187.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g188 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=40 --fin=1 --flows=grid/g188.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+g189 --topo=file --topofile=grid/topo/df4_2_2.txt --queue=100 --ecnK=80 --flows=grid/g189.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g190 --topo=file --topofile=grid/topo/t3d4x2.txt --queue=400 --ecnK=10 --fail=200000:s6:s7,600000:s6:s7:up --flows=grid/g190.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+g191 --topo=file --topofile=grid/topo/hx2_8x4.txt --queue=400 --ecnK=30 --flows=grid/g191.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g192 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=50 --ecnK=5 --flows=grid/g192.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=0
+g193 --topo=file --topofile=grid/topo/jf32_4_2_19.txt --queue=100 --ecnK=30 --flows=grid/g193.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g194 --topo=file --topofile=grid/topo/jf24_6_3_12.txt --queue=100 --ecnK=40 --flows=grid/g194.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g195 --topo=file --topofile=grid/topo/xp5_6_2_92.txt --queue=50 --ecnK=20 --flows=grid/g195.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g196 --topo=file --topofile=grid/topo/hx4_4x4x2.txt --queue=200 --ecnK=20 --flows=grid/g196.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g197 --topo=file --topofile=grid/topo/ls16x8x8.txt --queue=100 --ecnK=20 --flows=grid/g197.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+g198 --topo=file --topofile=grid/topo/ls4x4x4.txt --queue=100 --ecnK=60 --fin=1 --flows=grid/g198.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+g199 --topo=file --topofile=grid/topo/ls16x8x16.txt --queue=200 --ecnK=40 --flows=grid/g199.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1

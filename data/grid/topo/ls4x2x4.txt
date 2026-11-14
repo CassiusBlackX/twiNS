@@ -1,0 +1,26 @@
+hosts 16
+switches 6
+link h0 s0
+link h1 s0
+link h2 s0
+link h3 s0
+link h4 s1
+link h5 s1
+link h6 s1
+link h7 s1
+link h8 s2
+link h9 s2
+link h10 s2
+link h11 s2
+link h12 s3
+link h13 s3
+link h14 s3
+link h15 s3
+link s0 s4
+link s0 s5
+link s1 s4
+link s1 s5
+link s2 s4
+link s2 s5
+link s3 s4
+link s3 s5

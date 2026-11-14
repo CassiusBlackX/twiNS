@@ -163,12 +163,12 @@ __host__ __device__ __forceinline__ int twins_clz64(uint64_t x)
 #endif
 }
 #endif
-// The lead part of a code (27 bits), increasing with the lead. Leads below 2^26 ps (67 us) have
-// a code each: lead + 1. Above, a lead L in [2^e, 2^(e+1)), 26 <= e <= 50, keeps its 21 leading
-// bits: bucket (e - 26) * 2^20 + the next 20 bits, code LC_LIN + 1 + 2 bucket + x, where x = 0 iff
-// the dropped bits are zero (an exact code: 1 ms, 55 us, any multiple of 2^(e-20) ps), else 1 (a
-// lossy code). Equal exact codes are equal leads; two equal lossy codes are not known to be, and a
-// comparison that meets them is undecided. Leads of 2^51 ps (37 minutes) or more: LC_SAT, lossy.
+// The lead part of a code (27 bits), increasing with the lead (in ns, the models' time step). Leads
+// below 2^26 ns (67 ms) have a code each: lead + 1. Above, a lead L in [2^e, 2^(e+1)), 26 <= e <=
+// 50, keeps its 21 leading bits: bucket (e - 26) * 2^20 + the next 20 bits, code LC_LIN + 1 + 2
+// bucket + x, where x = 0 iff the dropped bits are zero (an exact code: any multiple of 2^(e-20) ns),
+// else 1 (a lossy code). Equal exact codes are equal leads; two equal lossy codes are not known to
+// be, and a comparison that meets them is undecided. Leads of 2^51 ns (26 days) or more: LC_SAT.
 constexpr uint32_t LC_LIN = 1u << 26, LC_SAT = (1u << 27) - 2;
 __host__ __device__ __forceinline__ uint32_t lead_code(int64_t lead)
 {
@@ -228,7 +228,7 @@ __device__ __forceinline__ TailNode tail_at(uint64_t p)
     // (a node of this ring may be written by another block in this launch: read it as a seqlock,
     // with loads that bypass the non-coherent L1, and take it only if its pos held still)
     TailNode &n = g_tail.n[(p - 1) & g_tail.mask];
-    const unsigned long long p1 = atomicAdd(&n.pos, 0ull);
+    const unsigned long long p1 = atomicAdd((unsigned long long *)&n.pos, 0ull);
     if (p1 != p)
         return TailNode{};
     __threadfence();
@@ -243,7 +243,7 @@ __device__ __forceinline__ TailNode tail_at(uint64_t p)
     t.lsid = v->lsid;
 #endif
     __threadfence();
-    t.pos = atomicAdd(&n.pos, 0ull) == p1 ? p1 : 0;
+    t.pos = atomicAdd((unsigned long long *)&n.pos, 0ull) == p1 ? p1 : 0;
     return t;
 #else
     return g_tail.n[(p - 1) & g_tail.mask];
@@ -359,6 +359,73 @@ __host__ __device__ __forceinline__ uint64_t chash(uint64_t h, uint32_t code)
     return z ^ (z >> 31);
 }
 
+#ifndef TWINS_HASH_MEMO
+// Lead fingerprints (strict build). A chain carries two fingerprints of its lead codes after the
+// root's start, l_1 .. l_n (oldest first, one per event, each >= 1): F_x = l_1 x^(n-1) + ... + l_n
+// mod p = 2^61 - 1, for two bases x1, x2 drawn at random when the run starts (--fp-bases fixes them).
+// Two different sequences of at most n codes give two different polynomials of degree <= n (the
+// codes are nonzero, so lengths differ in degree), which agree at a random x with probability at
+// most n/p (Schwartz-Zippel); both fingerprints agree with probability at most (n/p)^2. ccmp uses
+// them for one decision only: chains of distinct roots with equal fingerprints, no lossy code among
+// those leads, are ordered by their roots (what the walk would find, without walking). The run
+// counts the checks (C) and the longest lineage checked (n); the chance that any decision is wrong is
+// at most C (n/(p-2))^2: a wrong one needs a check of two different sequences that collide.
+constexpr uint64_t FP_P = (1ull << 61) - 1, FP_LOSSY = 1ull << 63;
+__constant__ uint64_t c_fp[2];
+static uint64_t h_fp[2]; // (the host's copy)
+static bool g_fp_given = false;
+__host__ __device__ __forceinline__ uint64_t fp_base(int i)
+{
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__) || defined(TWINS_CPU)
+    return c_fp[i];
+#else
+    return h_fp[i];
+#endif
+}
+__host__ __device__ __forceinline__ uint64_t fp_mul(uint64_t a, uint64_t b)
+{
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+    const uint64_t lo = a * b, hi = __umul64hi(a, b);
+#else
+    const unsigned __int128 m = (unsigned __int128)a * b;
+    const uint64_t lo = (uint64_t)m, hi = (uint64_t)(m >> 64);
+#endif
+    uint64_t r = (lo & FP_P) + (lo >> 61 | hi << 3); // (a b < 2^122; 2^61 = 1 mod p)
+    r = (r & FP_P) + (r >> 61);
+    return r >= FP_P ? r - FP_P : r;
+}
+// the fingerprint pair (h1 with its lossy bit, h2) after one more code
+__host__ __device__ __forceinline__ void fp_step(uint64_t &h1, uint64_t &h2, uint32_t code)
+{
+    const uint32_t L = code >> CODE_ORD_BITS;
+    uint64_t f1 = fp_mul(h1 & FP_P, fp_base(0)) + L, f2 = fp_mul(h2, fp_base(1)) + L;
+    f1 = f1 >= FP_P ? f1 - FP_P : f1;
+    f2 = f2 >= FP_P ? f2 - FP_P : f2;
+    h1 = f1 | (h1 & FP_LOSSY) | (lead_lossy(L) ? FP_LOSSY : 0);
+    h2 = f2;
+}
+// the bases: given (--fp-bases), or drawn independently and uniformly from [2, p - 1] by rejection
+inline void fp_set(uint64_t x1, uint64_t x2)
+{
+    h_fp[0] = x1;
+    h_fp[1] = x2;
+#ifdef TWINS_CPU
+    c_fp[0] = h_fp[0];
+    c_fp[1] = h_fp[1];
+#endif
+}
+#endif
+__host__ __device__ __forceinline__ void chash_reset(Chain &c)
+{
+    c.hash = 0;
+#ifdef TWINS_HASH_MEMO
+    for (int k = 0; k < NANC; k++)
+        c.anc[k] = 0;
+#else
+    c.hash2 = 0;
+#endif
+}
+
 // the chain of an event scheduled with `code` by the event whose chain is par
 __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const Chain &par)
 {
@@ -373,7 +440,14 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
         c = par;
         if (c.r[0].cnt < 0xFFFFFFFFu)
             c.r[0].cnt++;
+#ifdef TWINS_HASH_MEMO
         c.hash = chash(par.hash, code);
+#else
+        fp_step(c.hash, c.hash2, code);
+#ifndef RDMA_CRIT
+        c.pad += c.pad != 0xFFFFFFFFu;
+#endif
+#endif
     }
     else
     {
@@ -383,9 +457,17 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             c.r[i] = par.r[i - 1];
         c.root = par.root;
         c.tail = par.tail;
+#ifdef TWINS_HASH_MEMO
         c.hash = chash(par.hash, code);
+#else
+        c.hash = par.hash;
+        c.hash2 = par.hash2;
+        fp_step(c.hash, c.hash2, code);
+#endif
 #ifdef RDMA_CRIT
         c.pad = par.pad; // (the scheduler's depth)
+#elif !defined(TWINS_HASH_MEMO)
+        c.pad = par.pad + (par.pad != 0xFFFFFFFFu); // (the lineage's length, for the fingerprints' bound)
 #else
         c.pad = 0;
 #endif
@@ -398,7 +480,7 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             __atomic_store_n(&n.pos, 0ull, __ATOMIC_RELAXED); // (read by others as it is written: see tail_at)
             __atomic_thread_fence(__ATOMIC_RELEASE);
 #else
-            atomicExch(&n.pos, 0ull); // (an old node in this slot is gone: readers see it as lost)
+            atomicExch((unsigned long long *)&n.pos, 0ull); // (an old node in this slot is gone: readers see it as lost)
             __threadfence();
 #endif
             n.code = par.r[RUNS - 1].code;
@@ -430,7 +512,7 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             __atomic_store_n(&n.pos, (unsigned long long)pos, __ATOMIC_RELEASE);
 #else
             __threadfence(); // (publish the fields before pos: see tail_at)
-            atomicExch(&n.pos, (unsigned long long)pos);
+            atomicExch((unsigned long long *)&n.pos, (unsigned long long)pos);
 #endif
             c.tail = pos;
 #else
@@ -438,9 +520,11 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
 #endif
         }
     }
+#ifdef TWINS_HASH_MEMO
     c.anc[0] = par.hash;
     for (int i = 1; i < NANC; i++)
         c.anc[i] = par.anc[i - 1];
+#endif
     *dst = c;
 }
 
@@ -891,7 +975,30 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
     return 0; // (ablation: no lineages)
 #endif
 #ifndef TWINS_HASH_MEMO
-    // (strict: no decision rests on a hash; the walk, with its exact memo of tail states)
+    // (strict: the walk, with its exact memo of tail states; and, for chains of distinct roots, the
+    // fingerprints of their leads: equal ones, without a lossy code, are taken as equal leads, which
+    // the walk would follow to both ends, where the roots decide. See fp_step for the bound.)
+#ifndef TWINS_NO_FP
+    if (a.root && b.root && a.root != b.root)
+    {
+        uint64_t a1 = a.hash, a2 = a.hash2, b1 = b.hash, b2 = b.hash2;
+        if (pa)
+            fp_step(a1, a2, pa);
+        if (pb)
+            fp_step(b1, b2, pb);
+        // (counted: the checks, for the bound, and the longer lineage checked; the decisions)
+        atomicAdd(&s.ev[38], 1ull);
+#ifndef RDMA_CRIT
+        atomicMax(&s.ev[39], (unsigned long long)(a.pad > b.pad ? a.pad : b.pad) + 1ull);
+#endif
+        if (a1 == b1 && a2 == b2 && !(a1 & FP_LOSSY))
+        {
+            *inexact = false;
+            atomicAdd(&s.ev[35], 1ull);
+            return s.root_rank[a.root - 1] < s.root_rank[b.root - 1] ? -1 : 1;
+        }
+    }
+#endif
 #ifdef RDMA_PROF
     {
         long long walk0 = clock64();
@@ -906,7 +1013,7 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 #else
     return ccmp_walk(s.root_rank, pa, a, pb, b, inexact);
 #endif
-#endif
+#else
     // the hashes of the chains compared (a virtual push pa on a) and of their ancestors
     uint64_t ha[NANC + 1], hb[NANC + 1];
     ha[0] = pa ? chash(a.hash, pa) : a.hash;
@@ -966,6 +1073,7 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
 #endif
     }
     return r;
+#endif
 }
 
 // the first three runs of the chain cpush(code0, ch) (code0 0: of ch itself)

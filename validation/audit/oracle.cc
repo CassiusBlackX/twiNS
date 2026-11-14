@@ -14,7 +14,13 @@
 //      first or reports an undecided tie, never b first.
 // Pairs at one context (ns-3 node), which are those TwiNS compares, are counted apart.
 //
-// usage: oracle LOG [CHAIN_RUNS is fixed at build: -DORACLE_RUNS=9]
+// With a second argument "rdma" (a log of the HPCC fork, validation/audit/hpcc_evlog_patch.py), check
+// 2 is TwiNS-RDMA's comparator instead (src/rdma/rstep.cuh ccmp_walk on intact chains: 27-bit lead
+// codes, equal lossy codes undecided, 5-bit ordinals that saturate, the deepest ordinal difference
+// where the lineages meet, distinct roots in set-up order). Fingerprints (P5) are not checked here:
+// on equal lead sequences they give the same verdict as the walk.
+//
+// usage: oracle LOG [rdma]   [CHAIN_RUNS is fixed at build: -DORACLE_RUNS=9]
 // build: g++ -O2 -std=c++17 -I src -DORACLE_RUNS=9 validation/audit/oracle.cc -o oracle
 #include <cstdio>
 #include <cstdlib>
@@ -134,6 +140,63 @@ static uint16_t code_of(int64_t lead, bool o = false)
     return 0xFFFF; // (lossy: a comparison meeting two of these is undecided)
 }
 
+// TwiNS-RDMA's lead codes (src/rdma/rstep.cuh, a copy), leads in ns
+constexpr uint32_t LC_LIN = 1u << 26, LC_SAT = (1u << 27) - 2;
+static uint32_t rdma_lead_code(int64_t lead)
+{
+    const uint64_t L = (uint64_t)(lead < 0 ? 0 : lead);
+    if (L < LC_LIN)
+        return (uint32_t)L + 1;
+    const int e = 63 - __builtin_clzll(L);
+    if (e > 50)
+        return LC_SAT;
+    const int sh = e - 20;
+    const uint32_t bucket = (uint32_t)(e - 26) * (1u << 20) + (uint32_t)((L >> sh) - (1ull << 20));
+    return LC_LIN + 1 + 2 * bucket + ((L & ((1ull << sh) - 1)) ? 1 : 0);
+}
+static bool rdma_lossy(uint32_t lc) { return lc > LC_LIN && ((lc - LC_LIN - 1) & 1); }
+constexpr uint32_t RDMA_ORD_MAX = 31; // (CODE_ORD_MAX: ordinals at or above it share a code)
+enum { RW_LOSSY = 1, RW_ORD = 2 };
+// < 0: a first, > 0: b first, 0: undecided (*why)
+static int rdma_cmp(uint32_t a, uint32_t b, int *why)
+{
+    int ord = 0; // the deepest ordinal difference: -1/1, 2 unknown (equal saturated ordinals)
+    for (;;)
+    {
+        uint32_t pa = g_par[a], pb = g_par[b];
+        if (pa == 0 && pb == 0)
+            return a < b ? -1 : 1; // distinct roots: set-up order
+        if (pa == 0)
+            return -1;
+        if (pb == 0)
+            return 1;
+        const uint32_t ca = rdma_lead_code((int64_t)(g_ts[a] - g_ts[pa])), cb = rdma_lead_code((int64_t)(g_ts[b] - g_ts[pb]));
+        if (ca != cb)
+            return ca > cb ? -1 : 1;
+        if (rdma_lossy(ca))
+        {
+            *why = RW_LOSSY;
+            return 0;
+        }
+        const uint32_t oa = std::min(g_ord[a], RDMA_ORD_MAX), ob = std::min(g_ord[b], RDMA_ORD_MAX);
+        if (oa != ob)
+            ord = oa < ob ? -1 : 1;
+        else if (oa == RDMA_ORD_MAX)
+            ord = 2;
+        if (pa == pb) // (the lineages meet: below here they are one)
+        {
+            if (ord == 2)
+            {
+                *why = RW_ORD;
+                return 0;
+            }
+            return ord;
+        }
+        a = pa;
+        b = pb;
+    }
+}
+
 // Definition 1 on full lineages: < 0 if a runs first
 static int lin_cmp(uint32_t a, uint32_t b, uint64_t *depth)
 {
@@ -161,9 +224,10 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        fprintf(stderr, "usage: oracle LOG\n");
+        fprintf(stderr, "usage: oracle LOG [rdma]\n");
         return 2;
     }
+    const bool rdma = argc > 2 && !strcmp(argv[2], "rdma");
     FILE *f = fopen(argv[1], "rb");
     if (!f)
     {
@@ -187,6 +251,24 @@ int main(int argc, char **argv)
         if (t > 0)
             for (int k = 0; k < 1 + same; k++)
                 thm_bad[k]++;
+        if (rdma)
+        {
+            int w = 0;
+            int c = rdma_cmp(a, b, &w);
+            for (int k = 0; k < 1 + same; k++)
+            {
+                if (c < 0)
+                    cmp_ok[k]++;
+                else if (c == 0)
+                {
+                    cmp_und[k]++;
+                    why[k][w & 7]++;
+                }
+                else
+                    cmp_bad[k]++;
+            }
+            return;
+        }
         {
             auto oa = g_old.find(a), ob = g_old.find(b);
             if (oa != g_old.end() && ob != g_old.end())
@@ -270,6 +352,11 @@ int main(int argc, char **argv)
                 g_ts[r.uid] = r.ts;
                 g_par[r.uid] = r.parent;
                 g_ctx[r.uid] = r.context;
+                if (rdma)
+                {
+                    g_ord[r.uid] = r.parent ? g_nsched[r.parent]++ : 0;
+                    continue;
+                }
                 std::vector<uint16_t> ch(CHAIN), oc(CHAIN);
                 if (r.parent == 0)
                 {
@@ -314,6 +401,17 @@ int main(int argc, char **argv)
     printf("time stamps with simultaneous events: %llu, holding %llu events; leads without a TwiNS code: %llu\n",
            (unsigned long long)groups, (unsigned long long)tied_events, (unsigned long long)g_unmapped);
     const char *name[2] = {"all pairs", "same node"};
+    if (rdma)
+    {
+        for (int k = 0; k < 2; k++)
+            printf("%s: %llu checked; Theorem 1 (full lineages) disagrees %llu; TwiNS-RDMA comparator: right %llu, undecided %llu "
+                   "(lossy %llu ordinal %llu), WRONG %llu\n",
+                   name[k], (unsigned long long)pairs[k], (unsigned long long)thm_bad[k], (unsigned long long)cmp_ok[k],
+                   (unsigned long long)cmp_und[k], (unsigned long long)why[k][RW_LOSSY], (unsigned long long)why[k][RW_ORD],
+                   (unsigned long long)cmp_bad[k]);
+        printf("lineage levels walked: %llu\n", (unsigned long long)depth);
+        return (thm_bad[0] || cmp_bad[0]) ? 1 : 0;
+    }
     for (int k = 0; k < 2; k++)
         printf("%s: %llu checked; Theorem 1 (full lineages) disagrees %llu; chain comparator (%d runs): "
                "right %llu, undecided %llu (lossy %llu trunc %llu same-root %llu count %llu no-root %llu), WRONG %llu\n",

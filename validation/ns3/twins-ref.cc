@@ -282,7 +282,12 @@ int main(int argc, char *argv[])
     Config::SetDefault("ns3::RedQueueDisc::MaxTh", DoubleValue(ecnK));
     Config::SetDefault("ns3::RedQueueDisc::MaxSize", QueueSizeValue(QueueSize(std::to_string(queuePkts) + "p")));
     Config::SetDefault("ns3::Ipv4GlobalRouting::RandomEcmpRouting", BooleanValue(true));
-    Config::SetDefault("ns3::Ipv4GlobalRouting::FlowEcmpRouting", BooleanValue(perFlowEcmp));
+    // (per-flow ECMP is Unison's addition to Ipv4GlobalRouting: validation/ns3/flow-ecmp.patch ports it
+    // to a vanilla ns-3.46.1; without it only per-packet ECMP, --flowEcmp=0, can run)
+    if (!Config::SetDefaultFailSafe("ns3::Ipv4GlobalRouting::FlowEcmpRouting", BooleanValue(perFlowEcmp)) && perFlowEcmp)
+    {
+        NS_FATAL_ERROR("--flowEcmp=1 needs Ipv4GlobalRouting::FlowEcmpRouting (Unison's tree, or flow-ecmp.patch)");
+    }
     Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue(tcp));
     Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(1460));
     Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(10));
@@ -563,7 +568,10 @@ int main(int argc, char *argv[])
                             sa = 0;
                         std::cout << "Q " << Simulator::Now().GetPicoSeconds() << " " << node << " " << dev << " "
                                   << hostOf[ip->GetHeader().GetSource().Get()] << " " << hostOf[ip->GetHeader().GetDestination().Get()]
-                                  << " " << kind << " " << sa << " " << qq->GetNPackets() << std::endl;
+                                  << " " << kind << " " << sa << " " << qq->GetNPackets();
+                        if (getenv("TRACE_ECN")) // (TRACE_ECN=1: the IP ECN field after this enqueue, 3: CE)
+                            std::cout << " ecn " << (int)ip->GetHeader().GetEcn();
+                        std::cout << std::endl;
                     }, qq, node, dev));
             }
             if (const char *tq = getenv("TRACE_QUEUE"))

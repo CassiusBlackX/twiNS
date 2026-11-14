@@ -136,8 +136,27 @@ static std::vector<FlowIn> load_flows(const std::string &path, int H)
     return out;
 }
 
+#ifdef TWINS_MUTATION
+namespace nsm
+{
+int h_mut = 0; // (model.h)
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef TWINS_MUTATION
+    {
+        const char *m = getenv("TWINS_MUT");
+        h_mut = m ? atoi(m) : 0;
+#if defined(TWINS_USE_HIP)
+        CHECK(hipMemcpyToSymbol(HIP_SYMBOL(c_mut), &h_mut, sizeof h_mut));
+#else
+        CHECK(cudaMemcpyToSymbol(c_mut, &h_mut, sizeof h_mut));
+#endif
+        fprintf(stderr, "mutation %d\n", h_mut);
+    }
+#endif
     int k = 4, graph_k = 64;
     std::string flow_file, output = "fct.csv", tcp = "dctcp", ecmp_from, qtrace_file;
     int hash_check = 0;
@@ -734,7 +753,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "host %d binds more than %d connections: give --ecmp_from\n", recs[c].src % H1, 65535 - 49152);
                     return 1;
                 }
-                const uint16_t sport = (uint16_t)(49153 + n), dport = 1000;
+                const uint16_t sport = (uint16_t)((MUT(26) ? 49152 : 49153) + n), dport = 1000;
                 const uint32_t a = ip(recs[c].src % H1), b = ip(recs[c].dst % H1);
                 recs[c].hash_data = hash(a, b, sport, dport);
                 recs[c].hash_ack = hash(b, a, dport, sport);
@@ -860,6 +879,7 @@ int main(int argc, char **argv)
     s.hs.pend_end = dupload(pend_end);
     s.hs.pend_msg = dupload(order);
     s.hs.wake = dalloc<int64_t>(H); // 0: every host runs its first slot
+    s.hs.lst_ce = dupload(std::vector<int64_t>(H, -1));
     {
         std::vector<uint8_t> cc(H);
         std::vector<int> hk_(H), hq(H), pk((size_t)S * k), pq((size_t)S * k);

@@ -102,7 +102,7 @@ __host__ __device__ __forceinline__ uint64_t udiv64(uint64_t n, uint64_t d)
 #define TWINS_RDMA_RUNS 6
 #endif
 constexpr int RUNS = TWINS_RDMA_RUNS; // chain runs kept
-constexpr int MAXF = 256;    // frames a link can deliver in one slot, at most
+constexpr int MAXF = 256;    // frames a link can deliver in one slot, at most (--fcap raises it for links of nonzero frame time)
 constexpr int MAX_HOP = 5;   // IntHeader::maxHop
 constexpr int PG = 3;        // the data priority (flows' pg), RdmaEgressQueue::ack_q_idx
 constexpr uint32_t RESERVE = 4 * 1024, RESUME_OFFSET = 3 * 1024; // SwitchMmu
@@ -140,11 +140,21 @@ struct Chain
 {
     Run r[RUNS];
     uint64_t tail;  // the runs after r[RUNS - 1]: a TailNode (its position + 1; 0: none)
+#ifdef TWINS_HASH_MEMO
     uint64_t hash, anc[NANC];
+#else
+    // two polynomial fingerprints of the leads after the root's start (rstep.cuh, fp_step); bit
+    // 63 of hash: a lossy lead code is among them
+    uint64_t hash, hash2;
+#endif
     uint32_t root;  // 1 + the flow's index in start order, over all worlds (0: none)
     uint32_t pad;
 };
+#ifdef TWINS_HASH_MEMO
 static_assert(sizeof(Chain) == 8 * RUNS + 24 + 8 * NANC, "Chain");
+#else
+static_assert(sizeof(Chain) == 8 * RUNS + 32, "Chain");
+#endif
 
 // The older runs of long chains, in a ring shared by all chains: a node is immutable, and pos
 // (its position + 1) tells whether the ring has since overwritten it.

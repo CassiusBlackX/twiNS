@@ -145,7 +145,7 @@ struct Fifo
         int nq = (size > 0 && link_free > now && refilled) ? size - 1 : size;
         Frame g = f;
         g.ts = now;
-        if (nq >= red_k && nq > 1)
+        if ((MUT(7) ? nq > red_k : nq >= red_k) && nq > 1)
         {
             if (g.flags & F_ECT)
             {
@@ -158,7 +158,7 @@ struct Fifo
                 return false;
             }
         }
-        if (nq >= qcap)
+        if (nq >= (MUT(8) ? qcap + 1 : qcap))
         {
             atomicAdd(&s->ev[0], 1ull);
             return false;
@@ -309,7 +309,7 @@ __device__ inline void send_ack(HostCtx &c, int f, uint32_t ack, bool force_ece,
     // SendEmptyPacket(ACK) cancels the delayed ACK
     F.delack_at[f] = -1;
     F.delack_count[f] = 0;
-    emit(c, f, F_ACK | (ece ? F_ECE : 0), 0, ack, 0, CTRL_FRAME, true, now);
+    emit(c, f, F_ACK | (ece ? F_ECE : 0), 0, ack, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), true, now);
 }
 
 // ---- TcpTxBuffer without SACK (Reno emulation), as ns-3 implements it: the sent list is a ring
@@ -984,16 +984,16 @@ __device__ inline void rtt_sample(const FlowSoA &F, int f, int64_t m)
     else
     {
         int64_t delta = m - est;
-        est = ((est << 3) + delta) >> 3;
+        est = MUT(9) ? ((est << 2) + delta) >> 2 : ((est << 3) + delta) >> 3;
         if (delta < 0)
             delta = -delta;
-        var = ((var << 2) + delta - var) >> 2;
+        var = MUT(10) ? ((var << 3) + delta - var) >> 3 : ((var << 2) + delta - var) >> 2;
     }
     F.srtt[f] = est;
     F.rttvar[f] = var;
     int64_t v = 4 * var;
-    int64_t rto = est + (v > CLOCK_GRAN_PS ? v : CLOCK_GRAN_PS);
-    F.rto[f] = rto > MIN_RTO_PS ? rto : MIN_RTO_PS;
+    int64_t rto = est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
+    F.rto[f] = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
 }
 
 __device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now)
@@ -1057,7 +1057,7 @@ __device__ inline uint32_t send_segment(HostCtx &c, int f, uint32_t seq, uint32_
         flags |= F_FIN;
         F.fin[f] |= FIN_SENT;
     }
-    emit(c, f, flags, seq, 0, (uint16_t)len, (uint16_t)(len + 42), false, now);
+    emit(c, f, flags, seq, 0, (uint16_t)len, (uint16_t)(len + (MUT(19) ? 40 : 42)), false, now);
     if (retx)
     {
         atomicAdd(&c.s->ev[2], 1ull);
@@ -1155,20 +1155,20 @@ __device__ TWINS_COLD uint32_t cub_update(const FlowSoA &F, int f, uint32_t segs
         }
         else
         {
-            F.cub_k[f] = nsm_pow((double)(F.cub_lastmax[f] - seg_cwnd) / CUB_C, 1 / 3.);
+            F.cub_k[f] = nsm_pow((double)(F.cub_lastmax[f] - seg_cwnd) / (MUT(13) ? 0.5 : CUB_C), 1 / 3.);
             F.cub_origin[f] = F.cub_lastmax[f];
         }
     }
     int64_t t = (int64_t)((uint64_t)now + (uint64_t)F.cub_delaymin[f] - (uint64_t)F.cub_epoch[f]);
     double ts = nsm_seconds(t), k = F.cub_k[f];
     double offs = ts < k ? k - ts : ts - k;
-    uint32_t delta = cub_u32(CUB_C * nsm_pow(offs, 3));
+    uint32_t delta = cub_u32((MUT(13) ? 0.5 : CUB_C) * nsm_pow(offs, 3));
     uint32_t target = ts < k ? F.cub_origin[f] - delta : F.cub_origin[f] + delta;
     uint32_t cnt = target > seg_cwnd ? seg_cwnd / (target - seg_cwnd) : 100 * seg_cwnd;
     if (F.cub_lastmax[f] == 0 && cnt > 20)
         cnt = 20;
     // TCP friendliness
-    uint32_t scale = cub_u32(8 * (1024 + CUB_BETA * 1024) / 3 / (1024 - CUB_BETA * 1024));
+    uint32_t scale = cub_u32(8 * (1024 + (MUT(12) ? 0.8 : CUB_BETA) * 1024) / 3 / (1024 - (MUT(12) ? 0.8 : CUB_BETA) * 1024));
     delta = (seg_cwnd * scale) >> 3;
     while (F.cub_ackcnt[f] > delta)
     {
@@ -1245,11 +1245,11 @@ __device__ TWINS_COLD uint32_t cub_ssthresh(const FlowSoA &F, int f)
 {
     uint32_t seg_cwnd = F.cwnd[f] / MSS;
     if (seg_cwnd < F.cub_lastmax[f])
-        F.cub_lastmax[f] = cub_u32((seg_cwnd * (1 + CUB_BETA)) / 2); // fast convergence
+        F.cub_lastmax[f] = cub_u32((seg_cwnd * (1 + (MUT(12) ? 0.8 : CUB_BETA))) / 2); // fast convergence
     else
         F.cub_lastmax[f] = seg_cwnd;
     F.cub_epoch[f] = INT64_MIN;
-    uint32_t th = cub_u32(seg_cwnd * CUB_BETA);
+    uint32_t th = cub_u32(seg_cwnd * (MUT(12) ? 0.8 : CUB_BETA));
     return (th > 2 ? th : 2) * MSS;
 }
 
@@ -1287,7 +1287,8 @@ __device__ inline void pkts_acked(HostCtx &c, int f, uint32_t segs, uint32_t ack
     {
         double m = F.acked_total[f] > 0 ? (double)F.acked_ecn[f] / F.acked_total[f] : 0.0;
         // ns-3's optimized build (-march=native) contracts this into fma((1 - g), alpha, g * F)
-        F.alpha[f] = __builtin_fma(1.0 - DCTCP_G, F.alpha[f], DCTCP_G * m);
+        const double g = MUT(6) ? 0.125 : DCTCP_G;
+        F.alpha[f] = __builtin_fma(1.0 - g, F.alpha[f], g * m);
 #ifdef NS_TRACE
         if (f == NS_TRACE)
             printf("alpha %lld %u %u %a\n", (long long)(now / 1000), F.acked_ecn[f], F.acked_total[f], F.alpha[f]);
@@ -1371,8 +1372,8 @@ __device__ inline void new_ack(HostCtx &c, int f, uint32_t ack, bool reset_rto, 
         // RFC 6298 2.4: the RTO is recomputed from the estimator, which also clears any backoff
         // (before the first sample the estimator holds InitialEstimation, 100 us)
         int64_t est = F.srtt[f] >= 0 ? F.srtt[f] : INIT_RTT_PS, v = 4 * F.rttvar[f];
-        int64_t rto = est + (v > CLOCK_GRAN_PS ? v : CLOCK_GRAN_PS);
-        F.rto[f] = rto > MIN_RTO_PS ? rto : MIN_RTO_PS;
+        int64_t rto = est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
+        F.rto[f] = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
         F.rto_at[f] = now + F.rto[f];
         timer_chain(c, c.s->fl.rchain, f, F.rto[f]);
     }
@@ -1480,7 +1481,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
                 tb_add_reno_sack(F, f); // one segment has left the network
             else if (cg == C_DISORDER)
             {
-                if (F.dupacks[f] == DUPTHRESH && (old >= F.recover[f] || !F.recover_active[f]))
+                if (F.dupacks[f] == (MUT(1) ? 4 : DUPTHRESH) && (old >= F.recover[f] || !F.recover_active[f]))
                     enter_recovery(c, f, now);
                 else if (tb_head_lost(F, f))
                     enter_recovery(c, f, now); // IsLost(HighACK)
@@ -1518,7 +1519,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
             // partial ACK: the head is lost; retransmit it unless the item that this ACK plus one
             // segment would complete was retransmitted already
             tb_mark_head_lost(F, f);
-            if (!tb_retx_ends_at(F, f, ack + MSS))
+            if (!tb_retx_ends_at(F, f, ack + MSS) && !MUT(23))
                 do_retransmit(c, f, now);
             pkts_acked(c, f, 1, ack, now);
             new_ack(c, f, ack, F.first_partial[f], now);
@@ -1616,7 +1617,7 @@ __device__ TWINS_COLD void on_rto(HostCtx &c, int f, int64_t now)
     tb_all_lost(F, f); // ResetRenoSack + SetSentListLost(resetSack)
     F.recover[f] = F.high[f];
     F.recover_active[f] = 1;
-    int64_t r = 2 * F.rto[f];
+    int64_t r = MUT(5) ? F.rto[f] : 2 * F.rto[f];
     F.rto[f] = r < 60000000000000ll ? r : 60000000000000ll;
     F.h_n[f] = 0; // m_history.clear()
     if (!GENERAL)
@@ -1635,7 +1636,7 @@ __device__ TWINS_COLD void on_rto(HostCtx &c, int f, int64_t now)
 __device__ TWINS_COLD void send_synack(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
-    int64_t rto = CONN_TIMEOUT_PS << F.srv_syn_n[f];
+    int64_t rto = (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS) << F.srv_syn_n[f];
     F.srv_syn_n[f]++;
     if (F.r_synack_t[f] < 0)
         F.r_synack_t[f] = now; // UpdateRttHistory for the first SYN-ACK only
@@ -1663,14 +1664,14 @@ __device__ inline void ce_state(HostCtx &c, int f, bool ce_now, int64_t now)
     const FlowSoA &F = c.s->fl;
     if (ce_now)
     {
-        if (!F.ce_state[f] && F.reserved[f] && F.prior_flag[f])
+        if (!F.ce_state[f] && F.reserved[f] && F.prior_flag[f] && !MUT(14))
             send_ack(c, f, F.prior_rcv_nxt[f], false, true, now); // previous ACK without ECE
         F.ce_state[f] = 1;
         F.ecn_r[f] = E_CE_RCVD;
     }
     else
     {
-        if (F.ce_state[f] && F.reserved[f] && F.prior_flag[f])
+        if (F.ce_state[f] && F.reserved[f] && F.prior_flag[f] && !MUT(14))
             send_ack(c, f, F.prior_rcv_nxt[f], true, false, now); // previous ACK with ECE
         F.ce_state[f] = 0;
         if (F.ecn_r[f] == E_CE_RCVD || F.ecn_r[f] == E_SENDING_ECE)
@@ -1678,6 +1679,15 @@ __device__ inline void ce_state(HostCtx &c, int f, bool ce_now, int64_t now)
     }
     F.prior_flag[f] = 1;
     F.prior_rcv_nxt[f] = F.rcv_nxt[f];
+}
+
+// TcpSocketBase::ForwardUp at the host's listening socket, for a segment whose connection's endpoint is
+// gone: the CE check raises the listener's m_ecnCESeq (ProcessListen then ignores the segment), and
+// every later fork starts with it, so a new connection ignores CE marks up to that sequence number
+__device__ inline void listener_ecn(HostCtx &c, const Frame &p)
+{
+    if (c.dctcp && (p.flags & F_CE) && c.s->hs.lst_ce[c.h] < (int64_t)p.sa && !MUT(16))
+        c.s->hs.lst_ce[c.h] = p.sa;
 }
 
 // TcpSocketBase::ReceivedData (+ the ECN processing that precedes it)
@@ -1710,7 +1720,7 @@ __device__ inline void snd_ecn(HostCtx &c, int f, const Frame &p)
     const FlowSoA &F = c.s->fl;
     if (!c.dctcp)
         return;
-    if ((p.flags & F_CE) && !(F.s_ce[f] & 1))
+    if ((p.flags & F_CE) && (MUT(25) || !(F.s_ce[f] & 1)))
     {
         F.s_ce[f] = 3;
         F.ecn_s[f] = E_CE_RCVD;
@@ -1862,12 +1872,12 @@ __device__ TWINS_COLD void send_fin_ack(HostCtx &c, int f, int64_t now)
     const FlowSoA &F = c.s->fl;
     F.delack_at[f] = -1;
     F.delack_count[f] = 0;
-    emit(c, f, F_ACK | F_FIN, 0, F.rcv_nxt[f], 0, CTRL_FRAME, true, now);
+    emit(c, f, F_ACK | F_FIN, 0, F.rcv_nxt[f], 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), true, now);
     if (F.r_frx_at[f] < 0)
     {
         int64_t est = F.r_srtt[f] >= 0 ? F.r_srtt[f] : INIT_RTT_PS, v = 4 * F.r_rttvar[f];
-        int64_t rto = est + (v > CLOCK_GRAN_PS ? v : CLOCK_GRAN_PS);
-        rto = rto > MIN_RTO_PS ? rto : MIN_RTO_PS;
+        int64_t rto = est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
+        rto = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
         F.r_frx_at[f] = now + rto;
         timer_chain(c, F.schain, f, rto); // (the sender's SendPendingData chain is idle by now)
     }
@@ -1877,7 +1887,7 @@ __device__ TWINS_COLD void send_fin_ack(HostCtx &c, int f, int64_t now)
 __device__ inline int64_t last_rto(const FlowSoA &F, int f)
 {
     int64_t est = F.r_srtt[f] >= 0 ? F.r_srtt[f] : INIT_RTT_PS, v = 4 * F.r_rttvar[f];
-    return est + (v > CLOCK_GRAN_PS ? v : CLOCK_GRAN_PS);
+    return est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
 }
 
 // TcpSocketBase::DoPeerClose: CLOSE_WAIT; the PacketSink's sockets have ShutdownSend set, so
@@ -1925,7 +1935,7 @@ __device__ inline void received_data(HostCtx &c, int f, uint32_t seq, uint32_t l
         return;
     }
     uint32_t cnt = F.delack_count[f] + 1u;
-    if (cnt >= DELACK_COUNT)
+    if (cnt >= (MUT(2) ? 1u : DELACK_COUNT))
     {
         F.reserved[f] = 0;
         send_ack(c, f, F.rcv_nxt[f], false, false, now);
@@ -1936,8 +1946,8 @@ __device__ inline void received_data(HostCtx &c, int f, uint32_t seq, uint32_t l
         F.reserved[f] = 1; // CA_EVENT_DELAYED_ACK
         if (F.delack_at[f] < 0)
         {
-            F.delack_at[f] = now + DELACK_PS;
-            timer_chain(c, c.s->fl.dchain, f, DELACK_PS);
+            F.delack_at[f] = now + (MUT(3) ? 2 * DELACK_PS : DELACK_PS);
+            timer_chain(c, c.s->fl.dchain, f, MUT(3) ? 2 * DELACK_PS : DELACK_PS);
         }
     }
 }
@@ -1948,7 +1958,10 @@ __device__ inline void on_data(HostCtx &c, int f, const Frame &p, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     if (!F.r_up[f] || F.r_st[f] == R_CLOSED)
-        return; // (a closed connection's segments reach the listening socket, which ignores them)
+    {
+        listener_ecn(c, p); // (a closed connection's segments reach the listening socket, which ignores them)
+        return;
+    }
     uint32_t seq = p.sa, len = payload_of(p), end = seq + len;
     bool fin = GENERAL && (p.flags & F_FIN);
     // TcpSocketBase::IsValidTcpSegment: data entirely below rcv_nxt (OutOfRange; in LAST_ACK
@@ -1956,7 +1969,8 @@ __device__ inline void on_data(HostCtx &c, int f, const Frame &p, int64_t now)
     // ACK before any ECN processing
     if (len > 0 && F.r_est[f] && (F.r_st[f] == R_LAST_ACK ? seq != F.rcv_nxt[f] : end < F.rcv_nxt[f]))
     {
-        send_ack(c, f, F.rcv_nxt[f], false, true, now);
+        if (!MUT(15))
+            send_ack(c, f, F.rcv_nxt[f], false, true, now);
         return;
     }
 #ifdef NS_TRACE
@@ -2068,7 +2082,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
                 // UpdateRttHistory cannot mark the zero-length SYN entry as retransmitted, so a
                 // SYN timeout yields a ~10 ms sample (and a ~30 ms RTO)
                 rtt_sample(F, f, now - F.timing_time[f]);
-                emit(c, f, F_ACK, 0, 0, 0, CTRL_FRAME, false, now);
+                emit(c, f, F_ACK, 0, 0, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
                 // ConnectionSucceeded (ScheduleNow) lets the application write its due messages
                 uint16_t parent[CHAIN];
                 for (int i = 0; i < CHAIN; i++)
@@ -2086,7 +2100,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
             snd_ecn(c, f, p);
             on_ack(c, f, p.sa, p.flags & F_ECE, now);
             F.fin[f] |= FIN_TW;
-            emit(c, f, F_ACK, 0, 1, 0, CTRL_FRAME, false, now);
+            emit(c, f, F_ACK, 0, 1, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
         }
         else
         {
@@ -2113,9 +2127,10 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
         if (!F.r_up[f])
         {
             F.r_up[f] = 1;
+            F.ecn_ce_seq[f] = c.s->hs.lst_ce[c.h]; // (Fork copies the listener's m_ecnCESeq)
             // ns-3 enters ESTABLISHED with the delayed-ACK count at its maximum, so the first
             // data segment is acknowledged at once
-            F.delack_count[f] = DELACK_COUNT;
+            F.delack_count[f] = MUT(24) ? 0 : DELACK_COUNT;
             add_active(s, s.hs.act_rcv, s.hs.n_rcv, f, c.h);
         }
         if (F.r_est[f])
@@ -2139,6 +2154,8 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
         if (F.r_st[f] == R_LAST_ACK)
             rcv_closed(F, f);
     }
+    else if (F.r_up[f])
+        listener_ecn(c, p); // (a pure ACK after the endpoint is gone: at the listener)
 }
 
 
@@ -2155,6 +2172,10 @@ __device__ inline const uint16_t *due_chain(const FlowSoA &F, const Due &d)
 // two timers due at the same instant: does ns-3 run a after b? (undecided: no, counted)
 __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due &a, const Due &b, int h)
 {
+#ifdef TWINS_MUTATION
+    if (MUT(99))
+        printf("timer tie\n"); // (mutation builds: TWINS_MUT=99 prints every tie of two timers)
+#endif
     int why;
     int r = chain_cmp(due_chain(F, a), due_chain(F, b), &why);
     if (r == 0)
@@ -2163,7 +2184,7 @@ __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due
         atomicAdd(&s.ev[26 + TIE_ORDER], 1ull);
         atomicAdd(&s.ties_w[h / s.H1], 1ull);
     }
-    return r > 0;
+    return MUT(21) ? r < 0 : r > 0;
 }
 
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
@@ -2179,7 +2200,7 @@ __device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, 
         atomicAdd(&s.ev[26 + why], 1ull);
         atomicAdd(&s.ties_w[(p.dst_node % s.H) / s.H1], 1ull);
     }
-    return r <= 0; // (undecided: the timer)
+    return MUT(20) ? r >= 0 : r <= 0; // (undecided: the timer)
 }
 
 // One slot of host h: all of its events in [slot start, slot end) in timestamp order.
@@ -2315,9 +2336,9 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             F.st[f] = S_SYN_SENT;
             if (c.cubic)
                 cub_hystart_reset(F, f, now); // TcpCubic::Init when the socket is created
-            F.rto[f] = CONN_TIMEOUT_PS; // TcpSocketBase::SendEmptyPacket(SYN)
-            F.syn_at[f] = now + CONN_TIMEOUT_PS;
-            timer_chain(c, F.rchain, f, CONN_TIMEOUT_PS);
+            F.rto[f] = (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS); // TcpSocketBase::SendEmptyPacket(SYN)
+            F.syn_at[f] = now + (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS);
+            timer_chain(c, F.rchain, f, (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS));
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
         }
@@ -2365,7 +2386,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             {
                 // SYN retransmission with exponential backoff of the connection timeout
                 int tries = ++F.syn_tries[d.flow];
-                F.rto[d.flow] = CONN_TIMEOUT_PS << tries;
+                F.rto[d.flow] = (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS) << tries;
                 F.syn_at[d.flow] = now + F.rto[d.flow];
                 timer_chain(c, F.rchain, d.flow, F.rto[d.flow]);
                 emit(c, d.flow, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
@@ -2646,7 +2667,7 @@ __device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw
             if (sc.mpos[q] >= in.count())
                 continue;
             const Frame &f = in.at(sc.mpos[q]);
-            if (best < 0 || f.ts < bf->ts || (f.ts == bf->ts && frame_before(s, f, *bf)))
+            if (best < 0 || f.ts < bf->ts || (f.ts == bf->ts && !MUT(22) && frame_before(s, f, *bf)))
             {
                 best = q;
                 bf = &f;

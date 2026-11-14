@@ -1,0 +1,133 @@
+--- a/src/internet/model/ipv4-global-routing.cc	2026-11-14 08:50:17.836027081 +0000
++++ b/src/internet/model/ipv4-global-routing.cc	2026-10-27 11:25:48.152025953 +0000
+@@ -8,6 +8,7 @@
+ #include "ipv4-global-routing.h"
+ 
+ #include "global-route-manager.h"
++#include "ipv4-queue-disc-item.h"
+ #include "ipv4-route.h"
+ #include "ipv4-routing-table-entry.h"
+ 
+@@ -43,6 +44,12 @@
+                           BooleanValue(false),
+                           MakeBooleanAccessor(&Ipv4GlobalRouting::m_randomEcmpRouting),
+                           MakeBooleanChecker())
++            .AddAttribute("FlowEcmpRouting",
++                          "Set to true if flows are randomly routed among ECMP; set to false for "
++                          "using only one route consistently",
++                          BooleanValue(false),
++                          MakeBooleanAccessor(&Ipv4GlobalRouting::m_flowEcmpRouting),
++                          MakeBooleanChecker())
+             .AddAttribute("RespondToInterfaceEvents",
+                           "Set to true if you want to dynamically recompute the global routes upon "
+                           "Interface notification events (up/down, or add/remove address)",
+@@ -171,7 +178,7 @@
+ }
+ 
+ Ptr<Ipv4Route>
+-Ipv4GlobalRouting::LookupGlobal(Ipv4Address dest, Ptr<NetDevice> oif)
++Ipv4GlobalRouting::LookupGlobal(Ipv4Address dest, uint32_t flowHash, Ptr<NetDevice> oif)
+ {
+     NS_LOG_FUNCTION(this << dest << oif);
+     NS_LOG_LOGIC("Looking for route for destination " << dest);
+@@ -242,7 +249,7 @@
+     }
+     if (!allRoutes.empty()) // if route(s) is found
+     {
+-        // TwiNS reference patch: order equal-cost routes by output interface so that
++        // specsim comparison patch: order equal-cost routes by output interface so that
+         // flowHash % n maps to a reproducible port
+         std::stable_sort(allRoutes.begin(), allRoutes.end(), [](Ipv4RoutingTableEntry* a, Ipv4RoutingTableEntry* b) {
+             return a->GetInterface() < b->GetInterface();
+@@ -251,7 +258,11 @@
+         // ECMP routing is enabled, or always select the first route
+         // consistently if random ECMP routing is disabled
+         uint32_t selectIndex;
+-        if (m_randomEcmpRouting)
++        if (m_flowEcmpRouting)
++        {
++            selectIndex = flowHash % allRoutes.size();
++        }
++        else if (m_randomEcmpRouting)
+         {
+             selectIndex = m_rand->GetInteger(0, allRoutes.size() - 1);
+         }
+@@ -513,6 +524,12 @@
+                                Socket::SocketErrno& sockerr)
+ {
+     NS_LOG_FUNCTION(this << p << &header << oif << &sockerr);
++
++    uint32_t flowHash = 0;
++    if (m_flowEcmpRouting)
++    {
++        flowHash = Ipv4QueueDiscItem(p, Address(), header.GetProtocol(), header).Hash(0);
++    }
+     //
+     // First, see if this is a multicast packet we have a route for.  If we
+     // have a route, then send the packet down each of the specified interfaces.
+@@ -526,7 +543,7 @@
+     // See if this is a unicast packet we have a route for.
+     //
+     NS_LOG_LOGIC("Unicast destination- looking up");
+-    Ptr<Ipv4Route> rtentry = LookupGlobal(header.GetDestination(), oif);
++    Ptr<Ipv4Route> rtentry = LookupGlobal(header.GetDestination(), flowHash, oif);
+     if (rtentry)
+     {
+         sockerr = Socket::ERROR_NOTERROR;
+@@ -549,6 +566,13 @@
+ {
+     NS_LOG_FUNCTION(this << p << header << header.GetSource() << header.GetDestination() << idev
+                          << &lcb << &ecb);
++
++    uint32_t flowHash = 0;
++    if (m_flowEcmpRouting)
++    {
++        flowHash = Ipv4QueueDiscItem(p->Copy(), Address(), header.GetProtocol(), header).Hash(0);
++    }
++
+     // Check if input device supports IP
+     NS_ASSERT(m_ipv4->GetInterfaceForDevice(idev) >= 0);
+     uint32_t iif = m_ipv4->GetInterfaceForDevice(idev);
+@@ -581,7 +605,7 @@
+     }
+     // Next, try to find a route
+     NS_LOG_LOGIC("Unicast destination- looking up global route");
+-    Ptr<Ipv4Route> rtentry = LookupGlobal(header.GetDestination());
++    Ptr<Ipv4Route> rtentry = LookupGlobal(header.GetDestination(), flowHash);
+     if (rtentry)
+     {
+         NS_LOG_LOGIC("Found unicast destination- calling unicast callback");
+--- a/src/internet/model/ipv4-global-routing.h	2026-11-14 08:50:17.836027081 +0000
++++ b/src/internet/model/ipv4-global-routing.h	2026-10-26 18:55:33.141888978 +0000
+@@ -230,6 +230,9 @@
+     /// Set to true if packets are randomly routed among ECMP; set to false for using only one route
+     /// consistently
+     bool m_randomEcmpRouting;
++    /// Set to true if flows are randomly routed among ECMP; set to false for using only one route
++    /// consistently
++    bool m_flowEcmpRouting;
+     /// Set to true if this interface should respond to interface events by globally recomputing
+     /// routes
+     bool m_respondToInterfaceEvents;
+@@ -260,16 +263,19 @@
+     /**
+      * @brief Lookup in the forwarding table for destination.
+      * @param dest destination address
++     * @param flowHash flow hash for per-flow ECMP routing
+      * @param oif output interface if any (put 0 otherwise)
+      * @return Ipv4Route to route the packet to reach dest address
+      */
+-    Ptr<Ipv4Route> LookupGlobal(Ipv4Address dest, Ptr<NetDevice> oif = nullptr);
++    Ptr<Ipv4Route> LookupGlobal(Ipv4Address dest,
++                                uint32_t flowHash = 0,
++                                Ptr<NetDevice> oif = nullptr);
+ 
+     HostRoutes m_hostRoutes;             //!< Routes to hosts
+     NetworkRoutes m_networkRoutes;       //!< Routes to networks
+     ASExternalRoutes m_ASexternalRoutes; //!< External routes imported
+ 
+-    // TwiNS reference patch: indexes of the two tables (same entries, same order) so that
++    // specsim comparison patch: indexes of the two tables (same entries, same order) so that
+     // duplicate checks and lookups do not scan every route (quadratic set-up at k >= 16)
+     std::unordered_map<uint32_t, std::vector<Ipv4RoutingTableEntry*>> m_hostIndex; //!< by destination
+     std::map<uint32_t, std::unordered_map<uint32_t, std::vector<Ipv4RoutingTableEntry*>>, std::greater<uint32_t>>

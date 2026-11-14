@@ -1,0 +1,38 @@
+# R-2: vanilla ns-3.46.1 (+ routing index patch) against the Unison-tree sequential references (a87 ~/netsim/cmp/ref)
+k8_paper_TcpDctcp --k=8 --flows=flows/k8_paper.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_paper_TcpNewReno --k=8 --flows=flows/k8_paper.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_paper_TcpCubic --k=8 --flows=flows/k8_paper.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullsync_TcpDctcp --k=8 --flows=flows/k8_fullsync.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullsync_TcpNewReno --k=8 --flows=flows/k8_fullsync.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullsync_TcpCubic --k=8 --flows=flows/k8_fullsync.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullexp_TcpDctcp --k=8 --flows=flows/k8_fullexp.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullexp_TcpNewReno --k=8 --flows=flows/k8_fullexp.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_fullexp_TcpCubic --k=8 --flows=flows/k8_fullexp.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a30_TcpDctcp --k=8 --flows=flows/k8_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a30_TcpNewReno --k=8 --flows=flows/k8_a2a30.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a30_TcpCubic --k=8 --flows=flows/k8_a2a30.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_incast16_TcpDctcp --k=8 --flows=flows/k8_incast16.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_incast16_TcpNewReno --k=8 --flows=flows/k8_incast16.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_incast16_TcpCubic --k=8 --flows=flows/k8_incast16.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a50s_TcpDctcp --k=8 --flows=flows/k8_a2a50s.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a50s_TcpNewReno --k=8 --flows=flows/k8_a2a50s.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_a2a50s_TcpCubic --k=8 --flows=flows/k8_a2a50s.csv --tcp=ns3::TcpCubic --stop=0.3 --hostq=red --flowEcmp=1
+k8_paper_TcpDctcp_spray --k=8 --flows=flows/k8_paper.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+k8_a2a30_TcpDctcp_spray --k=8 --flows=flows/k8_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+k8_incast16_TcpDctcp_spray --k=8 --flows=flows/k8_incast16.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+ft8f_a2a30_TcpDctcp --topo=file --topofile=flows/fattree8.txt --fail=300000:s32:s0,500000:s64:s32,800000:s32:s0:up --flows=flows/ft8f_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+ft8f_a2a30_TcpDctcp_spray --topo=file --topofile=flows/fattree8.txt --fail=300000:s32:s0,500000:s64:s32,800000:s32:s0:up --flows=flows/ft8f_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=0
+ft8f_a2a50s_TcpDctcp --topo=file --topofile=flows/fattree8.txt --fail=300000:s32:s0,500000:s64:s32,800000:s32:s0:up --flows=flows/ft8f_a2a50s.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_r30_TcpDctcp --k=8 --flows=flows/k8_r30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_r30_TcpDctcp_fin --k=8 --flows=flows/k8_r30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1 --fin=1
+k8_r50_TcpDctcp --k=8 --flows=flows/k8_r50.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_r50_TcpDctcp_fin --k=8 --flows=flows/k8_r50.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1 --fin=1
+ls8o_a2a30_TcpDctcp --topo=file --topofile=flows/ls8o.txt --flows=flows/ls8o_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+t3d4_incast16_TcpNewReno --topo=file --topofile=flows/t3d4.txt --flows=flows/t3d4_incast16.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+xp4_a2a30_TcpDctcp --topo=file --topofile=flows/xp4.txt --flows=flows/xp4_a2a30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+ls32_incast16_TcpNewReno --topo=file --topofile=flows/ls32.txt --flows=flows/ls32_incast16.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+jf256_incast16_TcpDctcp --topo=file --topofile=flows/jf256.txt --flows=flows/jf256_incast16.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+tor16_hdp30_TcpNewReno --topo=file --topofile=flows/tor16.txt --flows=flows/tor16_hdp30.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_ws30_TcpDctcp --k=8 --flows=flows/k8_ws30.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1
+k8_ws30_TcpNewReno --k=8 --flows=flows/k8_ws30.csv --tcp=ns3::TcpNewReno --stop=0.3 --hostq=red --flowEcmp=1
+k8_ws50_TcpDctcp --k=8 --flows=flows/k8_ws50.csv --tcp=ns3::TcpDctcp --stop=0.3 --hostq=red --flowEcmp=1

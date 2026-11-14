@@ -1,0 +1,200 @@
+g000 ft8: 128 hosts, a2a uniform 30%, persistent, newreno, queue 100 K 20, spray
+g001 t3d4x2: 128 hosts, a2a mining 60%, dctcp, queue 200 K 60
+g002 hx2_8x4: 64 hosts, a2a fixed 30%, newreno, queue 200 K 10, spray
+g003 df4_2_4: 144 hosts, a2a exp 20%, dctcp, queue 400 K 30, spray, FIN
+g004 xp6_4_2_74: 56 hosts, pairs, dctcp, queue 100 K 5, spray
+g005 t3d4x2: 128 hosts, pairs, dctcp, queue 400 K 120, spray, failures 300000:s41:s57
+g006 jf32_8_4_84: 128 hosts, a2a mining 50%, persistent, cubic, queue 200 K 120, FIN
+g007 df4_2_4: 144 hosts, a2a fixed 60%, newreno, queue 100 K 60
+g008 ls4x4x12: 48 hosts, a2a exp 50%, persistent, newreno, queue 100 K 80, spray, FIN
+g009 df4_2_2: 72 hosts, a2a websearch 50%, persistent, newreno, queue 200 K 80, spray, FIN
+g010 df4_2_4: 144 hosts, a2a exp 60%, dctcp, queue 50 K 40, spray
+g011 t3d4x2: 128 hosts, incast 4-to-1, cubic, queue 400 K 60, spray, failures 100000:s16:s32,200000:s60:s12,300000:s16:s32:up,400000:s60:s12:up
+g012 hx4_4x4: 64 hosts, pairs, dctcp, queue 400 K 120, spray
+g013 jf32_8_2_28: 64 hosts, pairs, newreno, queue 200 K 120
+g014 df6_3_3: 342 hosts, pairs, newreno, queue 50 K 30, spray
+g015 tor6x6x4: 144 hosts, a2a uniform 20%, dctcp, queue 50 K 40, FIN
+g016 hx2_8x4: 64 hosts, a2a uniform 30%, newreno, queue 50 K 5
+g017 hx4_4x4: 64 hosts, a2a fixed 60%, cubic, queue 400 K 60
+g018 t3d4x2: 128 hosts, a2a websearch 20%, newreno, queue 400 K 10, FIN
+g019 ft4: 16 hosts, a2a exp 40%, newreno, queue 400 K 10
+g020 df4_2_4: 144 hosts, a2a mining 40%, newreno, queue 50 K 40, FIN
+g021 ft4: 16 hosts, pairs, newreno, queue 50 K 30, FIN
+g022 df6_3_3: 342 hosts, a2a websearch 40%, newreno, queue 100 K 30
+g023 hx4_4x4: 64 hosts, pairs, newreno, queue 400 K 30
+g024 df4_2_4: 144 hosts, incast 16-to-1, dctcp, queue 100 K 60
+g025 jf24_8_2_51: 48 hosts, pairs, newreno, queue 50 K 40
+g026 jf16_8_2_49: 32 hosts, a2a hadoop 60%, newreno, queue 100 K 80, failures 200000:s0:s7,400000:s2:s14,600000:s0:s7:up
+g027 df4_2_4: 144 hosts, pairs, cubic, queue 100 K 60
+g028 t3d4x2: 128 hosts, pairs, cubic, queue 400 K 20, FIN
+g029 ls4x8x12: 48 hosts, a2a exp 30%, persistent, dctcp, queue 100 K 20, FIN
+g030 ft4: 16 hosts, pairs, newreno, queue 100 K 20
+g031 hx2_8x4: 64 hosts, a2a hadoop 50%, persistent, dctcp, queue 400 K 40
+g032 df6_3_3: 342 hosts, a2a mining 40%, dctcp, queue 400 K 20
+g033 hx2_8x4: 64 hosts, a2a websearch 20%, persistent, dctcp, queue 100 K 10
+g034 ls16x8x4: 64 hosts, pairs, newreno, queue 50 K 40, spray
+g035 hx2_8x4: 64 hosts, a2a fixed 40%, newreno, queue 50 K 20, spray
+g036 ft4: 16 hosts, incast 8-to-1, dctcp, queue 100 K 20, failures 200000:s12:s5,400000:s12:s5:up
+g037 ft8: 128 hosts, a2a uniform 50%, cubic, queue 200 K 80
+g038 df6_3_3: 342 hosts, a2a exp 50%, cubic, queue 50 K 5
+g039 ft4: 16 hosts, pairs, cubic, queue 200 K 80
+g040 jf48_4_4_34: 192 hosts, incast 32-to-1, cubic, queue 100 K 40
+g041 ls8x4x12: 96 hosts, pairs, dctcp, queue 100 K 60, FIN
+g042 df4_2_2: 72 hosts, a2a mining 60%, newreno, queue 100 K 5
+g043 ft8: 128 hosts, pairs, cubic, queue 50 K 10, spray, FIN
+g044 df4_2_4: 144 hosts, a2a hadoop 60%, cubic, queue 400 K 60
+g045 ls16x2x16: 256 hosts, a2a websearch 20%, cubic, queue 400 K 40, FIN
+g046 tor6x8x4: 192 hosts, pairs, newreno, queue 100 K 40
+g047 jf24_4_4_45: 96 hosts, a2a hadoop 40%, persistent, dctcp, queue 200 K 5, failures 200000:s7:s20
+g048 ft4: 16 hosts, pairs, newreno, queue 200 K 5
+g049 t3d4x2: 128 hosts, a2a uniform 50%, newreno, queue 100 K 60
+g050 ls16x4x16: 256 hosts, incast 4-to-1, newreno, queue 400 K 10, spray
+g051 t3d4x2: 128 hosts, pairs, newreno, queue 50 K 10
+g052 ft4: 16 hosts, a2a fixed 50%, persistent, cubic, queue 100 K 5, failures 100000:s19:s11,300000:s19:s9,700000:s19:s9:up
+g053 t3d4x2: 128 hosts, a2a hadoop 50%, dctcp, queue 50 K 40, spray
+g054 df4_2_2: 72 hosts, pairs, cubic, queue 50 K 10
+g055 ft8: 128 hosts, incast 8-to-1, cubic, queue 200 K 60, spray
+g056 df4_2_2: 72 hosts, incast 32-to-1, dctcp, queue 200 K 10, spray
+g057 t3d4x2: 128 hosts, a2a mining 30%, cubic, queue 50 K 10, failures 200000:s62:s50,400000:s62:s50:up
+g058 df4_2_4: 144 hosts, a2a mining 60%, newreno, queue 200 K 120, FIN
+g059 ls8x2x4: 32 hosts, incast 8-to-1, newreno, queue 200 K 60, spray
+g060 tor8x8x4: 256 hosts, incast 16-to-1, dctcp, queue 200 K 10, spray
+g061 t3d4x2: 128 hosts, a2a mining 30%, newreno, queue 100 K 30
+g062 jf24_8_3_89: 72 hosts, pairs, cubic, queue 400 K 20, FIN, failures 100000:s1:s12,200000:s2:s15,500000:s1:s12:up
+g063 xp5_4_3_70: 72 hosts, a2a fixed 40%, dctcp, queue 200 K 80, spray
+g064 hx4_4x4: 64 hosts, incast 16-to-1, dctcp, queue 200 K 30
+g065 ft8: 128 hosts, a2a hadoop 30%, persistent, cubic, queue 100 K 10, failures 200000:s35:s2,600000:s35:s2:up
+g066 tor4x6x4: 96 hosts, pairs, dctcp, queue 50 K 5, failures 200000:s3:s4
+g067 ls8x4x12: 96 hosts, a2a websearch 60%, cubic, queue 400 K 80
+g068 ft8: 128 hosts, pairs, cubic, queue 50 K 40
+g069 xp6_6_2_0: 84 hosts, a2a websearch 20%, persistent, dctcp, queue 400 K 40
+g070 t3d4x2: 128 hosts, a2a uniform 30%, cubic, queue 400 K 10
+g071 df4_2_2: 72 hosts, incast 8-to-1, dctcp, queue 50 K 10, spray
+g072 jf32_4_2_66: 64 hosts, incast 32-to-1, dctcp, queue 50 K 10, spray
+g073 ft8: 128 hosts, pairs, cubic, queue 200 K 5, failures 100000:s72:s50,200000:s57:s27,400000:s57:s27:up
+g074 hx4_4x4: 64 hosts, a2a exp 50%, newreno, queue 400 K 30, spray
+g075 hx2_8x4: 64 hosts, incast 32-to-1, newreno, queue 200 K 40, spray, FIN
+g076 ft8: 128 hosts, a2a fixed 20%, cubic, queue 400 K 20
+g077 ft4: 16 hosts, pairs, cubic, queue 50 K 40, FIN
+g078 ft8: 128 hosts, pairs, newreno, queue 400 K 10
+g079 ft4: 16 hosts, a2a fixed 30%, newreno, queue 100 K 80, spray, FIN, failures 100000:s17:s12
+g080 tor8x4x2: 64 hosts, pairs, dctcp, queue 50 K 20
+g081 tor8x8x4: 256 hosts, pairs, newreno, queue 400 K 40, FIN
+g082 ft4: 16 hosts, pairs, newreno, queue 100 K 5, spray, FIN
+g083 ft4: 16 hosts, a2a exp 40%, persistent, newreno, queue 50 K 40, spray, FIN
+g084 ls4x4x16: 64 hosts, pairs, cubic, queue 100 K 20, spray, FIN
+g085 jf48_6_3_35: 144 hosts, a2a exp 50%, dctcp, queue 200 K 60
+g086 tor8x4x4: 128 hosts, pairs, dctcp, queue 200 K 40, FIN
+g087 xp5_8_3_78: 144 hosts, pairs, cubic, queue 100 K 20
+g088 ls8x4x4: 32 hosts, a2a websearch 20%, cubic, queue 400 K 20
+g089 df4_2_2: 72 hosts, pairs, cubic, queue 200 K 10
+g090 tor8x6x2: 96 hosts, a2a hadoop 60%, dctcp, queue 200 K 120, failures 300000:s26:s27,500000:s37:s38
+g091 ft4: 16 hosts, a2a uniform 40%, persistent, dctcp, queue 100 K 60
+g092 ft4: 16 hosts, incast 15-to-1, cubic, queue 200 K 5, failures 100000:s10:s2
+g093 ft8: 128 hosts, a2a uniform 30%, dctcp, queue 400 K 80, failures 300000:s45:s15
+g094 ft4: 16 hosts, a2a fixed 50%, persistent, dctcp, queue 200 K 30
+g095 hx4_4x4x2: 128 hosts, a2a mining 40%, persistent, dctcp, queue 400 K 60, spray, FIN
+g096 ft4: 16 hosts, a2a websearch 40%, persistent, dctcp, queue 100 K 80
+g097 xp4_6_2_10: 60 hosts, a2a exp 50%, cubic, queue 200 K 20
+g098 ft8: 128 hosts, a2a uniform 40%, cubic, queue 400 K 80, spray
+g099 ls4x8x12: 48 hosts, incast 16-to-1, newreno, queue 200 K 10
+g100 hx4_4x4x2: 128 hosts, pairs, newreno, queue 200 K 60, FIN
+g101 ls8x2x12: 96 hosts, a2a websearch 40%, dctcp, queue 100 K 10, spray
+g102 df4_2_4: 144 hosts, a2a websearch 30%, dctcp, queue 100 K 40
+g103 xp4_6_2_75: 60 hosts, a2a websearch 40%, newreno, queue 50 K 5, spray, FIN
+g104 xp6_6_3_41: 126 hosts, a2a websearch 20%, cubic, queue 100 K 40
+g105 xp5_8_3_71: 144 hosts, incast 32-to-1, newreno, queue 100 K 60
+g106 t3d4x2: 128 hosts, a2a hadoop 30%, newreno, queue 50 K 5, FIN
+g107 xp6_8_3_1: 168 hosts, pairs, dctcp, queue 100 K 80, spray
+g108 ls4x2x8: 32 hosts, a2a exp 20%, cubic, queue 50 K 10
+g109 ls16x2x4: 64 hosts, a2a websearch 40%, persistent, dctcp, queue 100 K 40, spray, FIN
+g110 t3d4x2: 128 hosts, a2a uniform 50%, cubic, queue 100 K 30, failures 100000:s9:s25,200000:s19:s16
+g111 ft8: 128 hosts, a2a hadoop 30%, newreno, queue 200 K 5
+g112 ls4x8x16: 64 hosts, a2a uniform 60%, dctcp, queue 100 K 5
+g113 jf32_4_4_58: 128 hosts, a2a uniform 30%, newreno, queue 50 K 30, spray, FIN
+g114 hx4_4x4x2: 128 hosts, a2a websearch 60%, persistent, newreno, queue 200 K 60
+g115 xp6_4_3_26: 84 hosts, a2a hadoop 30%, cubic, queue 400 K 30, spray
+g116 t3d4x2: 128 hosts, pairs, cubic, queue 200 K 80, spray, FIN
+g117 ls4x8x4: 16 hosts, incast 8-to-1, dctcp, queue 200 K 5
+g118 ft8: 128 hosts, a2a exp 60%, dctcp, queue 50 K 20
+g119 xp6_8_3_57: 168 hosts, pairs, cubic, queue 50 K 10, spray
+g120 tor8x6x4: 192 hosts, a2a fixed 20%, persistent, dctcp, queue 50 K 30, spray
+g121 t3d4x2: 128 hosts, pairs, newreno, queue 400 K 10, failures 300000:s17:s21,400000:s16:s20,600000:s16:s20:up,700000:s17:s21:up
+g122 df4_2_2: 72 hosts, a2a websearch 60%, persistent, dctcp, queue 200 K 120
+g123 tor8x6x4: 192 hosts, a2a hadoop 30%, persistent, cubic, queue 50 K 40
+g124 t3d4x2: 128 hosts, pairs, cubic, queue 100 K 30, spray, FIN
+g125 xp5_4_2_42: 48 hosts, a2a exp 60%, persistent, newreno, queue 400 K 20
+g126 hx4_4x4: 64 hosts, pairs, cubic, queue 50 K 30
+g127 ls8x4x4: 32 hosts, incast 16-to-1, dctcp, queue 100 K 10
+g128 ls16x8x16: 256 hosts, a2a mining 50%, persistent, newreno, queue 50 K 10
+g129 t3d4x2: 128 hosts, a2a fixed 60%, dctcp, queue 200 K 20, spray
+g130 t3d4x2: 128 hosts, a2a websearch 40%, cubic, queue 50 K 40, spray
+g131 ft4: 16 hosts, incast 8-to-1, newreno, queue 100 K 5
+g132 xp6_4_2_88: 56 hosts, pairs, dctcp, queue 400 K 80
+g133 hx2_8x4: 64 hosts, pairs, newreno, queue 100 K 40, spray, FIN
+g134 df4_2_4: 144 hosts, a2a hadoop 60%, newreno, queue 50 K 30, spray
+g135 jf16_4_4_58: 64 hosts, a2a fixed 50%, cubic, queue 200 K 120, spray, FIN
+g136 ls16x8x4: 64 hosts, incast 4-to-1, cubic, queue 100 K 20, FIN
+g137 xp5_6_2_91: 72 hosts, a2a websearch 30%, dctcp, queue 100 K 10, FIN
+g138 ls16x4x4: 64 hosts, a2a websearch 40%, dctcp, queue 50 K 10, spray
+g139 ft8: 128 hosts, a2a mining 40%, persistent, cubic, queue 200 K 80
+g140 xp5_8_2_44: 96 hosts, incast 8-to-1, dctcp, queue 50 K 40, FIN
+g141 ft8: 128 hosts, pairs, dctcp, queue 400 K 20, spray
+g142 tor4x6x4: 96 hosts, pairs, newreno, queue 50 K 20, FIN, failures 200000:s22:s23,400000:s22:s23:up
+g143 t3d4x2: 128 hosts, a2a websearch 60%, cubic, queue 200 K 80
+g144 t3d4x2: 128 hosts, a2a websearch 40%, dctcp, queue 400 K 5, failures 200000:s35:s32,600000:s35:s32:up
+g145 ls4x8x16: 64 hosts, a2a exp 20%, newreno, queue 100 K 40
+g146 tor4x6x4: 96 hosts, incast 4-to-1, dctcp, queue 400 K 10, FIN
+g147 xp5_8_2_70: 96 hosts, pairs, dctcp, queue 100 K 30
+g148 xp6_6_3_44: 126 hosts, pairs, dctcp, queue 200 K 30
+g149 tor4x6x2: 48 hosts, a2a uniform 50%, persistent, dctcp, queue 100 K 30, spray, FIN
+g150 hx2_8x4: 64 hosts, a2a hadoop 60%, newreno, queue 50 K 5, FIN
+g151 xp5_4_2_61: 48 hosts, a2a uniform 20%, dctcp, queue 400 K 120
+g152 ls4x2x4: 16 hosts, a2a websearch 50%, newreno, queue 50 K 5, spray
+g153 hx4_4x4x2: 128 hosts, a2a websearch 40%, newreno, queue 100 K 5
+g154 xp5_4_3_5: 72 hosts, a2a websearch 20%, cubic, queue 400 K 5
+g155 ls8x4x4: 32 hosts, pairs, cubic, queue 50 K 5
+g156 tor6x8x2: 96 hosts, a2a mining 40%, newreno, queue 50 K 10, spray, failures 300000:s40:s41,500000:s40:s41:up,500000:s21:s29,700000:s21:s29:up
+g157 df4_2_2: 72 hosts, a2a websearch 60%, persistent, newreno, queue 200 K 40, FIN
+g158 hx4_4x4: 64 hosts, a2a exp 60%, persistent, newreno, queue 100 K 40, FIN
+g159 ft8: 128 hosts, a2a hadoop 60%, dctcp, queue 400 K 60
+g160 hx4_4x4x2: 128 hosts, pairs, dctcp, queue 200 K 60, spray
+g161 xp5_8_3_46: 144 hosts, a2a websearch 30%, dctcp, queue 50 K 20
+g162 ft4: 16 hosts, incast 15-to-1, newreno, queue 400 K 40, FIN
+g163 ft8: 128 hosts, a2a hadoop 60%, newreno, queue 50 K 5, spray
+g164 tor4x6x2: 48 hosts, pairs, cubic, queue 200 K 20
+g165 ft4: 16 hosts, a2a websearch 60%, dctcp, queue 100 K 20, failures 100000:s8:s0,300000:s10:s2
+g166 df4_2_2: 72 hosts, pairs, newreno, queue 200 K 30, spray
+g167 xp5_6_3_11: 108 hosts, incast 4-to-1, dctcp, queue 400 K 60
+g168 df4_2_4: 144 hosts, pairs, newreno, queue 200 K 20, FIN
+g169 jf48_8_3_82: 144 hosts, a2a uniform 40%, newreno, queue 400 K 80, spray
+g170 hx4_4x4x2: 128 hosts, a2a exp 40%, dctcp, queue 200 K 5, spray
+g171 hx4_4x4: 64 hosts, a2a exp 60%, dctcp, queue 200 K 80, spray
+g172 ls8x2x12: 96 hosts, a2a websearch 20%, dctcp, queue 50 K 30, FIN
+g173 hx4_4x4x2: 128 hosts, incast 16-to-1, cubic, queue 400 K 5, FIN
+g174 df4_2_4: 144 hosts, pairs, dctcp, queue 100 K 10, spray
+g175 ft8: 128 hosts, pairs, dctcp, queue 400 K 20, failures 300000:s35:s2,400000:s38:s6,500000:s35:s2:up,600000:s38:s6:up
+g176 t3d4x2: 128 hosts, a2a fixed 60%, cubic, queue 400 K 120
+g177 ls4x2x8: 32 hosts, a2a fixed 40%, newreno, queue 100 K 10, FIN
+g178 xp4_8_3_45: 120 hosts, incast 16-to-1, cubic, queue 50 K 40
+g179 hx4_4x4: 64 hosts, pairs, cubic, queue 100 K 20, spray, FIN
+g180 ft8: 128 hosts, a2a hadoop 60%, persistent, dctcp, queue 100 K 5, FIN
+g181 ft8: 128 hosts, a2a websearch 40%, newreno, queue 50 K 40, spray, FIN
+g182 t3d4x2: 128 hosts, pairs, cubic, queue 400 K 5, spray
+g183 jf16_4_3_99: 48 hosts, a2a uniform 20%, newreno, queue 400 K 40, FIN
+g184 jf24_4_4_25: 96 hosts, pairs, cubic, queue 400 K 5, FIN
+g185 tor4x8x4: 128 hosts, a2a hadoop 30%, persistent, cubic, queue 200 K 40
+g186 ft8: 128 hosts, a2a mining 60%, cubic, queue 400 K 40
+g187 hx4_4x4: 64 hosts, a2a uniform 40%, dctcp, queue 50 K 40
+g188 hx4_4x4x2: 128 hosts, a2a fixed 50%, dctcp, queue 200 K 40, spray, FIN
+g189 df4_2_2: 72 hosts, a2a uniform 20%, dctcp, queue 100 K 80
+g190 t3d4x2: 128 hosts, incast 16-to-1, newreno, queue 400 K 10, failures 200000:s6:s7,600000:s6:s7:up
+g191 hx2_8x4: 64 hosts, pairs, cubic, queue 400 K 30
+g192 hx4_4x4x2: 128 hosts, pairs, cubic, queue 50 K 5, spray
+g193 jf32_4_2_19: 64 hosts, incast 16-to-1, dctcp, queue 100 K 30
+g194 jf24_6_3_12: 72 hosts, incast 32-to-1, dctcp, queue 100 K 40
+g195 xp5_6_2_92: 72 hosts, pairs, cubic, queue 50 K 20
+g196 hx4_4x4x2: 128 hosts, a2a fixed 20%, persistent, dctcp, queue 200 K 20
+g197 ls16x8x8: 128 hosts, pairs, dctcp, queue 100 K 20
+g198 ls4x4x4: 16 hosts, a2a uniform 20%, persistent, cubic, queue 100 K 60, FIN
+g199 ls16x8x16: 256 hosts, a2a websearch 50%, dctcp, queue 200 K 40

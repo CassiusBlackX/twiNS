@@ -19,7 +19,7 @@ are now either exact or flagged.
 | f | RDMA/AI `ccmp`, `qcmp` | equal lead hashes with distinct roots decided by root rank | silent on collision | removed (strict build) |
 | g | RDMA/AI `ccmp_walk` | walk memo keyed by a 62-bit hash of (tail node, count left) pairs | silent on collision | exact keys, written once (below) |
 | h | RDMA/AI `ccode` | ordinals ≥ 31 saturate; two saturated equal codes were walked past, and an ordinal verdict from a newer level returned | silent | `ORD_UNKNOWN`: a deeper ordinal difference still decides, otherwise flag |
-| i | RDMA/AI `ccode` | leads above 2^27 − 2 ps (134 us) saturated: compute delays of the system layer, timers | silent | order-preserving 27-bit code; exact below 67 us and for any lead with at most 21 significant bits (1 ms, 55 us); equal lossy codes: flag |
+| i | RDMA/AI `ccode` | leads above 2^27 − 2 ns (134 ms; the comment said ps) saturated: compute delays of the system layer, timers | silent | order-preserving 27-bit code; exact below 67 ms (2^26 ns) and for any lead with at most 21 significant bits; equal lossy codes: flag |
 | i' | AI host loop (`closed.h`) | a timer against a completion compared the timer's lead with a lead decoded from the code | — | compares codes (monotone); equal codes go to the chains |
 | i'' | RDMA root ranks (`rmain.cu`) | start chains sorted by lead codes | — | equal lossy leads counted as undecided |
 
@@ -151,3 +151,78 @@ host set-up, which assumes chains with roots; not pursued.)
   512 MB at 512 GPUs 12.6 vs 10.1 s); the seqlock is about 1.06–1.15× of that.
 - LLaMA 65B probe (training) is still over 400 s strict (52 s hash): open.
 - RTX 5090 (CUDA, the build before these two changes): TCP 306/306, RDMA 120/120, sweep 32/32.
+
+## Second round (night of 2026-11-14)
+
+### Lead fingerprints for AI training (TODOS R-1.8, option A)
+Strict mode was exact but slow on training (LLaMA 65B probe at 128 GPUs: more than 400 s against 52 s
+for the old hash build), because lineages of distinct flows agree in every lead for thousands of
+runs and the walk follows them to their roots. A chain now carries two polynomial fingerprints of
+its lead codes after the root's set-up, `F_x = sum lambda_i x^(n-i) mod 2^61 - 1` (codes >= 1), for
+two bases drawn independently and uniformly from [2, p - 1] at start-up (rejection sampling from the
+OS; `--fp-bases=X1,X2` repeats a run; islands and reruns get the same bases). They decide one case
+only: chains of distinct roots with equal fingerprints and no lossy code are ordered by their roots,
+which is what the walk would find. Two different sequences of at most n codes are different
+polynomials of degree < n, so one check of them passes with probability at most ((n-1)/(p-2))^2
+(Schwartz-Zippel, two independent bases); a run prints the number of checks C, the longest lineage
+n and the union bound C ((n-1)/(p-2))^2. Chains lost their `anc[]` hashes (strict build): 24 bytes
+smaller. `TWINS_NO_FP` removes the fingerprints; `TWINS_HASH_MEMO` still builds the old version.
+TCP has no fingerprints.
+- LLaMA 65B probe, 128 GPUs: 55.0 s, 439,168 messages identical, 0 undecided, 111 M decisions,
+  lineages up to 1.38 M events, bound 4e-17 (counted over decisions in that build; checks now).
+- RX gate (`out/audit/gate_fp.txt`): AI collectives 18/18; RDMA jobs1 10/10, jobs2 29/29, jobs3 8/8,
+  jobs_dctcp 41/41, jobs_topo 32/32, sweep 32/32 worlds; SimAI network 60/60; replay 16/16; what-if
+  matrix 47/47; paper runs (closed loop) and both with 4 islands: see the file.
+
+### HPCC-fork uid oracle (R-1.5): `validation/audit/hpcc_evlog_patch.py`, `oracle LOG rdma`
+The HPCC fork (ns-3.18) patched to log every Schedule and executed event (outputs unchanged: every
+run's FCTs equal the stored reference). The log streams through a FIFO into the oracle, which checks
+Theorem 1 on full lineages and TwiNS-RDMA's comparator (27-bit lead codes, 5-bit saturating
+ordinals, the deepest ordinal difference where lineages meet, roots in set-up order) on every pair of
+simultaneous events (all pairs of groups up to 256, else neighbours and random pairs). 70 runs of
+jobs1-3, jobs_dctcp and small topologies (the 1,024-host ones left out for the oracle's memory):
+365 M events, 2.00 billion pairs (47.7 M at one node); Theorem 1 disagrees 0; the comparator is right
+on every pair, 0 undecided, 0 wrong. (`validation/audit/oracle_rdma.sh`, a87 `~/netsim/rdma/oracle`.)
+
+### Vanilla ns-3.46.1 (R-2)
+Our TCP reference is ns-3.46.1 from Unison's tree run sequentially. Vanilla ns-3.46.1 has no per-flow
+ECMP: `Ipv4GlobalRouting::FlowEcmpRouting` (5-tuple hash modulo the equal-cost routes) is Unison's
+addition; the rest of Unison's changes are for thread safety. Results (a87):
+- vanilla + `validation/ns3/flow-ecmp.patch` (Unison's change only) + our routing index patch:
+  37/37 reference runs identical (k=8 six workloads x 3 TCPs, spraying, failures, persistent/FIN,
+  six topology files, CDF workloads);
+- vanilla with no patch at all: 21/21 spraying runs identical (so our patch's ordering of equal-cost
+  routes by interface does not change them).
+`twins-ref.cc` now asks for FlowEcmpRouting with SetDefaultFailSafe and stops only if --flowEcmp=1
+cannot be had.
+
+### Randomized grid (P0-7): `validation/grid/gen_grid.py 200 2027`, `check_grid.sh`
+200 scenarios drawn at random: FatTree k=4/8, leaf-spine, Jellyfish, 2-D/3-D tori, Dragonfly, HyperX,
+Xpander (16-320 hosts); all-to-all (web search, Hadoop, data mining, exp, uniform, fixed sizes; 20-60%
+load), incasts, pairs; persistent connections; DCTCP/NewReno/Cubic; queue 50-400 and K; spraying,
+FIN, link failures. 96,697 flows, ns-3 references on a87 (469 s on 20 cores).
+- First pass: 199 of 200 identical; **g188 differed in 467 of 558 flows with no flag** (3-D HyperX,
+  DCTCP, spraying, FIN). Cause, found with queue-trace diffs and ns-3's own DCTCP log: in ns-3 a
+  connection's socket is forked from the host's listening socket and copies its `m_ecnCESeq`; the
+  listener's CE check runs on every segment that reaches it, including segments of connections whose
+  endpoint is already gone (spraying makes retransmissions arrive after the close), so the listener's
+  value grows and every later connection ignores CE marks below it. TwiNS started each connection at
+  -1. Fixed (`HostSoA::lst_ce`, `listener_ecn`): a handler-fidelity defect, which no flag can catch.
+- After the fix: 200 of 200 runs identical, 96,697 of 96,697 flows; 18 reran with twins128; 2 keep a
+  flag (undecided ties) and are identical anyway. check_all 306/306 still identical.
+- (ns-3's debug build asserts `m_congState != CA_DISORDER` in SendPendingData on g188 at 510.6 us; the
+  release reference runs without asserts.)
+
+### Unison on one thread
+The same binary with `--threads=1` against sequential ns-3 on the 9950X: 85-100% of flows differ on
+all 16 runs (k=8/16, four workloads, DCTCP/NewReno); mean FCT -6.6 .. +13.5%.
+
+### Lookahead sensitivity (P0-6): `validation/hpcc/jobs_delay.txt`
+Uniform link delay 0.1-10 us on k=8 (a2a30 DCQCN and HPCC, incast DCQCN), references from the HPCC
+fork (about 18 s each). Identical up to 1 us for all; DCQCN above 1 us is refused (its timer
+intervals must be at least the slot), HPCC at 5 and 10 us first overflowed a link's frames per slot
+(256, flagged); `--fcap` and an automatic rerun with 4x on a frame overflow fix it (identical).
+
+### CUDA
+`TailNode::pos` is uint64_t (unsigned long): CUDA's atomics need unsigned long long*; the seqlock
+code now casts (HIP accepted it, so the seqlock had not been compiled for CUDA before).

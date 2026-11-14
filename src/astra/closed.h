@@ -262,6 +262,9 @@ struct NvlIslands
                                    "--isl-ringlog=" + std::to_string(RING_LOG), "--isl-side=" + std::to_string(k + 1),
                                    "NVL_BASE_RTT=" + std::to_string(s.P.base_rtt),
                                    "NVL_WIN=" + std::to_string(s.P.win)};
+#ifndef TWINS_HASH_MEMO
+            args.push_back("--fp-bases=" + std::to_string(h_fp[0]) + "," + std::to_string(h_fp[1])); // (the same bases)
+#endif
             for (int i = 2; i < g_argc; i++)
                 if (g_argv[i][0] != '-' && strchr(g_argv[i], '='))
                     args.push_back(g_argv[i]);
@@ -674,9 +677,7 @@ struct Closed : astra::Network
             Chain c = {};
             c.root = i + 1;
             push(&c, mains[i].timer ? fe->timers[mains[i].id].delay : 0, 0);
-            c.hash = 0;
-            for (int k = 0; k < NANC; k++)
-                c.anc[k] = 0;
+            chash_reset(c);
             w.troot.push_back(c);
             if (mains[i].timer)
                 main_timers.push_back({tslot[mains[i].id], c});

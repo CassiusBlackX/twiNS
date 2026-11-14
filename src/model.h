@@ -38,6 +38,20 @@ constexpr int64_t CONN_TIMEOUT_PS = 10000000000; // 10 ms (SYN retransmission)
 constexpr int64_t CLOCK_GRAN_PS = 1000000;       // 1 us
 constexpr int64_t INIT_RTT_PS = 100000000;       // RttEstimator::InitialEstimation, 100 us
 constexpr uint32_t DELACK_COUNT = 2;
+// Mutation testing (TODOS P0-3, validation/audit/mutate.sh): a -DTWINS_MUTATION build reads
+// TWINS_MUT=n and changes one behavior, a plausible misreading of ns-3 (the list is in mutate.sh);
+// MUT(n) is false in every other build
+#ifdef TWINS_MUTATION
+__constant__ int c_mut;
+extern int h_mut;
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
+#define MUT(n) (c_mut == (n))
+#else
+#define MUT(n) (h_mut == (n))
+#endif
+#else
+#define MUT(n) false
+#endif
 constexpr uint32_t INIT_CWND = 10 * MSS;
 constexpr int DUPTHRESH = 3;
 #ifndef TWINS_CHAIN_RUNS
@@ -298,6 +312,10 @@ struct HostSoA
     int *pend_next, *pend_end; // messages by (src, start): next not yet started, end of the host's range
     int *pend_msg;             // [messages] message ids sorted by (src, start, id)
     int64_t *wake;             // earliest slot the host must run (no input)
+    // the host's listening socket (the PacketSink's): its m_ecnCESeq, raised by CE-marked segments of
+    // connections whose endpoint is gone (they reach the listener); a SYN's fork copies it (sa units,
+    // -1: none)
+    int64_t *lst_ce;
 };
 
 struct PortSoA
