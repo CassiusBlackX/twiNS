@@ -55,6 +55,7 @@
 #include <unistd.h>
 #include <vector>
 #include <random>
+#include <type_traits>
 #include "rstep.cuh"
 #if defined(TWINS_ASTRA) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__CUDA_ARCH__) && !defined(TWINS_ISLAND)
 #define TWINS_ASTRA_HOST
@@ -81,6 +82,9 @@ using std::vector;
 #ifdef RDMA_CRIT
 static unsigned long long *g_crit_host;
 #endif
+#ifdef TWINS_EVIDENCE
+static TailPool evidence_tail;
+#endif
 static unsigned long long g_rank_lossy = 0; // root-order comparisons that met equal lossy leads
 template <typename T>
 static T *dev_alloc(size_t n)
@@ -88,6 +92,12 @@ static T *dev_alloc(size_t n)
     T *p = nullptr;
     CK(cudaMalloc((void **)&p, std::max<size_t>(n, 1) * sizeof(T)));
     CK(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(T)));
+#ifdef TWINS_EVIDENCE
+    twins_evidence::allocated += std::max<size_t>(n,1)*sizeof(T);
+    if constexpr (std::is_same<T,Chain>::value) twins_evidence::inline_allocated += std::max<size_t>(n,1)*sizeof(T);
+    if constexpr (std::is_same<T,QPChains>::value) twins_evidence::inline_allocated += std::max<size_t>(n,1)*sizeof(T);
+    if constexpr (std::is_same<T,LFrame>::value) twins_evidence::inline_allocated += std::max<size_t>(n,1)*sizeof(Chain);
+#endif
     return p;
 }
 template <typename T>
@@ -515,6 +525,13 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     }
     P.bps = link_rate.empty() ? bps : link_rate[0];
     P.seq_extra = P.simai ? 4 : 0;
+    // Pkt::size is 16 bits, including the protocol headers. Refuse an unsupported
+    // configured wire size instead of silently truncating it at h_send_new.
+    if (P.mtu == 0 || (uint64_t)P.mtu + data_hdr(P) > 65535)
+    {
+        fprintf(stderr, "%s: PACKET_PAYLOAD_SIZE %u: payload plus headers must fit a nonzero 16-bit wire size\n", w.name.c_str(), P.mtu);
+        return false;
+    }
     P.ecn_pcnt = P.simai ? 1025 : 257;
     if (P.simai && !cfg.u32("GLOBAL_T_HONOR", 0))
         global_t = 1;
@@ -700,7 +717,14 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 PortCfg pc = {};
                 uint64_t r = w.lbps[l];
                 pc.bps = r;
-                pc.hdrm_cap = (uint32_t)(r * (uint64_t)w.ldelay[l] / 8 / 1000000000ull * 3);
+                const unsigned __int128 product = (unsigned __int128)r * (uint64_t)w.ldelay[l];
+                const unsigned __int128 headroom = product / 8 / 1000000000ull * 3;
+                if (product > (unsigned __int128)~0ull || headroom > 0xFFFFFFFFull)
+                {
+                    fprintf(stderr, "%s: link headroom exceeds the supported integer range\n", w.name.c_str());
+                    return false;
+                }
+                pc.hdrm_cap = (uint32_t)headroom;
                 pc.shift = 3;
                 while (r > nic_rate && pc.shift > 0)
                 {
@@ -2031,6 +2055,9 @@ int main(int argc, char **argv)
         tp.n = dev_alloc<TailNode>(cap);
         tp.cnt = dev_alloc<unsigned long long>(1);
         tp.mask = cap - 1;
+#ifdef TWINS_EVIDENCE
+        evidence_tail=tp;
+#endif
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
 #ifdef RDMA_CRIT
         {
@@ -2368,15 +2395,30 @@ int main(int argc, char **argv)
     printf("prof: slowest host thread %.3f Gcycles, slowest switch thread %.3f Gcycles (summed over slots); switch events %llu, "
            "the busiest switch's per slot summed %llu\n",
            ev[18] * 1e-9, ev[19] * 1e-9, ev[20], ev[21]);
+#ifndef TWINS_CPU
     {
         int khz = 0;
         CK(hipDeviceGetAttribute(&khz, hipDeviceAttributeClockRate, 0));
         printf("prof: the slowest wave of each slot sums to %.3f Gcycles = %.3f s at %d MHz (wall %.3f s, %lld launches)\n", ev[23] * 1e-9,
                ev[23] / (khz * 1e3), khz / 1000, wall, launches);
     }
+#endif
     printf("prof: switch cycles per event: select %.0f, arrival chain %.0f, tc events %.0f, arrival handling %.0f\n", (double)ev[24] / ev[20],
            (double)ev[25] / ev[20], (double)ev[26] / ev[20], (double)ev[27] / ev[20]);
     printf("prof: switch ties %llu, undecided by the prefixes %llu; switch slots: safe %llu, not pooled %llu\n", ev[28], ev[29], ev[31], ev[30]);
+#endif
+#ifdef TWINS_EVIDENCE
+    { unsigned long long tails=0;
+      CK(cudaMemcpy(&tails,evidence_tail.cnt,sizeof(tails),cudaMemcpyDeviceToHost));
+      twins_evidence::report(tails,evidence_tail.mask+1,(evidence_tail.mask+1)*sizeof(TailNode),(1ull<<22)*sizeof(WalkEnt));
+    }
+#endif
+#ifdef TWINS_CORPUS
+    { vector<twins_corpus::Sample> corpus(twins_corpus::CAP);
+      CK(hipMemcpyFromSymbol(corpus.data(),HIP_SYMBOL(corpus_samples),corpus.size()*sizeof(corpus[0])));
+      FILE *file=fopen((out_file+".corpus").c_str(),"wb");
+      if(file){fwrite(corpus.data(),sizeof(corpus[0]),corpus.size(),file);fclose(file);}
+    }
 #endif
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
     if (ev[36])
@@ -2398,11 +2440,10 @@ int main(int argc, char **argv)
 #ifndef TWINS_HASH_MEMO
     if (ev[38])
     {
-        // a check of two different lead sequences of at most n entries passes with probability at most
-        // (n/(p-2))^2 (Schwartz-Zippel, two independent bases); a union bound over the checks
-        const double n = (double)ev[39], q = n / (double)(FP_P - 2);
-        printf("lead fingerprints: %llu checks, %llu decisions, lineages up to %.0f events; chance of a wrong decision at most %.2e\n",
-               ev[38], ev[35], n, (double)ev[38] * q * q);
+        // These are observations of this execution, not bounds on a base-independent ideal
+        // execution. In particular they do not certify a post-run error probability.
+        printf("lead fingerprints: C_obs=%llu checks, %llu decisions, n_obs=%llu events; observed statistics, not a probability certificate\n",
+               ev[38], ev[35], ev[39]);
     }
 #endif
     if (g_rank_lossy)

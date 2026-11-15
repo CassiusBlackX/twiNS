@@ -1,6 +1,8 @@
 // TwiNS-RDMA device code: the NIC (RdmaHw, RdmaEgressQueue, QbbNetDevice on a host), the switch
 // (SwitchNode, SwitchMmu, BEgressQueue, QbbNetDevice), and the slot kernel. See rdma.h.
 #include "rdma.h"
+#include "../evidence.h"
+#include "../evidence_corpus.h"
 #include "ns3hash.h"
 
 namespace rdma
@@ -368,8 +370,9 @@ __host__ __device__ __forceinline__ uint64_t chash(uint64_t h, uint32_t code)
 // most n/p (Schwartz-Zippel); both fingerprints agree with probability at most (n/p)^2. ccmp uses
 // them for one decision only: chains of distinct roots with equal fingerprints, no lossy code among
 // those leads, are ordered by their roots (what the walk would find, without walking). The run
-// counts the checks (C) and the longest lineage checked (n); the chance that any decision is wrong is
-// at most C (n/(p-2))^2: a wrong one needs a check of two different sequences that collide.
+// records C_obs and n_obs as diagnostics only. The first-error union bound uses C_star and n_star
+// from the base-independent ideal execution, not these possibly base-dependent observations.
+// Fixed --fp-bases reproduce a choice of bases; they do not retain the random-sampling guarantee.
 constexpr uint64_t FP_P = (1ull << 61) - 1, FP_LOSSY = 1ull << 63;
 __constant__ uint64_t c_fp[2];
 static uint64_t h_fp[2]; // (the host's copy)
@@ -433,6 +436,23 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
     // (ablation: no lineages; every tie is undecided and kept in candidate order)
     *dst = Chain{};
     return;
+#endif
+#ifdef TWINS_EVIDENCE
+    unsigned long long nr=1;
+    for(int i=0;i<RUNS;i++)nr+=par.r[i].code!=0;
+    unsigned long long represented=nr-(par.r[0].code==code);
+    unsigned long long sample=twins_evidence::push((unsigned long long)par.pad+1,represented>RUNS?RUNS:represented,par.r[0].code==code,par.tail!=0);
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__) || defined(TWINS_CPU)
+    if ((sample & 4095ull)==0) {
+        unsigned long long full=represented, pos=par.tail, visited=0;
+        bool lost=false;
+        while(pos) { TailNode t=tail_at(pos); if(t.pos!=pos){lost=true;break;} ++full;++visited;pos=t.next; }
+        if(lost)atomicAdd(&twins_evidence::count[13],1ull);
+        else { atomicAdd(&twins_evidence::count[10],1ull);atomicAdd(&twins_evidence::count[11],full);
+               atomicAdd(&twins_evidence::count[12],(unsigned long long)par.pad+1);atomicMax(&twins_evidence::count[14],full); }
+        atomicAdd(&twins_evidence::count[15],visited);
+    }
+#endif
 #endif
     Chain c;
     if (par.r[0].code == code)
@@ -961,11 +981,29 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
     }
 }
 
+#ifdef TWINS_CORPUS
+__device__ unsigned long long corpus_calls;
+__device__ twins_corpus::Sample corpus_samples[twins_corpus::CAP];
+__device__ inline void capture_comparison(const Sim &s,uint32_t pa,const Chain &a,uint32_t pb,const Chain &b,int result,bool inexact) {
+    unsigned long long sequence=atomicAdd(&corpus_calls,1ull)+1;
+    if(sequence & (sequence-1))return; // logarithmic samples span the entire run
+    int slot=0;for(auto x=sequence;x>1;x>>=1)++slot;
+    auto &d=corpus_samples[slot];d.roota=a.root;d.rootb=b.root;
+    d.ranka=a.root?s.root_rank[a.root-1]:-1;d.rankb=b.root?s.root_rank[b.root-1]:-1;
+    d.result=result;d.inexact=inexact;d.a1=a.hash;d.a2=a.hash2;d.b1=b.hash;d.b2=b.hash2;
+    if(pa)fp_step(d.a1,d.a2,pa);if(pb)fp_step(d.b1,d.b2,pb);
+    RunCursor A,B;A.init(a,pa);B.init(b,pb);d.na=d.nb=0;d.flags=1;
+    while(A.code && d.na<twins_corpus::MAX_RUNS){d.a[d.na++]={A.code,A.left};A.next();}
+    while(B.code && d.nb<twins_corpus::MAX_RUNS){d.b[d.nb++]={B.code,B.left};B.next();}
+    if(A.code || B.code)d.flags|=2;if(A.lost || B.lost)d.flags|=4;
+}
+#endif
+
 // ccmp_walk, sped up: chains of distinct roots with equal leads above their roots (equal hashes:
 // lineages in lockstep, whose walk would go all the way down) compare as their roots' start chains
 // (there are their first differing lead, and the end where the roots decide; ordinals decide only
 // below a common root); comparisons decided by leads come from the memo when known
-__device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact)
+__device__ __forceinline__ int ccmp_impl(const Sim &s, uint32_t pa, const Chain &a, uint32_t pb, const Chain &b, bool *inexact)
 {
 #ifdef RDMA_PROF
     atomicAdd(&g_prof[0], 1ull);
@@ -986,7 +1024,7 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
             fp_step(a1, a2, pa);
         if (pb)
             fp_step(b1, b2, pb);
-        // (counted: the checks, for the bound, and the longer lineage checked; the decisions)
+        // Observed checks, maximum checked length, and decisions (not a probability certificate).
         atomicAdd(&s.ev[38], 1ull);
 #ifndef RDMA_CRIT
         atomicMax(&s.ev[39], (unsigned long long)(a.pad > b.pad ? a.pad : b.pad) + 1ull);
@@ -1005,6 +1043,9 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
         unsigned long long wsteps = 0;
         bool bl;
         int r = ccmp_walk(s.root_rank, pa, a, pb, b, inexact, &bl, false, &wsteps);
+#ifdef TWINS_EVIDENCE
+        twins_evidence::comparison(wsteps);
+#endif
         atomicAdd(&g_prof[1], 1ull);
         atomicAdd(&g_prof[bl ? 2 : 5], wsteps);
         atomicAdd(&g_prof[6], (unsigned long long)(clock64() - walk0));
@@ -1074,6 +1115,14 @@ __device__ __forceinline__ int ccmp(const Sim &s, uint32_t pa, const Chain &a, u
     }
     return r;
 #endif
+}
+
+__device__ __forceinline__ int ccmp(const Sim &s,uint32_t pa,const Chain &a,uint32_t pb,const Chain &b,bool *inexact) {
+ int r=ccmp_impl(s,pa,a,pb,b,inexact);
+#ifdef TWINS_CORPUS
+ capture_comparison(s,pa,a,pb,b,r,*inexact);
+#endif
+ return r;
 }
 
 // the first three runs of the chain cpush(code0, ch) (code0 0: of ch itself)
@@ -3307,6 +3356,14 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
             int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
             if ((su > 0 ? su : 0) >= th_min)
                 bad = 1;
+            // The safe path also skips CheckIngressAdmission. Below-reserve bytes still
+            // participate in its packet_size + shared_used test: the PFC condition above
+            // alone is insufficient when a port's headroom is smaller than a packet.
+            // Every packet is <= the total arrival bytes, and every preceding shared
+            // occupancy is <= max(su,0). Either bound makes admission unconditional.
+            if (abytes[p] > s.pc[s.pbase[x] + p].hdrm_cap &&
+                (uint64_t)abytes[p] + (uint64_t)(su > 0 ? su : 0) > (uint64_t)th_min)
+                bad = 1;
         }
         safe = !__syncthreads_or(bad);
     }
@@ -3952,6 +4009,13 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         if (w[p].nout > 0 || w[p].pt.q0_n > 0 || w[p].pt.q3_n > 0 || w[p].pt.tc_at >= 0)
             act = true;
         gp[p] = w[p].pt;
+#ifdef TWINS_MMU_AUDIT
+        if(!s.si[x].nvs && t1<=400000) {
+          const Port &a=w[p].pt;const Switch &b=s.sw[x];
+          unsigned th=(WP.buffer_size-b.total_hdrm-b.total_rsrv-b.shared_used)>>s.pc[s.pbase[x]+p].shift;
+          printf("mmu_boundary %lld %d %d %u %u %u %u %u %u %d %d\n",(long long)t1,node,p+1,b.shared_used,a.ing,a.hdrm,a.egr,a.mmu_paused,th,(int)safe,nsl);
+        }
+#endif
     }
     return act ? 1 : 0;
 }

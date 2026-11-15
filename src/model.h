@@ -277,6 +277,9 @@ struct FlowSoA
     NS_RCV_FIELDS(NS_PTR_R)
 #undef NS_PTR_S
 #undef NS_PTR_R
+#ifdef TWINS_TCP_TIMER_ORDER
+    uint64_t *timer_order; // [conns][6], scheduling sequence at this timer's host
+#endif
     uint16_t *dchain;   // [conns][CHAIN] event-order chain of the delayed-ACK timer
     uint16_t *rchain;   // [conns][CHAIN] ... of the retransmission (or SYN) timer
     uint16_t *schain;   // [conns][CHAIN] ... of a pending SendPendingData (Send's TimeStep)
@@ -301,6 +304,9 @@ struct MsgSoA
 
 struct HostSoA
 {
+#ifdef TWINS_TCP_TIMER_ORDER
+    uint64_t *timer_sequence; // monotone per-host scheduling order, 0 is unknown
+#endif
     Frame *ring;      // [H][ring] egress FIFO (frames not yet started)
     int *q_head, *q_size;
     int64_t *link_free, *last_start;

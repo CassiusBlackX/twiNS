@@ -164,12 +164,15 @@ OS; `--fp-bases=X1,X2` repeats a run; islands and reruns get the same bases). Th
 only: chains of distinct roots with equal fingerprints and no lossy code are ordered by their roots,
 which is what the walk would find. Two different sequences of at most n codes are different
 polynomials of degree < n, so one check of them passes with probability at most ((n-1)/(p-2))^2
-(Schwartz-Zippel, two independent bases); a run prints the number of checks C, the longest lineage
-n and the union bound C ((n-1)/(p-2))^2. Chains lost their `anc[]` hashes (strict build): 24 bytes
-smaller. `TWINS_NO_FP` removes the fingerprints; `TWINS_HASH_MEMO` still builds the old version.
+(Schwartz-Zippel, two independent bases); the first-error union bound uses the number C_star and maximum length n_star in an ideal
+execution independent of the bases. The implementation prints C_obs and n_obs as diagnostics
+only; they do not certify a post-run probability. Fixed bases reproduce the semantic result
+and flags, not GPU interleavings or necessarily atomic counters. Chains lost their `anc[]` hashes (strict build): 24 bytes
+smaller. `TWINS_NO_FP` disables the fingerprint equality shortcut (the pair is still updated); `TWINS_HASH_MEMO` still builds the old version.
 TCP has no fingerprints.
 - LLaMA 65B probe, 128 GPUs: 55.0 s, 439,168 messages identical, 0 undecided, 111 M decisions,
-  lineages up to 1.38 M events, bound 4e-17 (counted over decisions in that build; checks now).
+  lineages up to 1.38 M events. The historical log printed 4e-17; this is not a certified
+  post-run bound (and that build counted decisions rather than checks).
 - RX gate (`out/audit/gate_fp.txt`): AI collectives 18/18; RDMA jobs1 10/10, jobs2 29/29, jobs3 8/8,
   jobs_dctcp 41/41, jobs_topo 32/32, sweep 32/32 worlds; SimAI network 60/60; replay 16/16; what-if
   matrix 47/47; paper runs (closed loop) and both with 4 islands: see the file.

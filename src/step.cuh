@@ -238,6 +238,18 @@ struct HostCtx
     int64_t slot_end;
 };
 
+// Timers of one host are scheduled by that host's sequential handler. Their local
+// creation sequence preserves their relative reference UIDs even when remote events interleave.
+// Experimental option: it supplies exact timer-vs-timer order without changing frame histories.
+__device__ inline void timer_record(HostCtx &c,int flow,int kind) {
+#ifdef TWINS_TCP_TIMER_ORDER
+    uint64_t &seq=c.s->hs.timer_sequence[c.h];
+    uint64_t key=0;
+    if(seq!=~0ull) key=++seq;
+    c.s->fl.timer_order[(size_t)flow*6+kind]=key;
+#endif
+}
+
 // a timer set during the slot, due within it: insert after the pending ones due no later
 __device__ inline void due_insert(HostCtx &c, int64_t at, int f, int kind)
 {
@@ -1066,6 +1078,7 @@ __device__ inline uint32_t send_segment(HostCtx &c, int f, uint32_t seq, uint32_
     if (F.rto_at[f] < 0)
     {
         F.rto_at[f] = now + F.rto[f];
+        timer_record(c, f, 0);
         timer_chain(c, c.s->fl.rchain, f, F.rto[f]);
     }
     F.cwnd_limited[f] = F.cwnd[f] < inflight(F, f) + MSS; // m_isCwndLimited
@@ -1375,6 +1388,7 @@ __device__ inline void new_ack(HostCtx &c, int f, uint32_t ack, bool reset_rto, 
         int64_t rto = est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
         F.rto[f] = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
         F.rto_at[f] = now + F.rto[f];
+        timer_record(c, f, 0);
         timer_chain(c, c.s->fl.rchain, f, F.rto[f]);
     }
     // no retransmission timer once the buffer is empty, except in FIN_WAIT_1 (the FIN is
@@ -1644,6 +1658,7 @@ __device__ TWINS_COLD void send_synack(HostCtx &c, int f, int64_t now)
     if (F.srv_syn_at[f] < 0)
     {
         F.srv_syn_at[f] = now + rto;
+        timer_record(c, f, 3);
         timer_chain(c, F.dchain, f, rto);
     }
 }
@@ -1879,6 +1894,7 @@ __device__ TWINS_COLD void send_fin_ack(HostCtx &c, int f, int64_t now)
         int64_t rto = est + (v > (MUT(11) ? 1000ll : CLOCK_GRAN_PS) ? v : (MUT(11) ? 1000ll : CLOCK_GRAN_PS));
         rto = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
         F.r_frx_at[f] = now + rto;
+        timer_record(c, f, 5);
         timer_chain(c, F.schain, f, rto); // (the sender's SendPendingData chain is idle by now)
     }
 }
@@ -1900,6 +1916,7 @@ __device__ TWINS_COLD void do_peer_close(HostCtx &c, int f, int64_t now)
     F.r_last_n[f] = DATA_RETRIES;
     int64_t lr = last_rto(F, f);
     F.r_last_at[f] = now + lr;
+    timer_record(c, f, 4);
     timer_chain(c, F.dchain, f, lr); // (no delayed ACK in LAST_ACK)
 }
 
@@ -1947,6 +1964,7 @@ __device__ inline void received_data(HostCtx &c, int f, uint32_t seq, uint32_t l
         if (F.delack_at[f] < 0)
         {
             F.delack_at[f] = now + (MUT(3) ? 2 * DELACK_PS : DELACK_PS);
+            timer_record(c, f, 1);
             timer_chain(c, c.s->fl.dchain, f, MUT(3) ? 2 * DELACK_PS : DELACK_PS);
         }
     }
@@ -2059,6 +2077,7 @@ __device__ TWINS_COLD void app_write(HostCtx &c, int f, int64_t now)
     if (F.cwnd[f] > pipe && F.syn_at[f] < 0)
     {
         F.syn_at[f] = now + 1;
+        timer_record(c, f, 2);
         chain_push(F.schain + (size_t)f * CHAIN, CHAIN_STEP, c.echain);
         due_insert(c, now + 1, f, 2);
     }
@@ -2178,6 +2197,12 @@ __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due
 #endif
     int why;
     int r = chain_cmp(due_chain(F, a), due_chain(F, b), &why);
+#ifdef TWINS_TCP_TIMER_ORDER
+    if (r==0) {
+        const uint64_t ka=F.timer_order[(size_t)a.flow*6+a.kind],kb=F.timer_order[(size_t)b.flow*6+b.kind];
+        if(ka && kb && ka!=kb){atomicAdd(&s.ev[33],1ull);return ka>kb;}
+    }
+#endif
     if (r == 0)
     {
         atomicAdd(&s.ev[25], 1ull);
@@ -2338,6 +2363,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
                 cub_hystart_reset(F, f, now); // TcpCubic::Init when the socket is created
             F.rto[f] = (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS); // TcpSocketBase::SendEmptyPacket(SYN)
             F.syn_at[f] = now + (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS);
+            timer_record(c, f, 2);
             timer_chain(c, F.rchain, f, (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS));
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
@@ -2363,6 +2389,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
                     send_fin_ack(c, d.flow, now);
                     int64_t lr = last_rto(F, d.flow);
                     F.r_last_at[d.flow] = now + lr;
+                    timer_record(c, d.flow, 4);
                     timer_chain(c, F.dchain, d.flow, lr);
                 }
             }
@@ -2388,6 +2415,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
                 int tries = ++F.syn_tries[d.flow];
                 F.rto[d.flow] = (MUT(17) ? 3000000000000ll : CONN_TIMEOUT_PS) << tries;
                 F.syn_at[d.flow] = now + F.rto[d.flow];
+                timer_record(c, d.flow, 2);
                 timer_chain(c, F.rchain, d.flow, F.rto[d.flow]);
                 emit(c, d.flow, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
             }

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "model.h"
+#include "evidence.h"
 #include "ns3hash.h"
 
 using namespace nsm;
@@ -54,6 +55,10 @@ static T *dalloc(size_t n)
     T *p;
     CHECK(cudaMalloc(&p, sizeof(T) * std::max<size_t>(n, 1)));
     CHECK(cudaMemset(p, 0, sizeof(T) * std::max<size_t>(n, 1)));
+#ifdef TWINS_EVIDENCE
+    twins_evidence::allocated += sizeof(T)*std::max<size_t>(n,1);
+    if constexpr (std::is_same<T,Frame>::value) twins_evidence::inline_allocated += sizeof(T)*std::max<size_t>(n,1) * sizeof(Frame::chain)/sizeof(Frame);
+#endif
     return p;
 }
 
@@ -858,9 +863,16 @@ int main(int argc, char **argv)
     NS_RCV_FIELDS(NS_BASE_R)
 #undef NS_BASE_S
 #undef NS_BASE_R
+#ifdef TWINS_TCP_TIMER_ORDER
+    s.fl.timer_order = dalloc<uint64_t>((size_t)F * 6);
+    s.hs.timer_sequence = dalloc<uint64_t>(H);
+#endif
     s.fl.dchain = dalloc<uint16_t>((size_t)F * CHAIN);
     s.fl.rchain = dalloc<uint16_t>((size_t)F * CHAIN);
     s.fl.schain = dalloc<uint16_t>((size_t)F * CHAIN);
+#ifdef TWINS_EVIDENCE
+    twins_evidence::inline_allocated += (size_t)F * CHAIN * sizeof(uint16_t) * 3;
+#endif
     // ---- hosts and ports
     s.ring = 0;
     for (const World &w : worlds)
@@ -871,6 +883,9 @@ int main(int argc, char **argv)
     s.hs.link_free = dalloc<int64_t>(H);
     s.hs.last_start = dalloc<int64_t>(H);
     s.hs.last_chain = dalloc<uint16_t>((size_t)H * CHAIN);
+#ifdef TWINS_EVIDENCE
+    twins_evidence::inline_allocated += (size_t)H * CHAIN * sizeof(uint16_t);
+#endif
     s.hs.act_snd = dalloc<int>((size_t)H * MAX_ACTIVE);
     s.hs.n_snd = dalloc<int>(H);
     s.hs.act_rcv = dalloc<int>((size_t)H * MAX_ACTIVE);
@@ -1106,6 +1121,12 @@ int main(int argc, char **argv)
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
            " | undecided-ties %llu\n",
            M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25]);
+#ifdef TWINS_EVIDENCE
+    twins_evidence::report();
+#endif
+#ifdef TWINS_TCP_TIMER_ORDER
+    printf("timer creation order: %llu chain ties resolved by exact per-host scheduling sequence\n",ev[33]);
+#endif
     if (ev[25])
         printf("undecided-ties by cause: lossy %llu trunc %llu same-root %llu count %llu no-root %llu timers %llu short %llu\n", ev[26], ev[27],
                ev[28], ev[29], ev[30], ev[31], ev[32]);

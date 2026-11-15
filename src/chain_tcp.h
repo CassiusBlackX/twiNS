@@ -91,6 +91,15 @@ __host__ __device__ inline void chain_push(uint16_t *dst, uint16_t code, const u
 #ifdef NS_NO_CHAIN
     return;
 #endif
+#ifdef TWINS_EVIDENCE
+    unsigned long long len = 1, nr = 1;
+    if (parent)
+        for (int i = 0; i < CHAIN_RUNS; i++)
+            if (parent[2 * i]) { len += parent[2 * i + 1]; nr++; }
+    bool ext = parent && parent[0] == code;
+    twins_evidence::push(len, nr - (ext ? 1 : 0), ext, false,
+                         parent && (chain_root_key(parent) & CHAIN_TRUNC));
+#endif
     if (parent && parent[0] == code)
     {
         for (int i = 0; i < CHAIN; i++)
@@ -128,7 +137,7 @@ enum : int
 // leads equal, are decided by their roots' set-up order. Every case in which the recorded
 // history cannot tell the reference's order is undecided: equal lossy codes, a truncated chain
 // that runs out, a saturated count that runs out, equal roots. (Appendix A, Lemma A.2.)
-__host__ __device__ inline int chain_cmp(const uint16_t *a, const uint16_t *b, int *why = nullptr)
+__host__ __device__ inline int chain_cmp_impl(const uint16_t *a, const uint16_t *b, int *why, unsigned long long *steps)
 {
     int dummy;
     if (!why)
@@ -139,6 +148,9 @@ __host__ __device__ inline int chain_cmp(const uint16_t *a, const uint16_t *b, i
     uint32_t ra = a[1], rb = b[1];
     for (;;)
     {
+#ifdef TWINS_EVIDENCE
+        ++*steps;
+#endif
         uint16_t ca = ia < CHAIN_RUNS ? a[2 * ia] : 0, cb = ib < CHAIN_RUNS ? b[2 * ib] : 0;
         if (ca == 0 || cb == 0)
         {
@@ -196,3 +208,12 @@ __host__ __device__ inline int chain_cmp(const uint16_t *a, const uint16_t *b, i
     }
 }
 
+
+__host__ __device__ inline int chain_cmp(const uint16_t *a,const uint16_t *b,int *why=nullptr) {
+ unsigned long long steps=0;
+ int r=chain_cmp_impl(a,b,why,&steps);
+#ifdef TWINS_EVIDENCE
+ twins_evidence::comparison(steps);
+#endif
+ return r;
+}
