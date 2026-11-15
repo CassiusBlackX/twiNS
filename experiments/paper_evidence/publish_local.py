@@ -2,6 +2,7 @@
 """Auto-generated Markdown from local receipts; never edits LaTeX or manual results prose."""
 from pathlib import Path
 import datetime,json,re,statistics,time,subprocess,os
+from receipt_status import terminal_profile
 ROOT=Path('/home/cassius/Work/SpecDES/twiNS/out/paper-evidence-20261116');MAT=Path('/home/cassius/Projects/TwiNS')
 def read(p):
  try:return json.loads(p.read_text())
@@ -29,11 +30,12 @@ while True:
  groups={}
  for p in (ROOT/'local/profile-final').glob('*/result.json'):
   x=read(p)
-  if x:groups.setdefault((x['case'],x['variant']),[]).append(x)
+  if x:
+   x=terminal_profile(x,p);groups.setdefault((x['case'],x['variant']),[]).append(x)
  for (n,v),xs in sorted(groups.items()):
   ts=[x['wall_ns']/1e9 for x in xs]
   lines.append(f'| {n} | {v} | {len(xs)}/{sum(x["accepted"] for x in xs)} | {statistics.median(ts):.9f} | {min(ts):.9f}–{max(ts):.9f} |')
- lines+=['','计数、log2 分布、RLE 抽样、tail 分配/复用/覆盖、明确分配字节及带桌面背景的 VRAM 采样在逐次结果和日志中。TCP 截断时是记录前缀长度；RDMA 每 4096 push 的完整 RLE 抽样把失效 tail 单列。计数构建开销单独报告，不与干净版本混用。','','## A2 固定输入 GPU 微基准','','三组语料来自真实比较调用，采样位置是比较次数的 2 的幂。FP 覆盖 root-start 之后的后缀，walk 输入还含 root-start 前缀；旧 v1 范围错误记录保留且不采用。后续已通过检查的样本才可使用。微基准重建连续 tail 布局，不能把其缓存局部性等同生产模拟，也不能把阶段时间相加当墙钟。','','| 语料 | 验收 | 阶段 | 中位 GPU 毫秒 |','|---|---|---:|']
+ lines+=['','计数、log2 分布、RLE 抽样、tail 分配/复用/覆盖、明确分配字节及带桌面背景的 VRAM 采样在逐次结果和日志中。TCP 截断时是记录前缀长度；RDMA 每 4096 push 的完整 RLE 抽样把失效 tail 单列。计数构建开销单独报告，不与干净版本混用。最终 pass flags 与初始重跑分开；wall/内存包含全部内部重跑。strict 若扩容 tail，端到端差值不等于纯 FP 指令开销。','','## A2 固定输入 GPU 微基准','','三组语料来自真实比较调用，采样位置是比较次数的 2 的幂。FP 覆盖 root-start 之后的后缀，walk 输入还含 root-start 前缀；旧 v1 范围错误记录保留且不采用。后续已通过检查的样本才可使用。微基准重建连续 tail 布局，不能把其缓存局部性等同生产模拟，也不能把阶段时间相加当墙钟。','','| 语料 | 验收 | 阶段 | 中位 GPU 毫秒 |','|---|---|---:|']
  for folder in sorted((ROOT/'local/corpus').glob('*')):
   corrected=(folder/'micro-isolated-result.json').exists()
   p=folder/('micro-isolated-result.json' if corrected else 'micro-final-result.json' if (folder/'micro-final-result.json').exists() else 'micro-v2-result.json')
