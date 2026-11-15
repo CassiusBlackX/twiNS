@@ -32,12 +32,27 @@ __global__ void update_inputs(const twins_corpus::Sample *samples,Result *result
  results[i]={construct?c.hash:h1,construct?c.hash2:h2,0,0};
 }
 __global__ void saturation_fixture(const uint32_t *ranks,int *result) {
- Chain a{},b{};a.root=1;b.root=2;a.r[0]={32031,0xFFFFFFFFu};b.r[0]=a.r[0];
- bool bad=false;result[0]=ccmp_walk(ranks,0,a,0,b,&bad);
+ Chain a{},b{};a.root=1;b.root=2;a.r[0]={ccode(1000,0),0xFFFFFFFFu};b.r[0]=a.r[0];
+ a.r[1]={ccode(900,0),1};b.r[1]={ccode(800,0),1};
+ bool bad=false;result[0]=ccmp_walk(ranks,0,a,0,b,&bad)==0;
  RunCursor c;c.init(a,a.r[0].code);result[1]=c.left==0xFFFFFFFFu;
+ Run pa[PRE]{},pb[PRE]{};cprefix(pa,a.r[0].code,a);cprefix(pb,0,b);
+ result[2]=pa[0].cnt==0xFFFFFFFFu;result[3]=pcmp(pa,pb)==0;
+ a.r[0].cnt=b.r[0].cnt=8;cprefix(pa,0,a);cprefix(pb,0,b);
+ result[4]=pcmp(pa,pb)==-1;result[5]=!lead_lossy(a.r[0].code>>CODE_ORD_BITS);
+}
+static void check_saturation(){
+ uint32_t *ranks;int *r;uint32_t rank[2]={0,1};int result[6]{};
+ OK(hipMalloc((void**)&ranks,sizeof(rank)));OK(hipMemcpy(ranks,rank,sizeof(rank),hipMemcpyHostToDevice));
+ OK(hipMalloc((void**)&r,sizeof(result)));saturation_fixture<<<1,1>>>(ranks,r);
+ OK(hipDeviceSynchronize());OK(hipMemcpy(result,r,sizeof(result),hipMemcpyDeviceToHost));
+ for(int i=0;i<6;i++)if(!result[i]){fprintf(stderr,"saturation fixture check %d failed\n",i);exit(5);}
+ OK(hipFree(r));OK(hipFree(ranks));
+ printf("{\"fixture\":\"saturated_run_and_prefix\",\"passed\":true,\"checks\":6,\"finite_positive_control\":true}\n");
 }
 template<typename T>T *upload(const std::vector<T>&v){T*p=nullptr;OK(hipMalloc((void**)&p,std::max<size_t>(1,v.size())*sizeof(T)));if(v.size())OK(hipMemcpy(p,v.data(),v.size()*sizeof(T),hipMemcpyHostToDevice));return p;}
 int main(int argc,char**argv){
+ if(argc==2 && std::string(argv[1])=="--boundary-only"){check_saturation();return 0;}
  if(argc!=2){fprintf(stderr,"usage: lineage-bench output.corpus\n");return 1;}
  std::ifstream file(argv[1],std::ios::binary);std::vector<twins_corpus::Sample> samples;
  for(int i=0;i<twins_corpus::CAP;i++){
@@ -84,10 +99,7 @@ int main(int argc,char**argv){
  Memo memo{};const size_t mcap=1<<22;OK(hipMalloc((void**)&memo.we,mcap*sizeof(WalkEnt)));memo.walk_mask=mcap-1;OK(hipMemset(memo.we,0,mcap*sizeof(WalkEnt)));OK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo),&memo,sizeof(memo)));
  Sim s{};s.root_rank=dranks;OK(hipMalloc((void**)&s.ev,40*8));OK(hipMemset(s.ev,0,40*8));
  TailPool construct{};construct.mask=(1<<22)-1;OK(hipMalloc((void**)&construct.n,(construct.mask+1)*sizeof(TailNode)));OK(hipMalloc((void**)&construct.cnt,8));
- {std::vector<uint32_t> rank{0,1};auto *d=upload(rank);std::vector<int> result(2);auto *r=upload(result);
-  saturation_fixture<<<1,1>>>(d,r);OK(hipDeviceSynchronize());OK(hipMemcpy(result.data(),r,8,hipMemcpyDeviceToHost));
-  if(result[0]!=0 || result[1]!=1){fprintf(stderr,"saturated run fixture failed\n");return 5;}
-  printf("{\"fixture\":\"saturated_run\",\"undecided\":true,\"virtual_push_clamped\":true}\n");}
+ check_saturation();
  printf("{\"samples\":%zu,\"logical_a_events\":%llu,\"tail_slots\":%zu,\"chain_bytes\":%zu,\"layout\":\"reconstructed contiguous tails; fixed sample order\"}\n",samples.size(),(unsigned long long)logical_events,cap,sizeof(Chain));
  for(int phase=0;phase<4;phase++){
   const char *name=phase==0?"fp_update":phase==1?"suffix_construction_including_fp":phase==2?"exact_walk_memo":"fingerprint_shortcut";

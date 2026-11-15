@@ -1175,7 +1175,7 @@ __device__ __forceinline__ void cprefix(Run *out, uint32_t code0, const Chain &c
     else if (ch.r[0].code == code0)
     {
         out[0].code = code0;
-        out[0].cnt = ch.r[0].cnt + 1;
+        out[0].cnt = ch.r[0].cnt == 0xFFFFFFFFu ? 0xFFFFFFFFu : ch.r[0].cnt + 1;
         for (int i = 1; i < PRE; i++)
             out[i] = ch.r[i];
     }
@@ -1206,6 +1206,10 @@ __device__ __forceinline__ int pcmp(const Run *a, const Run *b)
         uint32_t m = ra < rb ? ra : rb;
         ra -= m;
         rb -= m;
+        // A saturated count is a lower bound. Let the full comparator flag a tie
+        // rather than advancing the prefix past an unknown number of repeats.
+        if ((!ra && a[ia].cnt == 0xFFFFFFFFu) || (!rb && b[ib].cnt == 0xFFFFFFFFu))
+            return 0;
         if (ra == 0 && ++ia < PRE)
             ra = a[ia].cnt;
         if (rb == 0 && ++ib < PRE)
