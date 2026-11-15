@@ -9,6 +9,8 @@ while True:
   try:v=json.loads(p.read_text())
   except (OSError,ValueError):continue
   raw=RAW/p.parent.name
+  # Allow the producer to finish its own post-result cleanup before reclaiming its directory.
+  if time.time_ns()-p.stat().st_mtime_ns<30_000_000_000:continue
   if v.get('accepted') and raw.is_dir() and raw.parent.resolve()==RAW.resolve():
    shutil.rmtree(raw)
    with (EXP/'raw-cleanup.jsonl').open('a') as f:f.write(json.dumps(dict(label=p.parent.name,utc_ns=time.time_ns(),reason='validated; timing, hashes, counts, logs and resources retained in export'))+'\n')

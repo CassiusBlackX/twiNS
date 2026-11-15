@@ -44,5 +44,6 @@ while True:
  gate=read(DEST/'export/candidate-gates/summary.json');health=read(DEST/'export/health.json',{})
  lines+=['','## 队列与版本','','候选 CUDA 门禁：'+(str(gate.get('status')) if gate else '尚无最终验收摘要')+'。A3 固定 A1 二进制与后续修复候选分别归档，不混合求中位数。',f'最近远端空闲空间：{health.get("free_bytes",0)/2**30:.2f} GiB（健康采样 utc_ns={health.get("utc_ns")}）。','','```text',health.get('services','尚未回传健康采样'),'```','','计划见 [experiment_plan_20261116.md](experiment_plan_20261116.md)，已验收解释见 [experiment_results_20261116.md](experiment_results_20261116.md)。原始纳秒、哈希、校验、资源采样保存在本机 `twiNS/out/paper-evidence-20261116/s50/export/`。大体积 trace 未回传。']
  content='\n'.join(lines)+'\n';(HERE/'reports/experiment_results_live_20261116.md').write_text(content);Path('/home/cassius/Projects/TwiNS/experiment_results_live_20261116.md').write_text(content)
- if (DEST/'export/all-finished.json').exists():break
+ finished=read(DEST/'export/all-finished.json')
+ if finished and check['complete'] and (index.get('utc_ns',0)>=finished['utc_ns']):break
  time.sleep(30)
