@@ -5,6 +5,8 @@
 #ifdef TWINS_EVIDENCE
 namespace twins_evidence {
 __device__ unsigned long long count[16], lengths[32], runs_hist[32], depths[32];
+__device__ uint32_t *tail_depth=nullptr;
+inline unsigned long long instrumentation_bytes=0;
 inline unsigned long long allocated=0,inline_allocated=0;
 __host__ __device__ inline int bucket(unsigned long long n) {
  int b=0;while(n>1 && b<31){n>>=1;b++;}return b;
@@ -29,6 +31,7 @@ inline void report(unsigned long long tail_allocated=0,unsigned long long tail_s
  unsigned long long c[16],l[32],r[32],d[32];
  hipMemcpyFromSymbol(c,HIP_SYMBOL(count),sizeof(c));hipMemcpyFromSymbol(l,HIP_SYMBOL(lengths),sizeof(l));
  hipMemcpyFromSymbol(r,HIP_SYMBOL(runs_hist),sizeof(r));hipMemcpyFromSymbol(d,HIP_SYMBOL(depths),sizeof(d));
+ printf("evidence_schema: v2 full_rle=auxiliary_depth sample_period=4096 instrumentation_bytes=%llu\n",instrumentation_bytes);
  printf("evidence_counts:");for(auto x:c)printf(" %llu",x);printf("\n");
  printf("evidence_length_log2:");for(auto x:l)printf(" %llu",x);printf("\n");
  printf("evidence_inline_runs_log2:");for(auto x:r)printf(" %llu",x);printf("\n");

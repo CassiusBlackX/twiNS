@@ -2057,6 +2057,9 @@ int main(int argc, char **argv)
         tp.mask = cap - 1;
 #ifdef TWINS_EVIDENCE
         evidence_tail=tp;
+        auto *depth=dev_alloc<uint32_t>(cap);
+        twins_evidence::instrumentation_bytes=cap*sizeof(uint32_t);
+        CK(hipMemcpyToSymbol(HIP_SYMBOL(twins_evidence::tail_depth),&depth,sizeof(depth)));
 #endif
         CK(hipMemcpyToSymbol(HIP_SYMBOL(g_tail), &tp, sizeof(tp)));
 #ifdef RDMA_CRIT
@@ -2444,6 +2447,8 @@ int main(int argc, char **argv)
         // execution. In particular they do not certify a post-run error probability.
         printf("lead fingerprints: C_obs=%llu checks, %llu decisions, n_obs=%llu events; observed statistics, not a probability certificate\n",
                ev[38], ev[35], ev[39]);
+        if(ev[39]>=0xFFFFFFFFull)
+            printf("lead fingerprints: the 32-bit observed length counter is capped; n_obs is not an upper bound\n");
     }
 #endif
     if (g_rank_lossy)

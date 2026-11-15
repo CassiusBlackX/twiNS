@@ -31,6 +31,11 @@ __global__ void update_inputs(const twins_corpus::Sample *samples,Result *result
   }
  results[i]={construct?c.hash:h1,construct?c.hash2:h2,0,0};
 }
+__global__ void saturation_fixture(const uint32_t *ranks,int *result) {
+ Chain a{},b{};a.root=1;b.root=2;a.r[0]={32031,0xFFFFFFFFu};b.r[0]=a.r[0];
+ bool bad=false;result[0]=ccmp_walk(ranks,0,a,0,b,&bad);
+ RunCursor c;c.init(a,a.r[0].code);result[1]=c.left==0xFFFFFFFFu;
+}
 template<typename T>T *upload(const std::vector<T>&v){T*p=nullptr;OK(hipMalloc((void**)&p,std::max<size_t>(1,v.size())*sizeof(T)));if(v.size())OK(hipMemcpy(p,v.data(),v.size()*sizeof(T),hipMemcpyHostToDevice));return p;}
 int main(int argc,char**argv){
  if(argc!=2){fprintf(stderr,"usage: lineage-bench output.corpus\n");return 1;}
@@ -79,6 +84,10 @@ int main(int argc,char**argv){
  Memo memo{};const size_t mcap=1<<22;OK(hipMalloc((void**)&memo.we,mcap*sizeof(WalkEnt)));memo.walk_mask=mcap-1;OK(hipMemset(memo.we,0,mcap*sizeof(WalkEnt)));OK(hipMemcpyToSymbol(HIP_SYMBOL(g_memo),&memo,sizeof(memo)));
  Sim s{};s.root_rank=dranks;OK(hipMalloc((void**)&s.ev,40*8));OK(hipMemset(s.ev,0,40*8));
  TailPool construct{};construct.mask=(1<<22)-1;OK(hipMalloc((void**)&construct.n,(construct.mask+1)*sizeof(TailNode)));OK(hipMalloc((void**)&construct.cnt,8));
+ {std::vector<uint32_t> rank{0,1};auto *d=upload(rank);std::vector<int> result(2);auto *r=upload(result);
+  saturation_fixture<<<1,1>>>(d,r);OK(hipDeviceSynchronize());OK(hipMemcpy(result.data(),r,8,hipMemcpyDeviceToHost));
+  if(result[0]!=0 || result[1]!=1){fprintf(stderr,"saturated run fixture failed\n");return 5;}
+  printf("{\"fixture\":\"saturated_run\",\"undecided\":true,\"virtual_push_clamped\":true}\n");}
  printf("{\"samples\":%zu,\"logical_a_events\":%llu,\"tail_slots\":%zu,\"chain_bytes\":%zu,\"layout\":\"reconstructed contiguous tails; fixed sample order\"}\n",samples.size(),(unsigned long long)logical_events,cap,sizeof(Chain));
  for(int phase=0;phase<4;phase++){
   const char *name=phase==0?"fp_update":phase==1?"suffix_construction_including_fp":phase==2?"exact_walk_memo":"fingerprint_shortcut";
@@ -103,7 +112,7 @@ int main(int argc,char**argv){
    }
    printf("{\"phase\":\"%s\",\"round\":%d,\"gpu_ms\":%.9f,\"mismatches\":%d,\"memo_initially_empty\":true}\n",name,round+1,ms,mismatch);
    // Cache-warmed second walk uses precisely the same inputs, data layout and table.
-   if(phase==2){OK(hipEventRecord(start,0));compare_inputs<<<1,64>>>(s,dinput,dresult,(int)samples.size(),0);OK(hipEventRecord(stop,0));OK(hipEventSynchronize(stop));OK(hipEventElapsedTime(&ms,start,stop));printf("{\"phase\":\"exact_walk_memo_warm\",\"round\":%d,\"gpu_ms\":%.9f}\n",round+1,ms);}
+   if(phase==2){OK(hipEventRecord(start,0));compare_inputs<<<1,64>>>(s,dinput,dresult,(int)samples.size(),0);OK(hipEventRecord(stop,0));OK(hipEventSynchronize(stop));OK(hipEventElapsedTime(&ms,start,stop));OK(hipMemcpy(result.data(),dresult,result.size()*sizeof(Result),hipMemcpyDeviceToHost));int wrong=0;for(size_t i=0;i<result.size();i++)wrong+=(result[i].value!=inputs[i].expected || result[i].bad!=inputs[i].inexact);printf("{\"phase\":\"exact_walk_memo_warm\",\"round\":%d,\"gpu_ms\":%.9f,\"mismatches\":%d}\n",round+1,ms,wrong);}
    OK(hipEventDestroy(start));OK(hipEventDestroy(stop));
   }
  }

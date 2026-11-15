@@ -114,9 +114,10 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
   cmd=['taskset','-c',affinity,str(BIN/'twins-ai'),str(ROOT/'validation/simai/SimAI.conf'),f'--topo={ROOT}/data/simai/hpn{g}.topo',f'--astra={ROOT}/out/simai/wl/paper/{n.replace("_hpn","_")}.txt',f'--out={raw}/messages',f'--dag-out={raw}/actions.dag','--fp-bases=1000003,1000033']
   if engine=='p16': cmd+=['--nvl-islands=16']
   cmd+=list(options)
+ actual_inputs=([SD/'astra-sim-alibabacloud/inputs/config/SimAI.conf',AIROOT/f'wl/paper/{n.replace("_hpn","_")}.txt',AIROOT/f'topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100'] if engine=='simai' else [ROOT/'validation/simai/SimAI.conf',ROOT/f'data/simai/hpn{g}.topo',ROOT/f'out/simai/wl/paper/{n.replace("_hpn","_")}.txt'])
  before=snapshot(); start_utc=time.time_ns(); start=time.perf_counter_ns(); timedout=False
  env={**os.environ,'AS_SEND_LAT':'3'};env.pop('TWINS_TRACE',None);env.pop('TWINS_TXTRACE',None)
- save(d/'started.json',dict(case=n,engine=engine,command=cmd,start_utc_ns=start_utc,pre=before,timeout_s=M['timeout_s'],input_sha256={str(x):sha(x) for x in [ROOT/'validation/simai/SimAI.conf',ROOT/f'data/simai/hpn{g}.topo',ROOT/f'out/simai/wl/paper/{n.replace("_hpn","_")}.txt']},reference_uid_sha256=sha(ROOT/f'out/simai/paper/{n}.ref'),reference_dag_sha256=sha(ROOT/f'out/simai/paper/{n}.dag')))
+ save(d/'started.json',dict(case=n,engine=engine,command=cmd,start_utc_ns=start_utc,pre=before,timeout_s=M['timeout_s'],input_sha256={str(x):sha(x) for x in actual_inputs},reference_uid_sha256=sha(ROOT/f'out/simai/paper/{n}.ref'),reference_dag_sha256=sha(ROOT/f'out/simai/paper/{n}.dag')))
  start_utc=time.time_ns();start=time.perf_counter_ns()
  with (d/'process.log').open('w') as f:
   p=sp.Popen(cmd,cwd=raw,stdout=f,stderr=sp.STDOUT,env=env,start_new_session=True)

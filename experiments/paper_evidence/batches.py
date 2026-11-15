@@ -36,7 +36,8 @@ def prepare(trial,j,engine,cpu,policy):
   bin=c.BIN/'twins-ai';affinity='0-16' if engine=='p16' else '0'
   cmd=['taskset','-c',affinity,str(bin),str(ROOT/'validation/simai/SimAI.conf'),f'--topo={ROOT}/data/simai/hpn{g}.topo',f'--astra={ROOT}/out/simai/wl/paper/{name.replace("_hpn","_")}.txt',f'--out={raw}/messages',f'--dag-out={raw}/actions.dag','--fp-bases=1000003,1000033']
   if engine=='p16':cmd+=['--nvl-islands=16']
- v=dict(case=name,engine=engine,command=cmd,binary_sha256=c.sha(bin),affinity=affinity,cap_gib=cap if engine=='simai' else None,reference_uid_sha256=c.sha(ROOT/f'out/simai/paper/{name}.ref'),reference_dag_sha256=c.sha(ROOT/f'out/simai/paper/{name}.dag'),input_sha256={str(p):c.sha(p) for p in (ROOT/'validation/simai/SimAI.conf',ROOT/f'data/simai/hpn{g}.topo',ROOT/f'out/simai/wl/paper/{name.replace("_hpn","_")}.txt')})
+ inputs=([c.SD/'astra-sim-alibabacloud/inputs/config/SimAI.conf',c.AIROOT/f'wl/paper/{name.replace("_hpn","_")}.txt',c.AIROOT/f'topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100'] if engine=='simai' else [ROOT/'validation/simai/SimAI.conf',ROOT/f'data/simai/hpn{g}.topo',ROOT/f'out/simai/wl/paper/{name.replace("_hpn","_")}.txt'])
+ v=dict(case=name,engine=engine,command=cmd,binary_sha256=c.sha(bin),affinity=affinity,cap_gib=cap if engine=='simai' else None,reference_uid_sha256=c.sha(ROOT/f'out/simai/paper/{name}.ref'),reference_dag_sha256=c.sha(ROOT/f'out/simai/paper/{name}.dag'),input_sha256={str(p):c.sha(p) for p in inputs})
  c.save(d/'prepared.json',v);return dict(j=j,d=d,raw=raw,container=container,v=v)
 
 def launch(task):

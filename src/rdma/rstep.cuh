@@ -429,6 +429,21 @@ __host__ __device__ __forceinline__ void chash_reset(Chain &c)
 #endif
 }
 
+#ifdef TWINS_EVIDENCE
+// A constant-time observational lookup, published under the node's existing generation
+// seqlock. Volatile loads avoid using a previous generation's noncoherent L1 cache line.
+__device__ __forceinline__ uint32_t evidence_tail_depth(uint64_t pos) {
+    if(!pos || (pos>>TAIL_SIDE) || !twins_evidence::tail_depth)return 0;
+    TailNode &node=g_tail.n[(pos-1)&g_tail.mask];
+    if(atomicAdd((unsigned long long*)&node.pos,0ull)!=pos)return 0;
+    __threadfence();
+    const volatile uint32_t *depth=twins_evidence::tail_depth;
+    uint32_t d=depth[(pos-1)&g_tail.mask];
+    __threadfence();
+    return atomicAdd((unsigned long long*)&node.pos,0ull)==pos?d:0;
+}
+#endif
+
 // the chain of an event scheduled with `code` by the event whose chain is par
 __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const Chain &par)
 {
@@ -444,13 +459,16 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
     unsigned long long sample=twins_evidence::push((unsigned long long)par.pad+1,represented>RUNS?RUNS:represented,par.r[0].code==code,par.tail!=0);
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__) || defined(TWINS_CPU)
     if ((sample & 4095ull)==0) {
-        unsigned long long full=represented, pos=par.tail, visited=0;
-        bool lost=false;
-        while(pos) { TailNode t=tail_at(pos); if(t.pos!=pos){lost=true;break;} ++full;++visited;pos=t.next; }
-        if(lost)atomicAdd(&twins_evidence::count[13],1ull);
-        else { atomicAdd(&twins_evidence::count[10],1ull);atomicAdd(&twins_evidence::count[11],full);
-               atomicAdd(&twins_evidence::count[12],(unsigned long long)par.pad+1);atomicMax(&twins_evidence::count[14],full); }
-        atomicAdd(&twins_evidence::count[15],visited);
+        unsigned long long full=represented;
+        bool known=par.tail==0;
+        if(par.tail && !(par.tail>>TAIL_SIDE) && twins_evidence::tail_depth) {
+            uint32_t d=evidence_tail_depth(par.tail);
+            if(d){full+=d;known=true;}
+            atomicAdd(&twins_evidence::count[15],1ull);
+        }
+        if(!known)atomicAdd(&twins_evidence::count[13],1ull);
+        else {atomicAdd(&twins_evidence::count[10],1ull);atomicAdd(&twins_evidence::count[11],full);
+              atomicAdd(&twins_evidence::count[12],(unsigned long long)par.pad+1);atomicMax(&twins_evidence::count[14],full);}
     }
 #endif
 #endif
@@ -506,6 +524,16 @@ __host__ __device__ __forceinline__ void cpush(Chain *dst, uint32_t code, const 
             n.code = par.r[RUNS - 1].code;
             n.cnt = par.r[RUNS - 1].cnt;
             n.next = par.tail;
+#ifdef TWINS_EVIDENCE
+            if(twins_evidence::tail_depth) {
+                uint32_t depth=par.tail?0:1;
+                if(par.tail && !(par.tail>>TAIL_SIDE)) {
+                    uint32_t d=evidence_tail_depth(par.tail);
+                    if(d && d!=0xFFFFFFFFu)depth=d+1;
+                }
+                twins_evidence::tail_depth[(pos-1)&g_tail.mask]=depth;
+            }
+#endif
 #if !defined(TWINS_HASH_MEMO) && defined(TWINS_LSID)
             {
                 const uint32_t L = n.code >> CODE_ORD_BITS;
@@ -568,16 +596,18 @@ struct RunCursor
         i = 0;
         node = 0;
         lost = false;
+        full = 0;
         if (code0)
         {
             code = code0;
             if (ch.r[0].code == code0)
-                left = ch.r[0].cnt + 1; // merged with ch's first run, which is consumed with it
+                left = ch.r[0].cnt + (ch.r[0].cnt != 0xFFFFFFFFu); // saturated counts remain unknown
             else
             {
                 left = 1;
                 i = -1; // ch's runs follow
             }
+            full = left;
             return;
         }
         load();
@@ -588,6 +618,7 @@ struct RunCursor
         {
             code = c->r[i].code;
             left = c->r[i].cnt;
+            full = left;
             if (code || i < RUNS - 1)
                 return;
             i = RUNS;
@@ -974,6 +1005,10 @@ __device__ __forceinline__ int ccmp_walk(const uint32_t *root_rank, uint32_t pa,
         uint32_t m = A.left < B.left ? A.left : B.left;
         A.left -= m;
         B.left -= m;
+        // A stored maximum may stand for a longer run. Do not walk past it and
+        // silently decide by a later lead/root; callers turn an undecided result into a flag.
+        if ((A.left == 0 && A.full == 0xFFFFFFFFu) || (B.left == 0 && B.full == 0xFFFFFFFFu))
+            return 0;
         if (A.left == 0)
             A.next();
         if (B.left == 0)
@@ -1414,8 +1449,8 @@ __device__ __noinline__ int dag_fire(const Sim &s, int g, int k, int64_t tE, con
 // ------------------------------------------------------------------ frames
 __host__ __device__ __forceinline__ uint32_t node_ip(int id) { return 0x0b000001u + (id / 256) * 0x00010000u + (id % 256) * 0x00000100u; }
 
-__device__ __forceinline__ uint32_t data_hdr(const Params &P) { return 48 + P.seq_extra + P.int_size; }
-__device__ __forceinline__ uint32_t data_size(const Params &P, uint32_t payload) { return payload + data_hdr(P); }
+__host__ __device__ __forceinline__ uint32_t data_hdr(const Params &P) { return 48 + P.seq_extra + P.int_size; }
+__host__ __device__ __forceinline__ uint32_t data_size(const Params &P, uint32_t payload) { return payload + data_hdr(P); }
 __device__ __forceinline__ uint32_t ack_size(const Params &P)
 {
     int base = 12 + P.seq_extra + P.int_size, pad = 60 - 14 - 20 - base;

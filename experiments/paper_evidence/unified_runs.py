@@ -11,8 +11,8 @@ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 for key,row in seen.items():
  d=OUT/key;d.mkdir(exist_ok=True)
  if (d/'result.json').exists():continue
- if row['kind']=='tcp':passes=[(64,SRC/'build-evidence/twins'),(128,SRC/'build-evidence/twins128')]
- else:passes=[(None,SRC/'build-mmu/twins-rdma')]
+ if row['kind']=='tcp':passes=[(64,SRC/'build-final-clean/twins'),(128,SRC/'build-final-clean/twins128')]
+ else:passes=[(None,SRC/'build-final-clean/twins-rdma')]
  attempts=[]
  for cap,bin in passes:
   logpath=d/f'{cap}.log';output=d/'output';cmd=[str(bin)]
