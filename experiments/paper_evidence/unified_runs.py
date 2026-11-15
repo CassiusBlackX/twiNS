@@ -5,7 +5,7 @@ from pathlib import Path
 SRC=Path(__file__).resolve().parents[2];DATA=Path('/home/cassius/Work/SpecDES/twiNS');OUT=DATA/'out/paper-evidence-20261116/local/unified';OUT.mkdir(parents=True,exist_ok=True)
 rows=json.loads((DATA/'out/paper-evidence-20261116/manifests/scenario-inventory.json').read_text());seen={}
 for row in rows:
- if row['kind'] in ('tcp','rdma') and row['reference_sha256']:
+ if row['kind'] in ('tcp','rdma') and row['reference_sha256'] and not row['case'].startswith('dons_'):
   key=row['execution_config_sha256'];seen.setdefault(key,dict(row,memberships=[]))['memberships'].append([row['suite'],row['case']])
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 for key,row in seen.items():

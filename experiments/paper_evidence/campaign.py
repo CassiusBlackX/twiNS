@@ -94,6 +94,30 @@ def monitor(stop,path,pid,role,container,cpu):
    except OSError: pass
    f.write(json.dumps(x)+'\n'); stop.wait(5)
 
+def audit_interference(samples,engine,cpu=0):
+ """Retrospective indicators, not proof of exclusive access; three consecutive samples."""
+ def streak(xs):
+  longest=run=0
+  for x in xs:run=run+1 if x else 0;longest=max(longest,run)
+  return longest
+ gpu=[];cpu_busy=[];fractions=[]
+ for x in samples:
+  own={p['pid'] for p in x.get('own_processes',[])}|{x.get('pid')}
+  try:
+   foreign=[int(l.split(',')[0]) for l in x['gpu_processes'].splitlines() if l.split(',')[0].strip().isdigit() and int(l.split(',')[0]) not in own]
+   gpu.append(engine!='simai' and bool(foreign) and float(x['gpu'].split(',')[0])>20)
+  except (KeyError,ValueError,IndexError):gpu.append(False)
+ cpus=set(range(17)) if engine=='p16' else {int(cpu)}
+ for a,b in zip(samples,samples[1:]):
+  def stats(x):return {int(l.split()[0][3:]):list(map(int,l.split()[1:9])) for l in x.get('cpu_stat','').splitlines() if l.split() and l.split()[0][3:].isdigit() and l.startswith('cpu')}
+  sa,sb=stats(a),stats(b);total=busy=0
+  for core in cpus&sa.keys()&sb.keys():
+   d=[y-x for x,y in zip(sa[core],sb[core])];total+=sum(d);busy+=sum(d)-d[3]-d[4]
+  own0=sum(p['uticks']+p['sticks'] for p in a.get('own_processes',[]));own1=sum(p['uticks']+p['sticks'] for p in b.get('own_processes',[]))
+  fraction=max(0,busy-max(0,own1-own0))/total if total>0 else None
+  fractions.append(fraction);cpu_busy.append(fraction is not None and fraction>.20)
+ return dict(foreign_gpu_samples_above20=sum(gpu),bound_cpu_samples_above20=sum(cpu_busy),longest_gpu_streak=streak(gpu),longest_cpu_streak=streak(cpu_busy),suspected=streak(gpu)>=3 or streak(cpu_busy)>=3,sampling_period_s=5,bound_cpus=sorted(cpus),cpu_foreign_busy_fractions=fractions,scope='observed foreign GPU presence plus utilization; bound logical-CPU busy minus own process-tree ticks; no SMT isolation guarantee',classifier='consecutive-v2')
+
 def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
  d=EXPORT/'attempts'/label
  if (d/'result.json').exists() and not repeat: return json.loads((d/'result.json').read_text())
@@ -152,20 +176,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
  # A foreign compute PID is evidence of potential competition, not a reason to wait forever.
  samples=[json.loads(x) for x in (d/'resources.jsonl').read_text().splitlines()]
  result['resource_samples']=len(samples)
- gpu_interference=cpu_interference=0
- for x in samples:
-  try:
-   foreign=[int(line.split(',')[0]) for line in x['gpu_processes'].splitlines() if line.split(',')[0].strip().isdigit() and int(line.split(',')[0])!=p.pid]
-   if engine!='simai' and foreign and float(x['gpu'].split(',')[0])>20:gpu_interference+=1
-  except (ValueError,IndexError):pass
- for a,b in zip(samples,samples[1:]):
-  def cpuline(x):return next((list(map(int,line.split()[1:])) for line in x['cpu_stat'].splitlines() if line.startswith('cpu'+str(cpu)+' ')),[])
-  va,vb=cpuline(a),cpuline(b)
-  if va and vb:
-   delta=[y-x for x,y in zip(va,vb)];total=sum(delta[:8]);idle=delta[3]+delta[4]
-   own0=sum(x['uticks']+x['sticks'] for x in a.get('own_processes',[]));own1=sum(x['uticks']+x['sticks'] for x in b.get('own_processes',[]))
-   if engine in ('simai','p0') and total>0 and (total-idle-max(0,own1-own0))/total>0.20:cpu_interference+=1
- result['interference']=dict(foreign_gpu_samples_above20=gpu_interference,bound_cpu_samples_above20=cpu_interference,suspected=(gpu_interference>=3 or cpu_interference>=3),sampling_period_s=5)
+ result['interference']=audit_interference(samples,engine,cpu)
 
  result['accepted']=bool(rc==0 and result['validation'].get('equal') and result.get('dag_validation',{'equal':True})['equal'] and not result['flags']['present'])
  result['status']='timeout' if timedout else ('accepted' if result['accepted'] else 'failed_or_flagged')
@@ -196,7 +207,7 @@ def latency():
   for e in ('simai','p0','p16'):
    xs=[json.loads((EXPORT/f'attempts/latency-r{r}-{j["case"]}-{e}/result.json').read_text()) for r in (1,2,3)]
    vals=[x['wall_ns'] for x in xs if x['accepted']]
-   if len(vals)==3 and ((max(vals)-min(vals))/statistics.median(vals)>M['variation_threshold'] or any(x.get('interference',{}).get('suspected') for x in xs)):
+   if len(vals)<3 or (max(vals)-min(vals))/statistics.median(vals)>M['variation_threshold'] or any(x.get('interference',{}).get('suspected') for x in xs):
     for r in (4,5):attempt(f'latency-r{r}-{j["case"]}-{e}',j,e)
  for r in range(1,4):
   for e,opts in [('serial',['--serial']),('gwin0',['--gwin=0']),('both',['--serial','--gwin=0'])]:

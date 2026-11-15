@@ -14,6 +14,7 @@ for p in r.glob('rdma-pfc-*/result.json'):
   dest=r/'input-path-failures'/p.parent.name;dest.parent.mkdir(exist_ok=True);p.parent.rename(dest)
 PY
 bash experiments/paper_evidence/final_builds.sh || exit $?
+python3 experiments/paper_evidence/final_micro.py || exit $?
 python3 experiments/paper_evidence/final_profile.py || exit $?
 python3 experiments/paper_evidence/growth_runs.py || exit $?
 python3 experiments/paper_evidence/unified_runs.py || exit $?

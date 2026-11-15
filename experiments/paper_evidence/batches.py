@@ -20,9 +20,9 @@ def cap_manifest():
     import re
     m=re.search(r'peak=(\d+)',f.read_text())
     if m:peaks.append(int(m[1]))
-  cap=max(1,math.ceil((max(peaks)*1.35+(512<<20))/(1<<30))) if peaks else j['memory_cap_gib']
+  cap=max(1,math.ceil((max(peaks)*1.10+(512<<20))/(1<<30))) if peaks else j['memory_cap_gib']
   rows[j['case']]=dict(cap_gib=cap,observed_peaks_bytes=peaks,fallback_historical_cap_gib=j['memory_cap_gib'])
- d=dict(policy='ceil(1.35 * max accepted A3 cgroup peak + 512MiB), minimum 1GiB; same fixed caps in all batches',total_budget_gib=70,jobs=rows)
+ d=dict(policy='ceil(1.10 * max accepted A3 cgroup peak + 512MiB), minimum 1GiB; same fixed caps in all batches',total_budget_gib=70,jobs=rows)
  c.save(p,d);return d
 
 def prepare(trial,j,engine,cpu,policy):
@@ -30,7 +30,7 @@ def prepare(trial,j,engine,cpu,policy):
  if engine=='simai':
   etc=raw/'etc';(etc/'simulation').mkdir(parents=True,exist_ok=True);(etc/'results').mkdir(exist_ok=True)
   shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" >/run/internal.wall; exit "$rc"'
-  cmd=['docker','run','--rm','--name',container,'--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{c.SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{c.AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',c.SIMBIN,f'/work/wl/paper/{name.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
+  cmd=['docker','run','--rm','--name',container,'--label','twins.evidence.campaign=20261116','--label',f'twins.evidence.owner={os.getuid()}','--label','twins.evidence.role=throughput-v2','--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{c.SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{c.AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',c.SIMBIN,f'/work/wl/paper/{name.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
   bin=c.SD/c.SIMBIN.removeprefix('/simai/');affinity=str(cpu)
  else:
   bin=c.BIN/'twins-ai';affinity='0-16' if engine=='p16' else '0'
@@ -76,6 +76,7 @@ def validate(task):
 def batch(label,engine,concurrency,policy):
  receipt=BROOT/(label+'.json')
  if receipt.exists():return
+ if __import__('shutil').disk_usage(OUT).free<10<<30:raise RuntimeError('less than 10GiB free before batch')
  trialno=1
  while (BROOT/f'{label}-trial{trialno}').exists():trialno+=1
  trial=BROOT/f'{label}-trial{trialno}';trial.mkdir();queue=[]
@@ -86,7 +87,14 @@ def batch(label,engine,concurrency,policy):
  active=[];done=[];reserved=0;peak=0;events=[];stopmon=threading.Event()
  def monitor():
   with (trial/'resources.jsonl').open('w',buffering=1) as f:
-   while not stopmon.is_set():f.write(json.dumps(dict(**c.snapshot(),active=[t['v']['case'] for t in list(active)],reserved_gib=reserved))+'\n');stopmon.wait(5)
+   while not stopmon.is_set():
+    tasks=list(active);processes={}
+    for t in tasks:
+     pid=t['p'].pid
+     if engine=='simai':
+      with contextlib.suppress(ValueError):pid=int(c.cmdout(['docker','inspect',t['container'],'--format','{{.State.Pid}}']))
+     processes[t['v']['case']]=c.proc_tree(pid)
+    f.write(json.dumps(dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]))+'\n');stopmon.wait(5)
  thread=threading.Thread(target=monitor);thread.start();start=time.perf_counter_ns();utc=time.time_ns()
  try:
   while queue or active:
@@ -110,6 +118,9 @@ def batch(label,engine,concurrency,policy):
     events.append(dict(ns=end-start,action='finish',case=task['j']['case'],reserved_gib=reserved,active=len(active)))
    if active:time.sleep(.01)
   elapsed=time.perf_counter_ns()-start
+ except BaseException as exc:
+  c.save(trial/'state.json',dict(status='interrupted',utc_ns=time.time_ns(),reason=repr(exc),completed=[t['v'] for t in done],pending=[t['v']['case'] for t in queue],active=[t['v']['case'] for t in active],meaning='not a completed batch timing; entire batch will be repeated'))
+  raise
  finally:
   stopmon.set();thread.join(20)
   for task in active:stop(task);task['log'].close()
@@ -121,6 +132,15 @@ def main():
  with open(OUT/'campaign.lock','w') as lock:
   import fcntl
   fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  def terminate(signum,frame):raise KeyboardInterrupt('received signal '+str(signum))
+  signal.signal(signal.SIGTERM,terminate)
+  # A crashed previous driver may leave Docker alive outside its process cgroup.
+  # Labels scope cleanup to this user's own throughput campaign after taking its lock.
+  old=sp.check_output(['docker','ps','-q','--filter','label=twins.evidence.campaign=20261116','--filter',f'label=twins.evidence.owner={os.getuid()}','--filter','label=twins.evidence.role=throughput-v2'],text=True).split()
+  for container in old:sp.run(['docker','stop','-t','5',container],check=True,stdout=sp.DEVNULL)
+  for p in BROOT.glob('*-trial*/state.json'):
+   v=saved(p)
+   if v.get('status')=='running':v.update(status='interrupted',reason='previous driver ended before completed receipt',utc_ns=time.time_ns());c.save(p,v)
   policy=cap_manifest()
   for r in range(1,4):
    for con in (1,2,4,8):batch(f'cpu-r{r}-c{con}','simai',con,policy)

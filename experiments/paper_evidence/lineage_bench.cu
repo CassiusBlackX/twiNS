@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <vector>
+#ifndef TWINS_CORPUS
+#define TWINS_CORPUS
+#endif
 #include "rdma/rstep.cuh"
 using namespace rdma;
 #ifndef TWINS_USE_HIP
@@ -18,7 +21,9 @@ struct Input {Chain a,b;int expected;int inexact;};
 struct Result {uint64_t h1,h2;int value,bad;};
 __global__ void compare_inputs(Sim s,const Input *inputs,Result *results,int n,int fp){
  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
- bool bad=false;int r=fp?ccmp(s,0,inputs[i].a,0,inputs[i].b,&bad):ccmp_walk(s.root_rank,0,inputs[i].a,0,inputs[i].b,&bad);
+ // Call the production decision body directly: the corpus-only ccmp wrapper would
+ // otherwise recapture logarithmic samples inside the timed microbenchmark.
+ bool bad=false;int r=fp?ccmp_impl(s,0,inputs[i].a,0,inputs[i].b,&bad):ccmp_walk(s.root_rank,0,inputs[i].a,0,inputs[i].b,&bad);
  results[i]={0,0,r,(int)bad};
 }
 __global__ void update_inputs(const twins_corpus::Sample *samples,Result *results,int n,bool construct){

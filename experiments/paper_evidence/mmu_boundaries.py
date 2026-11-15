@@ -2,7 +2,7 @@
 """Small reachable-state cases; match only common half-open slot boundaries."""
 import hashlib,json,os,re,subprocess,time
 from pathlib import Path
-SRC=Path(__file__).resolve().parents[2];ROOT=Path('/home/cassius/Work/SpecDES/twiNS/out/paper-evidence-20261116');OUT=ROOT/'local/mmu/boundaries_v3';OUT.mkdir(parents=True,exist_ok=True)
+SRC=Path(__file__).resolve().parents[2];ROOT=Path('/home/cassius/Work/SpecDES/twiNS/out/paper-evidence-20261116');OUT=Path(os.environ.get('TWINS_MMU_REPRO_OUT',str(ROOT/'local/mmu/boundaries_v3')));OUT.mkdir(parents=True,exist_ok=True)
 ORACLE=ROOT/'oracle/portable-source/build/scratch/ns3.36.1-simai-ref';GPU=SRC/'build-mmu-audit/twins-rdma'
 config=(ROOT/'local/mmu/mixed.cfg').read_text();config=re.sub(r'^KMIN_MAP.*$', 'KMIN_MAP 3 1000000000 100 25000000000 100 100000000000 400',config,flags=re.M);config=re.sub(r'^KMAX_MAP.*$', 'KMAX_MAP 3 1000000000 400 25000000000 400 100000000000 1600',config,flags=re.M);config=re.sub(r'^PMAX_MAP.*$', 'PMAX_MAP 3 1000000000 0.2 25000000000 0.2 100000000000 0.2',config,flags=re.M)
 (OUT/'config.cfg').write_text(config)

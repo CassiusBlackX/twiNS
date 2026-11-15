@@ -37,7 +37,7 @@ for roundno in ([1] if strict_only else range(1,4)):
    if not bin.exists():raise RuntimeError('missing '+str(bin))
    cmd=[str(bin),*case['args'],'--out='+str(d/'output')]
    if case['kind']=='ai':cmd+=['--dag-out='+str(d/'actions.dag')]
-   gpu_paths=list(Path('/sys/class/drm').glob('card[0-9]*/device/mem_info_vram_used'));peaks={str(p):0 for p in gpu_paths};baseline={str(p):int(p.read_text()) for p in gpu_paths};stop=threading.Event();hwm=[0]
+   gpu_paths=list({p.resolve() for p in Path('/sys/class/drm').glob('card[0-9]*/device/mem_info_vram_used')});peaks={str(p):0 for p in gpu_paths};baseline={str(p):int(p.read_text()) for p in gpu_paths};stop=threading.Event();hwm=[0]
    def sample_memory(pid):
     while not stop.is_set():
      for p in gpu_paths:

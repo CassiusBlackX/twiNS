@@ -35,3 +35,15 @@ The MMU candidate additionally checks ingress admission: for ingress byte bound 
 Saturated 32-bit RDMA run counts remain unknown: virtual pushes clamp, and an exact walk that needs to pass such a run returns undecided for the caller to flag. The observed length counter is capped and is never a probability budget.
 
 `TWINS_NO_FP` disables the FP equality shortcut but continues updating/carrying the pair. `TWINS_HASH_MEMO`, `TWINS_LSID`, `TWINS_NO_SEQLOCK`, no-chain/lean/UB/mutation experiments are not accepted paper evidence builds.
+
+## Evidence versions and completion
+
+The final controlled A2 source is `48e0a3a`, archived with per-file hashes in `frozen-candidate.json`; its binaries in `build-final-*` are never rebuilt during the campaign. `6bc5a7c` adds conservative UINT32_MAX prefix handling after that evidence freeze. Candidate HIP/CUDA checks are independent and must pass before calling it validated. The optional microbenchmark defines its own corpus types; no corpus instrumentation is enabled in the default candidate simulation builds.
+
+`derive_a2.py` produces JSON, Markdown and standalone PDF figures with receipt paths and hashes. It subtracts profiling-only64MiB from tracked model allocation, and adds the TCP switch last_chain allocation omitted by the initial instrumentation ledger. RLE, history length and comparison distributions are push/comparison weighted; retained pointers do not measure distinct live sharing. The main two AI workloads have only about1.08× full-history RLE reduction.
+
+`archive_index.py` hashes completed exported evidence. `sync_results.py` verifies the local copies against that index. It never copies `remote-raw/`. `execution_status.py` keeps a cross-host Markdown status page until both pipelines and candidate gates have returned results and the indexed archive is verified. A stage returning does not imply scientific acceptance, and no script merges main or publishes a tag.
+
+The throughput cap policy is `max(1GiB, ceil(1.10 * max accepted A3 cgroup peak + 512MiB))`, frozen before batch1 with a70GiB reservation budget. Batch validation and provenance are outside actual makespan. `batch_selfcheck.py` exercises real subprocess overlap, cap admission and the validation timing boundary; `orchestration_selfcheck.py` checks the three-consecutive-sample resource classifier. Neither is simulation evidence. Own Docker cleanup uses campaign/owner/role labels after obtaining the campaign lock.
+
+Local execution uses user services with MemoryMax28G and swap allowed. `hip_candidate.sh` waits for local evidence stages to end, builds a separate HIP candidate and checks saturated-prefix handling with a finite positive control. Existing48e0 outputs are not relabeled. `mmu_boundaries.py` supports `TWINS_MMU_REPRO_OUT=/tmp/...` for isolated reproduction, followed by `validate_mmu_tx.py` for all ten TX fields and per-link order.
