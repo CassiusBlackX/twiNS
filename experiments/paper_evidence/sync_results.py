@@ -30,14 +30,18 @@ while True:
  for x in results:
   if x['label'].startswith('latency-'):groups.setdefault((x['case'],x['engine']),[]).append(x)
   elif x['label'].startswith('ablation-'):ablations.setdefault(tuple(x['options']),[]).append(x)
- now=datetime.datetime.now().astimezone().isoformat();lines=['# TwiNS s50 实验结果（自动更新）','',f'本机同步时间：{now}。','',f'已回传 {len(results)} 次尝试，{sum(bool(x["accepted"]) for x in results)} 次通过对应输出/flags 验收。校准、候选门禁与正式 A3 分组分别保存。',f'已完成 export 证据的 SHA-256 回传检查：{checked}/{check["indexed_files"]} 个文件；缺失 {len(missing)}，哈希差异 {len(bad)}。检查仅覆盖远端索引列出的已完成记录，不表示所有实验已经完成。','','| 负载 | 设置 | 完成/通过 | 中位数 s | 范围 s | 干扰疑似数 |','|---|---|---:|---:|---:|---:|']
+ now=datetime.datetime.now().astimezone().isoformat();lines=['# TwiNS s50 实验结果（自动更新）','',f'本机同步时间：{now}。','',f'已回传 {len(results)} 次尝试，{sum(bool(x["accepted"]) for x in results)} 次通过对应输出/flags 验收。校准、候选门禁与正式 A3 分组分别保存。',f'已完成 export 证据的 SHA-256 回传检查：{checked}/{check["indexed_files"]} 个文件；缺失 {len(missing)}，哈希差异 {len(bad)}。检查仅覆盖远端索引列出的已完成记录，不表示所有实验已经完成。','','| 负载 | 设置 | 完成/通过 | 中位数 s | 范围 s | 干扰疑似数 | 允许同跑次数 |','|---|---|---:|---:|---:|---:|---:|']
  for (n,e),xs in sorted(groups.items()):
   ts=[x['wall_ns']/1e9 for x in xs if x['accepted']];sus=sum(bool(x.get('interference',{}).get('suspected')) for x in xs)
-  lines.append(f'| {n} | {e} | {len(xs)}/{len(ts)} | '+(f'{statistics.median(ts):.9f} | {min(ts):.9f}–{max(ts):.9f}' if ts else '— | —')+f' | {sus} |')
+  lines.append(f'| {n} | {e} | {len(xs)}/{len(ts)} | '+(f'{statistics.median(ts):.9f} | {min(ts):.9f}–{max(ts):.9f}' if ts else '— | —')+f' | {sus} | {sum(bool((x.get("resource_context") or {}).get("co_run_allowed")) for x in xs)} |')
+ health=read(DEST/'export/health.json',{})
+ lines+=['','## 当前正在运行','','| 测量 | 引擎 | CPU mask | 内存上限 | 已运行分钟 |','|---|---|---|---:|---:|']
+ for x in health.get('active_attempts',[]):lines.append(f'| {x["label"]} | {x["engine"]} | {x["affinity"]} | {x.get("memory_limit") or "见资源记录"} | {max(0,(time.time_ns()-x["start_utc_ns"])/60e9):.1f} |')
+ lines+=['','作者要求并行后，CPU参照分配不同物理核，并可与固定core0的P0同跑；P16保留0–16并在自有CPU参照清空后单独执行。旧串行观测和新调度观测均保留，不能称全部结果来自独占整机。每次resource_context、亲和性和共同运行日志分别可查；表中中位数汇总全部已通过观测，不编造独占条件下的置信区间。']
  lines+=['','未齐三次的分组不能用于波动结论。原始点全部保留；当前早期分组的干扰分类将在延迟交接时统一用 consecutive-v2 复核。底层原始资源采样始终保留。','','## 消融','','| 参数 | 完成/通过 | 中位数 s |','|---|---:|---:|']
  for opts,xs in sorted(ablations.items()):
   ts=[x['wall_ns']/1e9 for x in xs if x['accepted']];lines.append(f'| {" ".join(opts)} | {len(xs)}/{len(ts)} | '+(f'{statistics.median(ts):.9f}' if ts else '—')+' |')
- lines+=['','## 真实整批吞吐','','验证和 provenance 在 makespan 之外。CPU cap 从已验收 A3 cgroup peak 冻结：ceil(1.10×最大峰值+512MiB)，至少 1GiB；总预算 70GiB。目标并发不能代替实际并发。','','| 批次 | 目标/实际峰值并发 | makespan s | 验证 s | 全部通过 |','|---|---:|---:|---:|---|']
+ lines+=['','## 真实整批吞吐','','验证和 provenance 在 makespan 之外。CPU cap 从已验收 A3 cgroup peak 冻结：ceil(1.10×最大峰值+512MiB)，至少 1GiB；总预留预算70GiB；不同批次可使用不重叠物理核同跑，按各批未完成作业的保守最大内存需求预留，保证不因其他批次挤占而延迟本批准入。共同运行时间线另存，不能称空机独占吞吐。目标并发不能代替实际并发。','','| 批次 | 目标/实际峰值并发 | makespan s | 验证 s | 全部通过 |','|---|---:|---:|---:|---|']
  batches=[x for p in (DEST/'export/batches-v2').glob('*.json') if (x:=read(p)) and 'makespan_ns' in x]
  for x in sorted(batches,key=lambda v:v['label']):lines.append(f'| {x["label"]} | {x["target_concurrency"]}/{x["peak_actual_concurrency"]} | {x["makespan_ns"]/1e9:.9f} | {x["validation_ns"]/1e9:.9f} | {x["all_accepted"]} |')
  if not batches:lines+=['','尚无已完成的正式批次。']

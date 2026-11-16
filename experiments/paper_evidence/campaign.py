@@ -118,7 +118,7 @@ def audit_interference(samples,engine,cpu=0):
   fractions.append(fraction);cpu_busy.append(fraction is not None and fraction>.20)
  return dict(foreign_gpu_samples_above20=sum(gpu),bound_cpu_samples_above20=sum(cpu_busy),longest_gpu_streak=streak(gpu),longest_cpu_streak=streak(cpu_busy),suspected=streak(gpu)>=3 or streak(cpu_busy)>=3,sampling_period_s=5,bound_cpus=sorted(cpus),cpu_foreign_busy_fractions=fractions,scope='observed foreign GPU presence plus utilization; bound logical-CPU busy minus own process-tree ticks; no SMT isolation guarantee',classifier='consecutive-v2')
 
-def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
+def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False,resource_context=None):
  d=EXPORT/'attempts'/label
  if (d/'result.json').exists() and not repeat: return json.loads((d/'result.json').read_text())
  if d.exists() and repeat:
@@ -141,7 +141,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
  actual_inputs=([SD/'astra-sim-alibabacloud/inputs/config/SimAI.conf',AIROOT/f'wl/paper/{n.replace("_hpn","_")}.txt',AIROOT/f'topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100'] if engine=='simai' else [ROOT/'validation/simai/SimAI.conf',ROOT/f'data/simai/hpn{g}.topo',ROOT/f'out/simai/wl/paper/{n.replace("_hpn","_")}.txt'])
  before=snapshot(); start_utc=time.time_ns(); start=time.perf_counter_ns(); timedout=False
  env={**os.environ,'AS_SEND_LAT':'3'};env.pop('TWINS_TRACE',None);env.pop('TWINS_TXTRACE',None)
- save(d/'started.json',dict(case=n,engine=engine,command=cmd,start_utc_ns=start_utc,pre=before,timeout_s=M['timeout_s'],input_sha256={str(x):sha(x) for x in actual_inputs},reference_uid_sha256=sha(ROOT/f'out/simai/paper/{n}.ref'),reference_dag_sha256=sha(ROOT/f'out/simai/paper/{n}.dag')))
+ save(d/'started.json',dict(case=n,engine=engine,command=cmd,start_utc_ns=start_utc,pre=before,timeout_s=M['timeout_s'],resource_context=resource_context,input_sha256={str(x):sha(x) for x in actual_inputs},reference_uid_sha256=sha(ROOT/f'out/simai/paper/{n}.ref'),reference_dag_sha256=sha(ROOT/f'out/simai/paper/{n}.dag')))
  start_utc=time.time_ns();start=time.perf_counter_ns()
  with (d/'process.log').open('w') as f:
   p=sp.Popen(cmd,cwd=raw,stdout=f,stderr=sp.STDOUT,env=env,start_new_session=True)
@@ -159,6 +159,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
   elapsed=time.perf_counter_ns()-start; end_utc=time.time_ns();stop.set();t.join(20)
  # Validation is outside timed interval, and outside the next run's interval in latency mode.
  result=dict(label=d.name,case=n,engine=engine,options=list(options),command=cmd,start_utc_ns=start_utc,end_utc_ns=end_utc,wall_ns=elapsed,rc=rc,timeout=timedout,memory_cap_gib=cap if engine=='simai' else None,affinity=str(cpu) if engine=='simai' else affinity,requested_island_workers=16 if engine=='p16' else 0,post=snapshot(),binary_sha256=sha(SD/SIMBIN.removeprefix('/simai/')) if engine=='simai' else sha(BIN/'twins-ai'))
+ result['resource_context']=resource_context
  try:
   if engine=='simai':
    fct=raw/'etc/simulation/llama_hpn7_fct.txt'
@@ -184,7 +185,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False):
  # Retain hashes and failure examples. Successful bulk traces and generated SimAI text are discarded.
  if result['accepted']:
   for file in [raw/'messages',raw/'actions.dag',raw/'etc/simulation/llama_hpn7_fct.txt']:
-   if file.exists():file.unlink()
+   with contextlib.suppress(FileNotFoundError):file.unlink()
  print(json.dumps({k:result[k] for k in ('label','case','engine','wall_ns','status')}),flush=True)
  return result
 

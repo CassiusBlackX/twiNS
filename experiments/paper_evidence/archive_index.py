@@ -16,4 +16,7 @@ def update(root):
    files[key]=dict(bytes=st.st_size,mtime_ns=st.st_mtime_ns,sha256=h.hexdigest())
  for p in (exp/'provenance-supplement').rglob('*'):
   if p.is_file():files[str(p.relative_to(exp))]=dict(bytes=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns,sha256=hashlib.sha256(p.read_bytes()).hexdigest())
+ for p in (exp/'parallel').glob('*'):
+  if p.is_file() and p.name not in ('active.json','batches-active.json','admission-wait.json') and not p.name.endswith('.tmp'):
+   files[str(p.relative_to(exp))]=dict(bytes=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns,sha256=hashlib.sha256(p.read_bytes()).hexdigest())
  v=dict(utc_ns=time.time_ns(),scope='completed exported receipts and retrospective input provenance; no remote-raw traces',files=files);tmp=dest.with_suffix('.tmp');tmp.write_text(json.dumps(v,indent=2)+'\n');tmp.replace(dest)

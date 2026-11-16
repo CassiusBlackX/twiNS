@@ -15,8 +15,15 @@ while True:
    shutil.rmtree(raw)
    with (EXP/'raw-cleanup.jsonl').open('a') as f:f.write(json.dumps(dict(label=p.parent.name,utc_ns=time.time_ns(),reason='validated; timing, hashes, counts, logs and resources retained in export'))+'\n')
  update(ROOT)
- services=subprocess.run(['systemctl','--user','show','twins-evidence-campaign','twins-evidence-after-latency','twins-evidence-batches','-p','Id','-p','ActiveState','-p','SubState','-p','Result'],capture_output=True,text=True)
- health=dict(utc_ns=time.time_ns(),free_bytes=shutil.disk_usage(ROOT).free,services=services.stdout)
+ services=subprocess.run(['systemctl','--user','show','twins-evidence-campaign','twins-evidence-after-latency','twins-evidence-parallel-latency','twins-evidence-batches','-p','Id','-p','ActiveState','-p','SubState','-p','Result'],capture_output=True,text=True)
+ active=[]
+ for p in (EXP/'attempts').glob('*/started.json'):
+  if (p.parent/'result.json').exists():continue
+  try:
+   v=json.loads(p.read_text());cmd=v['command'];key='--cpuset-cpus' if v['engine']=='simai' else '-c';affinity=cmd[cmd.index(key)+1]
+   active.append(dict(label=p.parent.name,engine=v['engine'],affinity=affinity,start_utc_ns=v['start_utc_ns'],memory_limit=cmd[cmd.index('--memory')+1] if '--memory' in cmd else None))
+  except (OSError,ValueError,KeyError):pass
+ health=dict(utc_ns=time.time_ns(),free_bytes=shutil.disk_usage(ROOT).free,services=services.stdout,active_attempts=active)
  tmp=EXP/'health.json.tmp';tmp.write_text(json.dumps(health,indent=2));tmp.replace(EXP/'health.json')
  if (EXP/'all-finished.json').exists():break
  time.sleep(30)

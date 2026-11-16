@@ -73,9 +73,10 @@ def validate(task):
   shutil.rmtree(raw)
  return v
 
-def batch(label,engine,concurrency,policy):
+def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,reservation_update=None,cancel_event=None):
  receipt=BROOT/(label+'.json')
  if receipt.exists():return
+ cpu_pool=list(range(16)) if cpu_pool is None else list(cpu_pool)
  if __import__('shutil').disk_usage(OUT).free<10<<30:raise RuntimeError('less than 10GiB free before batch')
  trialno=1
  while (BROOT/f'{label}-trial{trialno}').exists():trialno+=1
@@ -98,11 +99,12 @@ def batch(label,engine,concurrency,policy):
  thread=threading.Thread(target=monitor);thread.start();start=time.perf_counter_ns();utc=time.time_ns()
  try:
   while queue or active:
+   if cancel_event is not None and cancel_event.is_set():raise InterruptedError('parallel controller cancelled the batch')
    for task in list(queue):
     if len(active)>=concurrency:break
     cap=policy['jobs'][task['j']['case']]['cap_gib'] if engine=='simai' else 0
     if engine=='simai' and reserved+cap>70:continue
-    cpu=next(i for i in range(16) if i not in [t['cpu'] for t in active]);task['cpu']=cpu
+    cpu=next(i for i in cpu_pool if i not in [t['cpu'] for t in active]);task['cpu']=cpu
     if engine=='simai':
      ix=task['v']['command'].index('--cpuset-cpus');task['v']['command'][ix+1]=str(cpu);task['v']['affinity']=str(cpu)
     task=launch(task);queue.remove(task);active.append(task);reserved+=cap;peak=max(peak,len(active));events.append(dict(ns=time.perf_counter_ns()-start,action='admit',case=task['j']['case'],cpu=cpu,reserved_gib=reserved,active=len(active)))
@@ -116,6 +118,13 @@ def batch(label,engine,concurrency,policy):
     task['log'].close();active.remove(task);done.append(task)
     if engine=='simai':reserved-=policy['jobs'][task['j']['case']]['cap_gib']
     events.append(dict(ns=end-start,action='finish',case=task['j']['case'],reserved_gib=reserved,active=len(active)))
+   if reservation_update and engine=='simai':
+    remaining=queue+active
+    # Bound every possible future admission; releasing this quota cannot delay this batch.
+    bound=min(70,sum(sorted((policy['jobs'][t['j']['case']]['cap_gib'] for t in remaining),reverse=True)[:concurrency]))
+    keep=[t['cpu'] for t in active]
+    keep += [i for i in cpu_pool if i not in keep][:max(0,min(concurrency,len(remaining))-len(keep))]
+    reservation_update(bound,keep)
    if active:time.sleep(.01)
   elapsed=time.perf_counter_ns()-start
  except BaseException as exc:
@@ -126,6 +135,7 @@ def batch(label,engine,concurrency,policy):
   for task in active:stop(task);task['log'].close()
  validation_start=time.perf_counter_ns();results=[validate(t) for t in done];validation_ns=time.perf_counter_ns()-validation_start
  result=dict(label=label,trial=trial.name,engine=engine,start_utc_ns=utc,makespan_ns=elapsed,validation_ns=validation_ns,target_concurrency=concurrency,peak_actual_concurrency=peak,budget_gib=70,events=events,all_accepted=all(v['accepted'] for v in results),jobs=[v['case'] for v in results],timing_scope='startup + stub + execution + admission; validation/provenance outside batch timer')
+ result.update(cpu_pool=cpu_pool,resource_context=resource_context)
  c.save(receipt,result);c.save(trial/'state.json',dict(status='completed',result=result));print(json.dumps(result),flush=True)
 
 def main():

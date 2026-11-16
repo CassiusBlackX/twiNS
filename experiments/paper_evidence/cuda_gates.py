@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Post-latency candidate validation. It does not replace or relabel frozen A1 timings."""
-import csv,hashlib,json,re,subprocess,time
+import csv,hashlib,json,re,subprocess,time,os
 from pathlib import Path
 import campaign as c
 ROOT=c.ROOT;CAND=ROOT/'candidate';OUT=c.EXPORT/'candidate-gates';OUT.mkdir(exist_ok=True)
+# The parallel latency parent uses a housekeeping core. This standalone post-latency
+# build/gate stage can use all physical cores; model affinity remains explicit below.
+os.sched_setaffinity(0,set(range(16)))
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def run(name,cmd,timeout=3600):
  d=OUT/name;d.mkdir(exist_ok=True);start=time.perf_counter_ns()
