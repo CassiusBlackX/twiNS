@@ -2,6 +2,7 @@
 """Pull only exported receipts, checksums, small inputs and build records; never remote-raw."""
 import datetime,hashlib,json,statistics,subprocess,time
 from pathlib import Path
+from progress_estimate import estimate,local_time
 HERE=Path('/home/cassius/Work/SpecDES/twiNS/out/paper-evidence-20261116');DEST=HERE/'s50';DEST.mkdir(parents=True,exist_ok=True)
 REMOTE='s50:Videos/twins-paper-evidence-20261116/out/paper-evidence-20261116/'
 def read(p,default=None):
@@ -47,6 +48,10 @@ while True:
  if not batches:lines+=['','尚无已完成的正式批次。']
  gate=read(DEST/'export/candidate-gates/summary.json');health=read(DEST/'export/health.json',{})
  lines+=['','## 队列与版本','','候选 CUDA 门禁：'+(str(gate.get('status')) if gate else '尚无最终验收摘要')+'。A3 固定 A1 二进制与后续修复候选分别归档，不混合求中位数。',f'最近远端空闲空间：{health.get("free_bytes",0)/2**30:.2f} GiB（健康采样 utc_ns={health.get("utc_ns")}）。','','```text',health.get('services','尚未回传健康采样'),'```','','计划见 [experiment_plan_20261116.md](experiment_plan_20261116.md)，已验收解释见 [experiment_results_20261116.md](experiment_results_20261116.md)。原始纳秒、哈希、校验、资源采样保存在本机 `twiNS/out/paper-evidence-20261116/s50/export/`。大体积 trace 未回传。']
+ progress=estimate(HERE)
+ if progress['latency_finished_utc_ns']:
+  lines[4:4]=['',f'A3及消融已于{local_time(progress["latency_finished_utc_ns"])}完成；CUDA门禁{progress["cuda_gate_status"]}。当前只剩吞吐固定矩阵。','']
+ if progress['remaining_s'] is not None:lines+=['',f'剩余约{progress["remaining_s"]/3600:.1f}小时；预计{local_time(progress["estimated_finish_utc_ns"])}，含余量至{local_time(progress["buffered_finish_utc_ns"])}。见[自动排期](experiment_schedule_20261116.md)。']
  content='\n'.join(lines)+'\n';(HERE/'reports/experiment_results_live_20261116.md').write_text(content);Path('/home/cassius/Projects/TwiNS/experiment_results_live_20261116.md').write_text(content)
  finished=read(DEST/'export/all-finished.json')
  if finished and check['complete'] and (index.get('utc_ns',0)>=finished['utc_ns']):break
