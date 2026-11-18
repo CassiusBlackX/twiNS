@@ -58,6 +58,15 @@ __device__ inline void frame_copy(Frame *d, const Frame *s)
 // ------------------------------------------------------------------ ns-3 event order
 #include "chain_tcp.h"
 
+__device__ inline ChainWord arrival_code(const Frame &p)
+{
+#ifdef TWINS_LINK_TIMING
+    return chain_lead(p.arrival_lead);
+#else
+    return chain_arrival(p.len);
+#endif
+}
+
 __device__ inline uint32_t payload_of(const Frame &p) { return (p.flags & F_DATA) ? p.len - 42u : 0u; }
 
 // ------------------------------------------------------------------ egress FIFO
@@ -72,7 +81,7 @@ struct Fifo
     int64_t last_start; // start of the transmission in progress
     int64_t woke = -1;  // a ScheduleNow'd event runs at this instant (see enqueue)
     int64_t idle_start = -1; // the last start at an idle link (this slot)
-    uint16_t *last_chain; // [CHAIN] chain of the transmission in progress (persistent)
+    ChainWord *last_chain; // [CHAIN] chain of the transmission in progress (persistent)
     int id = -1;        // host h, or H + switch port (tracing)
     int red_k = RED_K, qcap = QDISC_CAP;
     Frame *out;        // this slot's message
@@ -83,23 +92,32 @@ struct Fifo
     // start every frame whose transmission begins at or before `until` (and in this slot)
     __device__ __forceinline__ void advance(int64_t until)
     {
-        while (size > 0 && sent < MAX_TX)
+        while (size > 0 && sent < tx_capacity(*s))
         {
             Frame &f = ring[head];
             int64_t start = f.ts > link_free ? f.ts : link_free;
             if (start > until || start >= slot_end)
                 return;
-            int64_t end = start + (int64_t)f.len * PS_PER_BYTE;
+#ifdef TWINS_LINK_TIMING
+            int64_t duration = s->tx_ps[size_t(s->rate_index[id]) * (DATA_FRAME + 1) + f.len];
+#else
+            int64_t duration = (int64_t)f.len * PS_PER_BYTE;
+#endif
+            int64_t end = start + duration;
             Frame o = f;
             // the event that starts this transmission: the frame's own enqueue on an idle link
             // (o.chain is already the enqueue event's chain), else the TransmitComplete of the
             // previous frame, scheduled when that one started
             if (f.ts <= link_free && link_free > last_start) // (a link that never sent is idle)
             {
-                uint16_t prev[CHAIN];
+                ChainWord prev[CHAIN];
                 for (int i = 0; i < CHAIN; i++)
                     prev[i] = last_chain[i];
+#ifdef TWINS_LINK_TIMING
+                chain_push(o.chain, chain_lead(link_free - last_start), prev);
+#else
                 chain_push(o.chain, chain_tc((int)((link_free - last_start) / PS_PER_BYTE)), prev);
+#endif
             }
             else
             {
@@ -108,14 +126,29 @@ struct Fifo
             for (int i = 0; i < CHAIN; i++)
                 last_chain[i] = o.chain[i];
             last_start = start;
+#ifdef TWINS_LINK_TIMING
+            o.arrival_lead = duration + s->delay_ps[id];
+            o.ts = start + o.arrival_lead;
+            int64_t arrival_slot = o.ts / s->slot_ps;
+            int n = msg_count(*s, arrival_slot, id);
+            if (n >= s->max_tx)
+            {
+                atomicAdd(&s->ev[19], 1ull);
+                return;
+            }
+            frame_copy(s->msg + size_t(mi(*s, arrival_slot, id)) * s->max_tx + n, &o);
+            msg_set(*s, arrival_slot, id, n + 1);
+            atomicMax(s->last_arrival_slot, (unsigned long long)arrival_slot);
+#else
             o.ts = end + PROP_PS;
             frame_copy(&out[sent], &o);
+#endif
             sent++;
             link_free = end;
             head = (head + 1) % s->ring;
             size--;
         }
-        if (size > 0 && sent >= MAX_TX)
+        if (size > 0 && sent >= tx_capacity(*s))
         {
             atomicAdd(&s->ev[4], 1ull);
 #ifdef NS_TRACE_CAP
@@ -232,7 +265,7 @@ struct HostCtx
     Fifo *nic;
     int h;
     int dctcp, cubic; // the host's TCP
-    uint16_t echain[CHAIN]; // ns-3 event-order chain of the event being processed
+    ChainWord echain[CHAIN]; // ns-3 event-order chain of the event being processed
     Due *due;               // timers due in this slot, sorted; [*id, *nd) are pending
     int *nd, *id;
     int64_t slot_end;
@@ -272,14 +305,17 @@ __device__ inline void due_insert(HostCtx &c, int64_t at, int f, int kind)
 }
 
 // a timer scheduled by the current event: its chain is [lead] + the event's chain
-__device__ inline void timer_chain(HostCtx &c, uint16_t *base, int f, int64_t lead)
+__device__ inline void timer_chain(HostCtx &c, ChainWord *base, int f, int64_t lead)
 {
+#ifndef TWINS_LINK_TIMING
     if (lead < 2 * SLOT_PS)
     {
         // (no timer of the model is this short: its code would not order above the arrivals')
         atomicAdd(&c.s->ev[25], 1ull);
         atomicAdd(&c.s->ev[26 + TIE_SHORT], 1ull);
+        atomicAdd(&c.s->ties_w[c.h / c.s->H1], 1ull);
     }
+#endif
     chain_push(base + (size_t)f * CHAIN, chain_lead(lead), c.echain);
 }
 
@@ -2043,15 +2079,16 @@ __device__ inline void on_delack(HostCtx &c, int f, int64_t now)
     send_ack(c, f, F.rcv_nxt[f], false, false, now);
 }
 
-__device__ inline void add_active(const Sim &s, int *list, int *n, int f, int h)
+__device__ inline void add_active(const Sim &s, int *list, int *n, const int *offset, int f, int h)
 {
     int k = n[h];
-    if (k >= MAX_ACTIVE)
+    if (k >= offset[h + 1] - offset[h])
     {
         atomicAdd(&s.ev[5], 1ull);
+        atomicAdd(&s.active_ovf_w[h / s.H1], 1ull);
         return;
     }
-    list[(size_t)h * MAX_ACTIVE + k] = f;
+    list[offset[h] + k] = f;
     n[h] = k + 1;
 }
 
@@ -2103,7 +2140,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
                 rtt_sample(F, f, now - F.timing_time[f]);
                 emit(c, f, F_ACK, 0, 0, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
                 // ConnectionSucceeded (ScheduleNow) lets the application write its due messages
-                uint16_t parent[CHAIN];
+                ChainWord parent[CHAIN];
                 for (int i = 0; i < CHAIN; i++)
                     parent[i] = c.echain[i];
                 chain_push(c.echain, CHAIN_NOW, parent);
@@ -2150,13 +2187,13 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
             // ns-3 enters ESTABLISHED with the delayed-ACK count at its maximum, so the first
             // data segment is acknowledged at once
             F.delack_count[f] = MUT(24) ? 0 : DELACK_COUNT;
-            add_active(s, s.hs.act_rcv, s.hs.n_rcv, f, c.h);
+            add_active(s, s.hs.act_rcv, s.hs.n_rcv, s.hs.rcv_offset, f, c.h);
         }
         if (F.r_est[f])
             return; // ESTABLISHED: a duplicate SYN
         // the SYN-ACK is sent from CompleteFork, which the SYN's arrival schedules (ScheduleNow)
         c.nic->woke = now;
-        uint16_t parent[CHAIN];
+        ChainWord parent[CHAIN];
         for (int i = 0; i < CHAIN; i++)
             parent[i] = c.echain[i];
         chain_push(c.echain, CHAIN_NOW, parent);
@@ -2180,9 +2217,9 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
 
 
 // the event-order chain of a timer
-__device__ inline const uint16_t *due_chain(const FlowSoA &F, const Due &d)
+__device__ inline const ChainWord *due_chain(const FlowSoA &F, const Due &d)
 {
-    const uint16_t *base = d.kind == 1 || d.kind == 3 || d.kind == 4 ? F.dchain
+    const ChainWord *base = d.kind == 1 || d.kind == 3 || d.kind == 4 ? F.dchain
                            : d.kind == 5 || (d.kind == 2 && F.st[d.flow] == S_EST) ? F.schain
                                                                                     : F.rchain;
     return base + (size_t)d.flow * CHAIN;
@@ -2213,17 +2250,17 @@ __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due
 }
 
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
-__device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p)
+__device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p, int h)
 {
-    uint16_t arr[CHAIN];
-    chain_push(arr, chain_arrival(p.len), p.chain);
+    ChainWord arr[CHAIN];
+    chain_push(arr, arrival_code(p), p.chain);
     int why;
     int r = chain_cmp(due_chain(F, d), arr, &why);
     if (r == 0)
     {
         atomicAdd(&s.ev[25], 1ull);
         atomicAdd(&s.ev[26 + why], 1ull);
-        atomicAdd(&s.ties_w[(p.dst_node % s.H) / s.H1], 1ull);
+        atomicAdd(&s.ties_w[h / s.H1], 1ull);
     }
     return MUT(20) ? r >= 0 : r <= 0; // (undecided: the timer)
 }
@@ -2233,7 +2270,7 @@ __device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, 
 // one slot of host h; returns 1 if it sent or holds frames; *wake: the next slot it must run
 __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_t *wake)
 {
-    const int64_t S0 = t * SLOT_PS, E0 = S0 + SLOT_PS;
+    const int64_t S0 = t * slot_width(s), E0 = S0 + slot_width(s);
     const HostSoA &hs = s.hs;
     const FlowSoA &F = s.fl;
     // received frames: the tail of slot t-2's message arriving from S0 on, then the head
@@ -2241,6 +2278,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     int link = s.host_in_link[h];
     const Frame *m2 = nullptr, *m1 = nullptr;
     int n2 = 0, n1 = 0, i2 = 0;
+#ifdef TWINS_LINK_TIMING
+    n1 = msg_count(s, t, link);
+    m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+#else
     if (t >= 2)
     {
         n2 = msg_count(s, t - 2, link);
@@ -2253,6 +2294,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         n1 = msg_count(s, t - 1, link);
         m1 = s.msg + (size_t)mi(s, t - 1, link) * MAX_TX;
     }
+#endif
     int i1 = 0;
     bool input = i2 < n2 || (n1 > 0 && m1[0].ts < E0);
     int out_slot = (int)mi(s, t, h);
@@ -2269,7 +2311,9 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     nic.last_chain = hs.last_chain + (size_t)h * CHAIN;
     nic.id = h;
     nic.last_start = hs.last_start[h];
+#ifndef TWINS_LINK_TIMING
     nic.out = s.msg + (size_t)out_slot * MAX_TX;
+#endif
     nic.sent = 0;
     nic.slot_end = E0;
     nic.s = &s;
@@ -2283,7 +2327,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     int ns = hs.n_snd[h], nr = hs.n_rcv[h];
     for (int i = 0; i < ns; i++)
     {
-        int f = hs.act_snd[(size_t)h * MAX_ACTIVE + i];
+        int f = hs.act_snd[hs.snd_offset[h] + i];
         int64_t a = F.rto_at[f], b = F.syn_at[f];
         if (a >= 0 && a < E0 && nd < MAX_DUE)
             due[nd++] = {a, f, 0};
@@ -2292,7 +2336,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     }
     for (int i = 0; i < nr; i++)
     {
-        int f = hs.act_rcv[(size_t)h * MAX_ACTIVE + i];
+        int f = hs.act_rcv[hs.rcv_offset[h] + i];
         int64_t a = F.delack_at[f], b = F.srv_syn_at[f], l = F.r_last_at[f], x = F.r_frx_at[f];
         if (a >= 0 && a < E0 && nd < MAX_DUE)
             due[nd++] = {a, f, 1};
@@ -2357,7 +2401,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             int m = hs.pend_msg[pn++], f = s.mg.conn[m];
             chain_set_root(c.echain, s.app_key[f]); // application starts are scheduled at setup, host by host
             F.m_due[f] = 1;
-            add_active(s, hs.act_snd, hs.n_snd, f, h);
+            add_active(s, hs.act_snd, hs.n_snd, hs.snd_offset, f, h);
             F.st[f] = S_SYN_SENT;
             if (c.cubic)
                 cub_hystart_reset(F, f, now); // TcpCubic::Init when the socket is created
@@ -2368,10 +2412,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
         }
-        else if (now == td && (now != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1])))
+        else if (now == td && (now != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h)))
         {
             Due d = due[id++];
-            const uint16_t *tc = due_chain(F, d);
+            const ChainWord *tc = due_chain(F, d);
             for (int i = 0; i < CHAIN; i++)
                 c.echain[i] = tc[i];
             if (d.kind == 0 && F.rto_at[d.flow] == d.at)
@@ -2423,12 +2467,14 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         else
         {
             Frame p = i2 < n2 ? m2[i2++] : m1[i1++];
-            chain_push(c.echain, chain_arrival(p.len), p.chain);
+            chain_push(c.echain, arrival_code(p), p.chain);
             on_frame(c, p, now);
         }
     }
     nic.advance(E0 - 1);
+#ifndef TWINS_LINK_TIMING
     msg_set(s, t, h, nic.sent);
+#endif
     hs.q_head[h] = nic.head;
     hs.q_size[h] = nic.size;
     hs.link_free[h] = nic.link_free;
@@ -2441,10 +2487,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         int k = 0;
         for (int i = 0; i < ns; i++)
         {
-            int f = hs.act_snd[(size_t)h * MAX_ACTIVE + i];
+            int f = hs.act_snd[hs.snd_offset[h] + i];
             if (F.st[f] == S_DONE)
                 continue;
-            hs.act_snd[(size_t)h * MAX_ACTIVE + k++] = f;
+            hs.act_snd[hs.snd_offset[h] + k++] = f;
             int64_t a = F.rto_at[f], b = F.syn_at[f];
             if (a >= 0 && a < next)
                 next = a;
@@ -2454,10 +2500,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         // flows added during this slot sit after index ns
         for (int i = ns; i < hs.n_snd[h]; i++)
         {
-            int f = hs.act_snd[(size_t)h * MAX_ACTIVE + i];
+            int f = hs.act_snd[hs.snd_offset[h] + i];
             if (F.st[f] == S_DONE)
                 continue;
-            hs.act_snd[(size_t)h * MAX_ACTIVE + k++] = f;
+            hs.act_snd[hs.snd_offset[h] + k++] = f;
             int64_t a = F.rto_at[f], b = F.syn_at[f];
             if (a >= 0 && a < next)
                 next = a;
@@ -2471,10 +2517,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         int nr2 = hs.n_rcv[h];
         for (int i = 0; i < nr2; i++)
         {
-            int f = hs.act_rcv[(size_t)h * MAX_ACTIVE + i];
+            int f = hs.act_rcv[hs.rcv_offset[h] + i];
             if (F.st[f] == S_DONE && F.delack_at[f] < 0 && F.r_last_at[f] < 0 && F.r_frx_at[f] < 0)
                 continue;
-            hs.act_rcv[(size_t)h * MAX_ACTIVE + k++] = f;
+            hs.act_rcv[hs.rcv_offset[h] + k++] = f;
             int64_t a = F.delack_at[f], b = F.srv_syn_at[f], l = F.r_last_at[f], x = F.r_frx_at[f];
             if (a >= 0 && a < next)
                 next = a;
@@ -2493,7 +2539,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         if (st < next)
             next = st;
     }
-    hs.wake[h] = nic.size > 0 ? t + 1 : (next == INT64_MAX ? INT64_MAX : next / SLOT_PS);
+    hs.wake[h] = nic.size > 0 ? t + 1 : (next == INT64_MAX ? INT64_MAX : next / slot_width(s));
     *wake = hs.wake[h];
     return (nic.sent > 0 || nic.size > 0) ? 1 : 0;
 }
@@ -2623,10 +2669,14 @@ struct Input
 
 __device__ inline Input input_of(const Sim &s, int link, int64_t t)
 {
-    const int64_t S0 = t * SLOT_PS, E0 = S0 + SLOT_PS;
+    const int64_t S0 = t * slot_width(s), E0 = S0 + slot_width(s);
     Input in{nullptr, nullptr, 0, 0, 0};
     if (link < 0)
         return in; // an unused port
+#ifdef TWINS_LINK_TIMING
+    in.n1 = msg_count(s, t, link);
+    in.m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+#else
     if (t >= 2)
     {
         in.n2 = msg_count(s, t - 2, link);
@@ -2641,6 +2691,7 @@ __device__ inline Input input_of(const Sim &s, int link, int64_t t)
         while (in.n1 < n && in.m1[in.n1].ts < E0)
             in.n1++;
     }
+#endif
     return in;
 }
 
@@ -2654,24 +2705,29 @@ __device__ inline Input input_cached(const Sim &s, const SwScratch &sc, int sw, 
     in.i2 = sc.in_win[3 * iq];
     in.n2 = sc.in_win[3 * iq + 1];
     in.n1 = sc.in_win[3 * iq + 2];
+#ifdef TWINS_LINK_TIMING
+    in.m2 = nullptr;
+    in.m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+#else
     in.m2 = t >= 2 ? s.msg + (size_t)mi(s, t - 2, link) * MAX_TX : nullptr;
     in.m1 = t >= 1 ? s.msg + (size_t)mi(s, t - 1, link) * MAX_TX : nullptr;
+#endif
     return in;
 }
 
 // arrivals at the same instant, as ns-3 orders their Receive events: the longer frame started
 // earlier upstream; else by the chains of the upstream transmission starts
-__device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b)
+__device__ inline bool frame_before(const Sim &s, const Frame &a, const Frame &b, int sw)
 {
-    if (a.len != b.len)
-        return a.len > b.len;
+    if (arrival_code(a) != arrival_code(b))
+        return arrival_code(a) > arrival_code(b);
     int why;
     int c = chain_cmp(a.chain, b.chain, &why);
     if (c == 0)
     {
         atomicAdd(&s.ev[25], 1ull); // the recorded histories do not tell: a guess
         atomicAdd(&s.ev[26 + why], 1ull);
-        atomicAdd(&s.ties_w[(a.dst_node % s.H) / s.H1], 1ull);
+        atomicAdd(&s.ties_w[sw / s.S1], 1ull);
     }
     return c != 0 ? c < 0 : a.flow < b.flow;
 }
@@ -2695,7 +2751,7 @@ __device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw
             if (sc.mpos[q] >= in.count())
                 continue;
             const Frame &f = in.at(sc.mpos[q]);
-            if (best < 0 || f.ts < bf->ts || (f.ts == bf->ts && !MUT(22) && frame_before(s, f, *bf)))
+            if (best < 0 || f.ts < bf->ts || (f.ts == bf->ts && !MUT(22) && frame_before(s, f, *bf, sw)))
             {
                 best = q;
                 bf = &f;
@@ -2711,7 +2767,7 @@ __device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw
         }
         int nr = routes_to(s, sw, bf->dst_node, ep);
         uint32_t up = nr ? nsm_rng::get_integer(st, (uint32_t)nr) : 0;
-        sc.up[best * 2 * MAX_TX + sc.mpos[best]] = (uint8_t)up;
+        sc.up[best * 2 * tx_capacity(s) + sc.mpos[best]] = (uint8_t)up;
         sc.mpos[best]++;
     }
     s.sw_rng[sw] = st;
@@ -2721,7 +2777,7 @@ __device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw
 __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool active, SwScratch sc)
 {
     const int k = s.k;
-    const int64_t S0 = t * SLOT_PS, E0 = S0 + SLOT_PS;
+    const int64_t S0 = t * slot_width(s), E0 = S0 + slot_width(s);
     int port = sw * k + q;
     Input in{nullptr, nullptr, 0, 0, 0};
     int *my_row = sc.rows + q * (k + 1);
@@ -2731,7 +2787,7 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
         int ep = GENERAL && s.n_fail ? epoch_of(s, p.ts) : 0;
         if (port_down(s, sw, q, ep))
             return -1; // dropped on arrival
-        return spray ? route_up(s, sw, p.dst_node, sc.up[q * 2 * MAX_TX + j], ep) : route(s, sw, p, ep);
+        return spray ? route_up(s, sw, p.dst_node, sc.up[q * 2 * tx_capacity(s) + j], ep) : route(s, sw, p, ep);
     };
     if (active)
     {
@@ -2810,7 +2866,7 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
         Input src = input_cached(s, sc, sw, (int)(r >> 16), t);
         return src.at(r & 0xFFFF);
     };
-    auto before = [&](uint32_t ra, uint32_t rb) { return frame_before(s, frame_at(ra), frame_at(rb)); };
+    auto before = [&](uint32_t ra, uint32_t rb) { return frame_before(s, frame_at(ra), frame_at(rb), sw); };
     for (int i = 1; i < n; i++)
     {
         int64_t x = ts[i];
@@ -2836,21 +2892,25 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
     eg.id = s.H + port;
     eg.last_start = s.ps.last_start[port];
     int out_link = s.H + port;
+#ifndef TWINS_LINK_TIMING
     eg.out = s.msg + (size_t)mi(s, t, out_link) * MAX_TX;
+#endif
     eg.sent = 0;
     eg.slot_end = E0;
     eg.s = &s;
     for (int i = 0; i < n; i++)
     {
         Frame p = frame_at(ref[i]);
-        uint16_t up[CHAIN];
+        ChainWord up[CHAIN];
         for (int i = 0; i < CHAIN; i++)
             up[i] = p.chain[i];
-        chain_push(p.chain, chain_arrival(p.len), up); // queued: the arrival event's chain
+        chain_push(p.chain, arrival_code(p), up); // queued: the arrival event's chain
         eg.enqueue(p, p.ts);
     }
     eg.advance(E0 - 1);
+#ifndef TWINS_LINK_TIMING
     msg_set(s, t, out_link, eg.sent);
+#endif
     s.ps.q_head[port] = eg.head;
     s.ps.q_size[port] = eg.size;
     s.ps.link_free[port] = eg.link_free;

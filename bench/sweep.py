@@ -25,25 +25,6 @@ def configs(workloads, queues, Ks):
                         yield w, t, q, K
 
 
-def run_long(k, lines, wf):
-    r = subprocess.run(["./build/twins128", f"--k={k}", f"--worlds={wf}"], capture_output=True, text=True)
-    if r.returncode == 0 or len(lines) == 1:
-        if r.returncode:
-            raise SystemExit(r.stderr)
-        return r
-    half = len(lines) // 2
-    out = []
-    for i, part in enumerate((lines[:half], lines[half:])):
-        pf = f"{wf}.{i}"
-        open(pf, "w").write("\n".join(part) + "\n")
-        out.append(run_long(k, part, pf))
-    # the simulation times of the parts add up; keep the last one's report
-    d = sum(float(re.search(r"Simulation Duration: ([0-9.]+)s", x.stdout).group(1)) for x in out)
-    out[-1].stdout = re.sub(r"Simulation Duration: [0-9.]+s", f"Simulation Duration: {d:.6f}s", out[-1].stdout)
-    out[-1].stderr = "".join(x.stderr for x in out)
-    return out[-1]
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -68,24 +49,9 @@ def main():
                         f"out={a.out}/{w}_{TCP[t]}_q{q}_K{K}.csv\n")
         t0 = time.time()
         r = subprocess.run(["./build/twins", f"--k={a.k}", f"--worlds={wf}"], capture_output=True, text=True, check=True)
-        if "undecided" in r.stderr:
-            # ties the recorded histories could not decide: those worlds again, with longer
-            # histories (twice the frame memory: in halves if they do not fit)
-            m = re.search(r"undecided-ties by world:([ 0-9]*)", r.stdout)
-            lines = open(wf).read().splitlines()
-            redo = [lines[int(w)] for w in m.group(1).split()] if m else lines
-            print(f"batch {b // a.batch}: undecided ties in {len(redo)} worlds, rerun with twins128", flush=True)
-            rf = wf + ".long"
-            open(rf, "w").write("\n".join(redo) + "\n")
-            rl = run_long(a.k, redo, rf)
-            sim += float(re.search(r"Simulation Duration: ([0-9.]+)s", rl.stdout).group(1))
-            r.stderr = rl.stderr
         total += time.time() - t0
-        bad = [l for l in r.stderr.splitlines() if "warning" in l and "undecided" not in l]
-        if bad:
-            raise SystemExit(f"batch {b // a.batch}: {bad[0]}")
-        if "undecided" in r.stderr:
-            print(f"batch {b // a.batch}: ties still undecided with twins128 (results may differ from ns-3)", flush=True)
+        if "warning:" in r.stderr:
+            raise SystemExit(f"batch {b // a.batch}: {r.stderr}")
         sim += float(re.search(r"Simulation Duration: ([0-9.]+)s", r.stdout).group(1))
         last = [l for l in r.stdout.splitlines() if l.startswith("flows ")][-1]
         print(f"batch {b // a.batch}: {min(a.batch, len(cfg) - b)} worlds, {last[:90]}", flush=True)

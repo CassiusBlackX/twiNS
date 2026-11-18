@@ -35,6 +35,13 @@ __host__ __device__ inline int twins_clz64(uint64_t x)
 // code: equal lossy codes need not be equal leads, and a comparison that meets two of them is
 // undecided). Codes of different buckets order as their leads; within a bucket the exact code
 // is the least lead. Timer leads below 2 us would not order above the arrivals' codes: counted.
+#ifdef TWINS_LINK_TIMING
+using HistoryWord = uint64_t;
+__host__ __device__ inline HistoryWord chain_lead(int64_t ps) { return uint64_t(ps) + 1; }
+__host__ __device__ inline bool chain_lossy(HistoryWord) { return false; }
+constexpr HistoryWord CHAIN_NOW = 1, CHAIN_STEP = 2;
+#else
+using HistoryWord = uint16_t;
 __host__ __device__ inline uint16_t chain_tc(int len) { return (uint16_t)len; }
 __host__ __device__ inline uint16_t chain_arrival(int len) { return (uint16_t)(2048 + len); }
 constexpr uint16_t CHAIN_TIMER0 = 4096;
@@ -62,6 +69,7 @@ __host__ __device__ inline uint16_t chain_lead(int64_t lead_ps)
 __host__ __device__ inline bool chain_lossy(uint16_t code) { return code >= CHAIN_TIMER0 && (code & 1); }
 constexpr uint16_t CHAIN_NOW = 1, CHAIN_STEP = 2;
 
+#endif
 // A chain: the leads from an event back towards its root, run-length encoded as up to
 // CHAIN_RUNS (code, count) pairs (back-to-back transmissions form long runs of TransmitComplete
 // codes), then the root, an event scheduled before the simulation runs, as a 32-bit key in
@@ -73,20 +81,20 @@ constexpr uint16_t CHAIN_NOW = 1, CHAIN_STEP = 2;
 // there (CHAIN_CNT_SAT): the run may be longer.
 constexpr uint32_t CHAIN_ROOT_APP = 0x40000000u, CHAIN_TRUNC = 0x80000000u;
 constexpr uint16_t CHAIN_CNT_SAT = 0xFFFF;
-__host__ __device__ inline void chain_set_root(uint16_t *dst, uint32_t key)
+__host__ __device__ inline void chain_set_root(HistoryWord *dst, uint32_t key)
 {
     for (int i = 0; i < 2 * CHAIN_RUNS; i++)
         dst[i] = 0;
     dst[2 * CHAIN_RUNS] = (uint16_t)(key >> 16);
     dst[2 * CHAIN_RUNS + 1] = (uint16_t)key;
 }
-__host__ __device__ inline uint32_t chain_root_key(const uint16_t *c)
+__host__ __device__ inline uint32_t chain_root_key(const HistoryWord *c)
 {
     return (uint32_t)c[2 * CHAIN_RUNS] << 16 | c[2 * CHAIN_RUNS + 1];
 }
-__host__ __device__ inline void chain_root_msg(uint16_t *dst, int msg_local) { chain_set_root(dst, 1u + (uint32_t)msg_local); }
+__host__ __device__ inline void chain_root_msg(HistoryWord *dst, int msg_local) { chain_set_root(dst, 1u + (uint32_t)msg_local); }
 
-__host__ __device__ inline void chain_push(uint16_t *dst, uint16_t code, const uint16_t *parent)
+__host__ __device__ inline void chain_push(HistoryWord *dst, HistoryWord code, const HistoryWord *parent)
 {
 #ifdef NS_NO_CHAIN
     return;
@@ -137,7 +145,7 @@ enum : int
 // leads equal, are decided by their roots' set-up order. Every case in which the recorded
 // history cannot tell the reference's order is undecided: equal lossy codes, a truncated chain
 // that runs out, a saturated count that runs out, equal roots. (Appendix A, Lemma A.2.)
-__host__ __device__ inline int chain_cmp_impl(const uint16_t *a, const uint16_t *b, int *why, unsigned long long *steps)
+__host__ __device__ inline int chain_cmp_impl(const HistoryWord *a, const HistoryWord *b, int *why, unsigned long long *steps)
 {
     int dummy;
     if (!why)
@@ -151,7 +159,7 @@ __host__ __device__ inline int chain_cmp_impl(const uint16_t *a, const uint16_t 
 #ifdef TWINS_EVIDENCE
         ++*steps;
 #endif
-        uint16_t ca = ia < CHAIN_RUNS ? a[2 * ia] : 0, cb = ib < CHAIN_RUNS ? b[2 * ib] : 0;
+        HistoryWord ca = ia < CHAIN_RUNS ? a[2 * ia] : 0, cb = ib < CHAIN_RUNS ? b[2 * ib] : 0;
         if (ca == 0 || cb == 0)
         {
             if ((ca == 0 && ta) || (cb == 0 && tb))
@@ -209,7 +217,7 @@ __host__ __device__ inline int chain_cmp_impl(const uint16_t *a, const uint16_t 
 }
 
 
-__host__ __device__ inline int chain_cmp(const uint16_t *a,const uint16_t *b,int *why=nullptr) {
+__host__ __device__ inline int chain_cmp(const HistoryWord *a,const HistoryWord *b,int *why=nullptr) {
  unsigned long long steps=0;
  int r=chain_cmp_impl(a,b,why,&steps);
 #ifdef TWINS_EVIDENCE

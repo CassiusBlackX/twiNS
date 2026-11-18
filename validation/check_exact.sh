@@ -39,18 +39,14 @@ for w in $1; do
             topo="--k=$(echo $w | sed 's/k\([0-9]*\)_.*/\1/')"
         fi
         out=$OUT/${w}_${t}_$V.csv
-        bin=twins
         # (TwiNS computes ns-3's ECMP hashes; ECMP_FROM=1 takes them from the reference instead)
         [ -n "$ECMP_FROM" ] && X="$X --ecmp_from=$rf"
         # (TIELOG=file: append each run's undecided ties and their causes)
-        o=$(./build/twins $topo --flows=$fl --out=$out --tcp=$t $X 2>&1)
-        [ -n "$TIELOG" ] && echo "$w $t $V twins $(echo "$o" | grep -o 'undecided-ties [0-9]*') $(echo "$o" | grep 'by cause')" >> "$TIELOG"
-        if echo "$o" | grep -q "were undecided"; then
-            bin=twins128 # undecided ties: longer event histories
-            o=$(./build/twins128 $topo --flows=$fl --out=$out --tcp=$t $X 2>&1)
-            [ -n "$TIELOG" ] && echo "$w $t $V twins128 $(echo "$o" | grep -o 'undecided-ties [0-9]*') $(echo "$o" | grep 'by cause')" >> "$TIELOG"
+        o=$(./build/twins $topo --flows="$fl" --out="$out" --tcp="$t" $X 2>&1) || { echo "$o" >&2; exit 1; }
+        if [ -n "$TIELOG" ]; then
+            echo "$o" | awk -v w="$w" -v t="$t" -v v="$V" '/TCP pass/ {print w,t,v,$0}' >> "$TIELOG"
         fi
         paste -d, <(tail -n +2 $rf | cut -d, -f5,6) <(tail -n +2 $out | cut -d, -f5,6) |
-            awk -F, -v w=$w -v t=$t -v v=$V -v b=$bin '{n++; if ($1 == $3 && $2 == $4) x++} END {printf "%s %s %s: %d/%d flows identical%s\n", w, t, v, x, n, b == "twins" ? "" : " (twins128)"}'
+            awk -F, -v w=$w -v t=$t -v v=$V '{n++; if ($1 == $3 && $2 == $4) x++} END {printf "%s %s %s: %d/%d flows identical\n", w, t, v, x, n}'
     done
 done

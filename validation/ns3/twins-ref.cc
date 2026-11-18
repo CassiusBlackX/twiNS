@@ -14,6 +14,7 @@
 // connection after writing its last message (FIN with the last segment; the PacketSink peer
 // stays in CLOSE_WAIT).
 // Output CSV (one row per flow): src,dst,flow_size,start_ns,established_ns,completed_ns,hash_data,hash_ack,retx
+#include "link_timing.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
@@ -311,6 +312,7 @@ int main(int argc, char *argv[])
     // ---- a topology file: hosts, switches, links in installation order
     bool fromFile = topo == "file";
     std::vector<std::pair<std::string, std::string>> fileLinks;
+    std::vector<LinkTiming> fileTiming;
     uint32_t fileHosts = 0, fileSwitches = 0;
     if (fromFile)
     {
@@ -328,6 +330,7 @@ int main(int argc, char *argv[])
                 std::string a, b;
                 in >> a >> b;
                 fileLinks.push_back({a, b});
+                fileTiming.push_back(read_link_timing(in));
             }
             else
                 std::getline(in, key);
@@ -401,8 +404,12 @@ int main(int argc, char *argv[])
     {
         auto node = [&](const std::string &x) { return x[0] == 'h' ? hosts.Get(std::stoul(x.substr(1))) : edges.Get(std::stoul(x.substr(1))); };
         std::vector<int> hostLinks(H, 0);
+        size_t index = 0;
         for (auto &l : fileLinks)
         {
+            auto timing = fileTiming[index++];
+            p2p.SetDeviceAttribute("DataRate", DataRateValue(DataRate(timing.bps)));
+            p2p.SetChannelAttribute("Delay", TimeValue(PicoSeconds(timing.delay_ps)));
             NS_ABORT_MSG_IF(l.second[0] == 'h', "a host must be the first endpoint of its link");
             NetDeviceContainer d = p2p.Install(node(l.first), node(l.second));
             red.Install(d.Get(1));

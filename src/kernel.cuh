@@ -48,7 +48,7 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         int sw = b * s.sw_per_block + local;
         bool active = local < s.sw_per_block && sw < s.S;
         int l = active ? local : 0;
-        size_t per_sw = (size_t)s.k * 2 * MAX_TX;
+        size_t per_sw = (size_t)s.k * 2 * tx_capacity(s);
         SwScratch sc;
         sc.rows = rows + l * s.k * (s.k + 1);
         sc.base = base + l * s.k;
@@ -94,7 +94,12 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
             unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
             unsigned long long nw = atomicAdd(s.next_wake, 0ull);
             int64_t next = t + 1;
-            if (cur == 0 && prev == 0 && nw != ~0ull && (int64_t)nw > next)
+#ifdef TWINS_LINK_TIMING
+            bool flight_empty = *s.last_arrival_slot <= (unsigned long long)t;
+#else
+            bool flight_empty = true;
+#endif
+            if (flight_empty && cur == 0 && prev == 0 && nw != ~0ull && (int64_t)nw > next)
                 next = (int64_t)nw < s.max_slots ? (int64_t)nw : s.max_slots;
             s.activity[1] = cur;
             s.activity[0] = 0;

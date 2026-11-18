@@ -19,6 +19,12 @@
 namespace nsm
 {
 
+#ifdef TWINS_LINK_TIMING
+using ChainWord = uint64_t;
+#else
+using ChainWord = uint16_t;
+#endif
+
 constexpr int64_t SLOT_PS = 1000000;    // 1 us = link propagation delay
 constexpr int64_t PROP_PS = 1000000;    // link propagation delay
 constexpr int64_t PS_PER_BYTE = 80;     // 100 Gbps
@@ -97,9 +103,15 @@ struct alignas(16) Frame
     uint8_t flags;
     uint8_t to_sender;  // 1: travels to the flow's sender (ACK, SYN-ACK)
     uint16_t up;        // upward port index (flow hash % k/2), the same at every tier
-    uint16_t chain[CHAIN]; // queued: the enqueue event's chain; on a link: the start's
+#ifdef TWINS_LINK_TIMING
+    int64_t arrival_lead;
+#endif
+    ChainWord chain[CHAIN]; // queued: the enqueue event's chain; on a link: the start's
 };
-static_assert(sizeof(Frame) == 24 + 2 * CHAIN && sizeof(Frame) % 16 == 0, "Frame layout");
+#ifndef TWINS_LINK_TIMING
+static_assert(sizeof(Frame) == 24 + 2 * CHAIN, "compact frame layout");
+#endif
+static_assert(sizeof(Frame) % 16 == 0, "vector copy alignment");
 
 enum : uint8_t
 {
@@ -280,9 +292,9 @@ struct FlowSoA
 #ifdef TWINS_TCP_TIMER_ORDER
     uint64_t *timer_order; // [conns][6], scheduling sequence at this timer's host
 #endif
-    uint16_t *dchain;   // [conns][CHAIN] event-order chain of the delayed-ACK timer
-    uint16_t *rchain;   // [conns][CHAIN] ... of the retransmission (or SYN) timer
-    uint16_t *schain;   // [conns][CHAIN] ... of a pending SendPendingData (Send's TimeStep)
+    ChainWord *dchain;   // [conns][CHAIN] event-order chain of the delayed-ACK timer
+    ChainWord *rchain;   // [conns][CHAIN] ... of the retransmission (or SYN) timer
+    ChainWord *schain;   // [conns][CHAIN] ... of a pending SendPendingData (Send's TimeStep)
     // per-connection rings of cap[f] entries at off[f]: the sent list (item start, flags) and the
     // RTT history (seq, count with the retransmitted flag in bit 31, time)
     uint32_t *it_start;
@@ -310,9 +322,10 @@ struct HostSoA
     Frame *ring;      // [H][ring] egress FIFO (frames not yet started)
     int *q_head, *q_size;
     int64_t *link_free, *last_start;
-    uint16_t *last_chain; // [H][CHAIN]
+    ChainWord *last_chain; // [H][CHAIN]
     uint8_t *cc;          // [H] congestion control of the host's world
     int *red_k, *qcap;    // [H] the host qdisc's RED threshold and limit
+    int *snd_offset, *rcv_offset; // [H+1] prefix sums
     int *act_snd, *n_snd; // [H][MAX_ACTIVE], flows this host sends
     int *act_rcv, *n_rcv; // [H][MAX_ACTIVE], flows this host receives
     int *pend_next, *pend_end; // messages by (src, start): next not yet started, end of the host's range
@@ -329,7 +342,7 @@ struct PortSoA
     Frame *ring; // [S*k][ring]
     int *q_head, *q_size;
     int64_t *link_free, *last_start;
-    uint16_t *last_chain; // [S*k][CHAIN]
+    ChainWord *last_chain; // [S*k][CHAIN]
     int *red_k, *qcap;    // [S*k]
 };
 
@@ -359,6 +372,13 @@ enum : int
 
 struct Sim
 {
+#ifdef TWINS_LINK_TIMING
+    int64_t slot_ps;
+    int max_tx, banks;
+    int *rate_index;
+    int64_t *tx_ps, *delay_ps;
+    unsigned long long *last_arrival_slot;
+#endif
     int k, hk, H, S, L, F; // k: ports per switch (FatTree: its k); F: connections
     int M;                 // messages (flows)
     int H1, S1;            // hosts and switches of one world (worlds are disjoint copies)
@@ -402,14 +422,37 @@ struct Sim
     unsigned long long *qtrace_cnt;
     unsigned long long qtrace_n;
     int64_t qtrace_until, qtrace_from;
+    unsigned long long *active_ovf_w;
     unsigned long long *ties_w; // [worlds] undecided ties per world
     unsigned long long *ev; // [16] counters: drops, marks, retx, rto, tx-cap hits, active overflow, ooo overflow,
                             // due overflow, retransmissions by congestion state (8 + C_*)
 };
 
+__host__ __device__ inline int tx_capacity(const Sim &s)
+{
+#ifdef TWINS_LINK_TIMING
+    return s.max_tx;
+#else
+    return MAX_TX;
+#endif
+}
+
+__host__ __device__ inline int64_t slot_width(const Sim &s)
+{
+#ifdef TWINS_LINK_TIMING
+    return s.slot_ps;
+#else
+    return SLOT_PS;
+#endif
+}
+
 __host__ __device__ inline int64_t mi(const Sim &s, int64_t slot, int link)
 {
+#ifdef TWINS_LINK_TIMING
+    return (slot % s.banks) * s.L + link;
+#else
     return (slot & (NB - 1)) * s.L + link;
+#endif
 }
 
 // frames in link's message of slot `slot` (0 if that ring entry was last written for another slot)

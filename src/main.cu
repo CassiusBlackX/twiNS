@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+#include <numeric>
+#include <unistd.h>
 #include <map>
 #include <sstream>
 #include <string>
@@ -12,6 +15,7 @@
 #include <vector>
 
 #include "model.h"
+#include "link_timing.h"
 #include "evidence.h"
 #include "ns3hash.h"
 
@@ -36,16 +40,21 @@ constexpr int BLOCK = 32;
 __constant__ Sim c_sim;
 
 // the two variants of the model (see step.cuh)
+#ifndef TWINS_LINK_TIMING
 #define TWINS_GENERAL 0
 #define TWINS_NS kbasic
 #include "step.cuh"
 #include "kernel.cuh"
 #undef TWINS_GENERAL
 #undef TWINS_NS
+#endif
 #define TWINS_GENERAL 1
 #define TWINS_NS kfull
 #include "step.cuh"
 #include "kernel.cuh"
+#ifdef TWINS_LINK_TIMING
+namespace kbasic = kfull;
+#endif
 using kfull::Due;
 
 
@@ -150,6 +159,21 @@ int h_mut = 0; // (model.h)
 
 int main(int argc, char **argv)
 {
+#ifdef TWINS_RETRY_DRIVER
+    if (argc < 2 || std::string(argv[1]) != "--single-pass")
+    {
+        auto binary = std::filesystem::canonical("/proc/self/exe");
+        auto driver = binary.parent_path() / "tcp_retry.py";
+        std::vector<char *> args{const_cast<char *>("python3"), const_cast<char *>(driver.c_str()),
+                                 const_cast<char *>(binary.c_str())};
+        args.insert(args.end(), argv + 1, argv + argc + 1);
+        execvp(args[0], args.data());
+        perror("starting TCP retry driver");
+        return 1;
+    }
+#endif
+    bool exact_active = false;
+
 #ifdef TWINS_MUTATION
     {
         const char *m = getenv("TWINS_MUT");
@@ -180,7 +204,11 @@ int main(int argc, char **argv)
     {
         std::string a = argv[i];
         auto val = [&](const char *p) { return a.substr(strlen(p)); };
-        if (a.rfind("--k=", 0) == 0)
+        if (a == "--single-pass")
+            continue;
+        else if (a == "--size-active")
+            exact_active = true;
+        else if (a.rfind("--k=", 0) == 0)
             k = std::stoi(val("--k="));
         else if (a.rfind("--flows=", 0) == 0)
             flow_file = val("--flows=");
@@ -248,6 +276,7 @@ int main(int argc, char **argv)
     // a topology file: hosts, switches, links in installation order (workloads/topo.py)
     int g_hosts = 0, g_switches = 0;
     std::vector<std::pair<int, int>> g_links; // endpoints: host h -> h, switch j -> -1 - j
+    std::vector<LinkTiming> timing;
     if (is_graph)
     {
         std::ifstream in(topo_file);
@@ -269,11 +298,23 @@ int main(int argc, char **argv)
                 std::string a, b;
                 in >> a >> b;
                 g_links.push_back({node(a), node(b)});
+                try { timing.push_back(read_link_timing(in)); }
+                catch (const std::exception &e) { fprintf(stderr, "%s: %s\n", topo_file.c_str(), e.what()); return 1; }
             }
             else
                 std::getline(in, key);
         }
     }
+#ifndef TWINS_LINK_TIMING
+    for (const auto &link : timing)
+        if (link.bps != 100000000000 || link.delay_ps != PROP_PS)
+        {
+            auto path = std::filesystem::canonical("/proc/self/exe").string() + "-links";
+            execv(path.c_str(), argv);
+            perror("starting heterogeneous TCP kernel");
+            return 1;
+        }
+#endif
     bool bad_topo = is_graph ? (g_hosts < 1 || g_switches < 1)
                     : ls  ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > BLOCK || leaves * hpl > 65535)
                           : (topo != "fattree" || k < 4 || k > 32 || (k & (k - 1)));
@@ -362,7 +403,7 @@ int main(int argc, char **argv)
         g_adj.assign(g_switches, {});
         for (auto &l : g_links)
         {
-            if (l.second >= 0 || (l.first >= 0 && g_hsw[l.first] >= 0))
+            if (l.first < -g_switches || l.first >= g_hosts || l.second < -g_switches || l.second >= 0 || (l.first >= 0 && g_hsw[l.first] >= 0))
             {
                 fprintf(stderr, "%s: hosts need exactly one link, as its first endpoint\n", topo_file.c_str());
                 return 1;
@@ -867,9 +908,9 @@ int main(int argc, char **argv)
     s.fl.timer_order = dalloc<uint64_t>((size_t)F * 6);
     s.hs.timer_sequence = dalloc<uint64_t>(H);
 #endif
-    s.fl.dchain = dalloc<uint16_t>((size_t)F * CHAIN);
-    s.fl.rchain = dalloc<uint16_t>((size_t)F * CHAIN);
-    s.fl.schain = dalloc<uint16_t>((size_t)F * CHAIN);
+    s.fl.dchain = dalloc<ChainWord>((size_t)F * CHAIN);
+    s.fl.rchain = dalloc<ChainWord>((size_t)F * CHAIN);
+    s.fl.schain = dalloc<ChainWord>((size_t)F * CHAIN);
 #ifdef TWINS_EVIDENCE
     twins_evidence::inline_allocated += (size_t)F * CHAIN * sizeof(uint16_t) * 3;
 #endif
@@ -882,13 +923,25 @@ int main(int argc, char **argv)
     s.hs.q_size = dalloc<int>(H);
     s.hs.link_free = dalloc<int64_t>(H);
     s.hs.last_start = dalloc<int64_t>(H);
-    s.hs.last_chain = dalloc<uint16_t>((size_t)H * CHAIN);
+    s.hs.last_chain = dalloc<ChainWord>((size_t)H * CHAIN);
 #ifdef TWINS_EVIDENCE
     twins_evidence::inline_allocated += (size_t)H * CHAIN * sizeof(uint16_t);
 #endif
-    s.hs.act_snd = dalloc<int>((size_t)H * MAX_ACTIVE);
+    // One connection occupies at most one entry on each endpoint. Prefix sums
+    // give a tight upper bound per host even when an incast is very skewed.
+    auto active_table = [&](bool sending, int *&offset) {
+        std::vector<int> ends(H + 1, exact_active ? 0 : MAX_ACTIVE);
+        ends[0] = 0;
+        if (exact_active)
+            for (const auto &f : recs)
+                ++ends[1 + (sending ? f.src : f.dst)];
+        std::partial_sum(ends.begin(), ends.end(), ends.begin());
+        offset = dupload(ends);
+        return dalloc<int>(ends.back());
+    };
+    s.hs.act_snd = active_table(true, s.hs.snd_offset);
+    s.hs.act_rcv = active_table(false, s.hs.rcv_offset);
     s.hs.n_snd = dalloc<int>(H);
-    s.hs.act_rcv = dalloc<int>((size_t)H * MAX_ACTIVE);
     s.hs.n_rcv = dalloc<int>(H);
     s.hs.pend_next = dupload(pend_next);
     s.hs.pend_end = dupload(pend_end);
@@ -920,7 +973,7 @@ int main(int argc, char **argv)
     s.ps.q_size = dalloc<int>((size_t)S * k);
     s.ps.link_free = dalloc<int64_t>((size_t)S * k);
     s.ps.last_start = dalloc<int64_t>((size_t)S * k);
-    s.ps.last_chain = dalloc<uint16_t>((size_t)S * k * CHAIN);
+    s.ps.last_chain = dalloc<ChainWord>((size_t)S * k * CHAIN);
     // ---- links: host h sends on link h; switch sw port p sends on link H + sw*k + p
     auto sw_link = [&](int sw, int p) { return H + sw * k + p; };
     std::vector<int> host_in(H), sw_in((size_t)S * k, -1);
@@ -1015,10 +1068,62 @@ int main(int argc, char **argv)
         return 1;
     }
     s.sw_in_link = dupload(sw_in);
-    s.msg = dalloc<Frame>((size_t)NB * s.L * MAX_TX);
-    s.msg_cnt = dalloc<long long>((size_t)NB * s.L);
+    int banks = NB, tx_capacity = MAX_TX;
+#ifdef TWINS_LINK_TIMING
+    if (timing.empty()) { fprintf(stderr, "heterogeneous kernel needs a graph topology\n"); return 1; }
+    s.slot_ps = INT64_MAX;
+    int64_t max_lead = 0, shortest_tx = INT64_MAX;
+    std::map<int64_t,int> rate_ids;
+    std::vector<int64_t> table;
+    for (const auto &l : timing)
     {
-        std::vector<long long> init((size_t)NB * s.L, -(1ll << 16)); // no slot
+        s.slot_ps = std::min(s.slot_ps, l.delay_ps);
+        int64_t longest = link_serialization_ps(DATA_FRAME, l.bps);
+        if (longest > INT64_MAX - l.delay_ps) return 1;
+        max_lead = std::max(max_lead, longest + l.delay_ps);
+        shortest_tx = std::min(shortest_tx, link_serialization_ps(CTRL_FRAME, l.bps));
+        if (rate_ids.emplace(l.bps, rate_ids.size()).second)
+            for (int n = 0; n <= DATA_FRAME; ++n)
+                table.push_back(link_serialization_ps(n, l.bps));
+    }
+    if (!shortest_tx || max_slots <= 0 || max_slots > (INT64_MAX - max_lead) / s.slot_ps ||
+        max_slots >= (1ll << 47) || max_lead / s.slot_ps > INT_MAX - 3 ||
+        s.slot_ps / shortest_tx >= 65534)
+    {
+        fprintf(stderr, "link time or slot capacity exceeds representable range\n"); return 1;
+    }
+    banks = s.banks = int(max_lead / s.slot_ps) + 3;
+    tx_capacity = s.max_tx = int(s.slot_ps / shortest_tx) + 2;
+    std::vector<int> rates(s.L);
+    std::vector<int64_t> delays(s.L);
+    for (int w = 0; w < W; ++w)
+    {
+        std::vector<int> degree(S1);
+        auto endpoint = [&](int v) {
+            if (v >= 0) return w * H1 + v;
+            int sw = -1 - v;
+            return H + (w * S1 + sw) * k + degree[sw]++;
+        };
+        for (size_t i = 0; i < timing.size(); ++i)
+            for (int node : {g_links[i].first, g_links[i].second})
+            {
+                int port = endpoint(node);
+                rates[port] = rate_ids.at(timing[i].bps);
+                delays[port] = timing[i].delay_ps;
+            }
+    }
+    s.rate_index = dupload(rates);
+    s.tx_ps = dupload(table);
+    s.delay_ps = dupload(delays);
+    s.last_arrival_slot = dalloc<unsigned long long>(1);
+    if (size_t(banks) > SIZE_MAX / s.L / tx_capacity / sizeof(Frame)) return 1;
+    printf("TCP heterogeneous slot %lld ps, %d banks, %d frames/slot, %zu-byte frame, %d history runs\n",
+           (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
+#endif
+    s.msg = dalloc<Frame>((size_t)banks * s.L * tx_capacity);
+    s.msg_cnt = dalloc<long long>((size_t)banks * s.L);
+    {
+        std::vector<long long> init((size_t)banks * s.L, -(1ll << 16)); // no slot
         CHECK(cudaMemcpy(s.msg_cnt, init.data(), 8 * init.size(), cudaMemcpyHostToDevice));
     }
     s.activity = dalloc<unsigned int>(2);
@@ -1035,6 +1140,7 @@ int main(int argc, char **argv)
     s.finished = dalloc<int>(1);
     s.error = dalloc<int>(1);
     s.ev = dalloc<unsigned long long>(40);
+    s.active_ovf_w = dalloc<unsigned long long>(W);
     s.ties_w = dalloc<unsigned long long>(W);
     s.qtrace = nullptr;
     s.qtrace_cnt = dalloc<unsigned long long>(1);
@@ -1053,7 +1159,7 @@ int main(int argc, char **argv)
     if (M == 0)
         *h_finished = 1;
     Due *due = dalloc<Due>((size_t)H * MAX_DUE);
-    size_t per_sw = (size_t)k * 2 * MAX_TX;
+    size_t per_sw = (size_t)k * 2 * tx_capacity;
     int64_t *sw_ts = dalloc<int64_t>((size_t)S * per_sw);
     uint32_t *sw_ref = dalloc<uint32_t>((size_t)S * per_sw);
     uint8_t *sw_up = spray ? dalloc<uint8_t>((size_t)S * per_sw) : nullptr;
@@ -1206,6 +1312,7 @@ int main(int argc, char **argv)
     for (int w = 0; w < W; w++)
     {
         std::ofstream o(worlds[w].out);
+        o.exceptions(std::ios::badbit | std::ios::failbit);
         o << "src,dst,flow_size,start_ns,established_ns,completed_ns\n";
         for (int i = wfirst[w]; i < wfirst[w + 1]; i++)
         {
@@ -1217,11 +1324,19 @@ int main(int argc, char **argv)
     if (W > 1)
     {
         printf("worlds %d\n", W);
+        if (ev[5])
+        {
+            auto counts = ddown(s.active_ovf_w, W);
+            printf("active-ovf by world:");
+            for (int w = 0; w < W; ++w)
+                if (counts[w]) printf(" %d", w);
+            printf("\n");
+        }
         if (ev[25])
         {
-            // the worlds to rerun with twins128
+            // World indices refer to this pass.
             std::vector<unsigned long long> tw = ddown(s.ties_w, W);
-            printf("undecided-ties by world:"); // (bench/sweep.py reruns these with twins128)
+            printf("undecided-ties by world:");
             for (int w = 0; w < W; w++)
                 if (tw[w])
                     printf(" %d", w);
