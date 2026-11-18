@@ -81,6 +81,12 @@ def main():
  with (E/'exclusive-campaign.lock').open('w') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   while not (E/'receipts/prepared.json').exists():state(stage='waiting_for_builds');time.sleep(20)
+  # Docker containers outlive their client cgroup after an unexpected controller
+  # failure. Only this campaign/UID and a mount in this new raw root qualify.
+  ids=sp.check_output(['docker','ps','-q','--filter','label=twins.evidence.campaign=20261118','--filter',f'label=twins.evidence.owner={os.getuid()}'],text=True).split()
+  for cid in ids:
+   info=json.loads(sp.check_output(['docker','inspect',cid],text=True))[0]
+   if any(Path(m.get('Source','/')).is_relative_to(RAW) for m in info.get('Mounts',[])):sp.run(['docker','stop','-t','3',cid],check=True,stdout=sp.DEVNULL)
   freeze()
   stages=[('pilot',pilot),('pilot-pipeline',pilot_pipeline),('cubic',tcp.cubic),('scans',tcp.scans),('ai-latency',ai.latency),('mtp',ai.mtp),('throughput',ai.throughput)]
   for name,fn in stages:

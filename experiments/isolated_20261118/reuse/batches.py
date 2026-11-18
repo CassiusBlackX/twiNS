@@ -30,7 +30,7 @@ def prepare(trial,j,engine,cpu,policy):
  if engine=='simai':
   etc=raw/'etc';(etc/'simulation').mkdir(parents=True,exist_ok=True);(etc/'results').mkdir(exist_ok=True)
   shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" >/run/internal.wall; exit "$rc"'
-  cmd=['docker','run','--rm','--name',container,'--label','twins.evidence.campaign=20261116','--label',f'twins.evidence.owner={os.getuid()}','--label','twins.evidence.role=throughput-v2','--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{c.SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{c.AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',c.SIMBIN,f'/work/wl/paper/{name.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
+  cmd=['docker','run','--rm','--name',container,'--label','twins.evidence.campaign=20261118','--label',f'twins.evidence.owner={os.getuid()}','--label','twins.evidence.role=isolated-throughput','--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{c.SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{c.AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',c.SIMBIN,f'/work/wl/paper/{name.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
   bin=c.SD/c.SIMBIN.removeprefix('/simai/');affinity=str(cpu)
  else:
   bin=c.BIN/'twins-ai';affinity='0-16' if engine=='p16' else '0'
@@ -151,7 +151,7 @@ def main():
   signal.signal(signal.SIGTERM,terminate)
   # A crashed previous driver may leave Docker alive outside its process cgroup.
   # Labels scope cleanup to this user's own throughput campaign after taking its lock.
-  old=sp.check_output(['docker','ps','-q','--filter','label=twins.evidence.campaign=20261116','--filter',f'label=twins.evidence.owner={os.getuid()}','--filter','label=twins.evidence.role=throughput-v2'],text=True).split()
+  old=sp.check_output(['docker','ps','-q','--filter','label=twins.evidence.campaign=20261118','--filter',f'label=twins.evidence.owner={os.getuid()}','--filter','label=twins.evidence.role=isolated-throughput'],text=True).split()
   for container in old:sp.run(['docker','stop','-t','5',container],check=True,stdout=sp.DEVNULL)
   for p in BROOT.glob('*-trial*/state.json'):
    v=saved(p)
