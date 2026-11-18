@@ -14,7 +14,7 @@ To reproduce the queue comparison, build ns-3.46.1 using both routing patches in
 python validation/extensions/tcp_links.py build/twins /path/to/ns3.46.1-twins-ref-optimized out/tcp-links
 ```
 
-The matrix compares all six flow fields and the time, device, order, packet identity and queue length of each enqueue through the last completion expressed in nanoseconds. It covers uniform, rate-only, delay-only and mixed links. A fifth input uses 10 hosts per leaf, 625 Gb/s access, 500 Gb/s uplinks, 12-packet queues and a simultaneous burst. Every variant runs CUBIC, DCTCP and NewReno with flow ECMP and packet spraying.
+The matrix compares all six flow fields and the time, device, order, packet identity and queue length of each enqueue through the last completion expressed in nanoseconds. It covers uniform, rate-only, delay-only and mixed links. A fifth input uses 10 hosts per leaf, 625 Gb/s access, 500 Gb/s uplinks, 12-packet queues and a simultaneous burst. Every variant runs CUBIC, DCTCP and NewReno with flow ECMP and packet spraying. Repeat with `--scale` and a new directory for the 128-host, eight-leaf, four-spine case.
 
 ## Loss-tolerant RDMA
 
@@ -30,7 +30,9 @@ python validation/extensions/irn_fixture.py /path/to/conweave-ns3 out/irn
 python validation/extensions/irn_compare.py build/twins-rdma /path/to/conweave-ns3 out/irn
 ```
 
-The comparison also accepts `--image IMAGE` for a local runtime container and repeatable `--case NAME` filters. It records both process times, binary hash, commands, per-flow identity and FCT agreement, and the first difference in link transmissions. Reference process time in container mode includes container start and stop. The six fixtures cover a short final packet, multiple destination ports, cross-rack routing, probabilistic ECN, lossy incasts with timeout and SACK, and eight simultaneous 15-to-1 incasts. The AI AllReduce control can be checked against existing loss-free SimAI receipts. A lossy closed-loop AI run exercises the shared transport independently of those receipts.
+The comparison also accepts `--image IMAGE` for a local runtime container and repeatable `--case NAME` filters. It records both process times, binary hash, commands, per-flow identity and FCT agreement, and the first difference in link transmissions. Reference process time in container mode includes container start and stop. For IRN, both traces also expose the destination port, selective-feedback byte offset and length, and CNP bit. The six fixtures cover a short final packet, multiple destination ports, cross-rack routing, probabilistic ECN, lossy incasts with timeout and SACK, and eight simultaneous 15-to-1 incasts. The AI AllReduce control can be checked against existing loss-free SimAI receipts. A lossy closed-loop AI run exercises the shared transport independently of those receipts.
+
+For native timing, generate a fresh fixture directory and run `irn_timing.py reference REF FIXTURES` in the reference runtime and `irn_timing.py twins TWINS FIXTURES` on the GPU host. Trial zero warms each scenario. The next three trials time complete processes without packet tracing. Each saves its FCT file and log.
 
 ## Frozen audit
 

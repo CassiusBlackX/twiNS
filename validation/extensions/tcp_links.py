@@ -23,13 +23,14 @@ def main():
     parser = argparse.ArgumentParser()
     for opt in ("twins", "reference", "out"):
         parser.add_argument(opt, type=Path)
+    parser.add_argument("--scale", action="store_true", help="128-host fabric with four spines")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     flows = args.out / "messages.csv"
     flows.write_text("src,dst,flow_size,start_ns\n" + "".join(
         f"{i},{19-i%2},{n},{1000 + 71*i}\n" for i,n in enumerate((1,1460,20000,65536,4097,63000))))
     failures = []
-    for variant in ("uniform","rate","delay","mixed","oversubscribed"):
+    for variant in (("scale",) if args.scale else ("uniform","rate","delay","mixed","oversubscribed")):
         heavy = variant == "oversubscribed"
         flow_file = flows
         if heavy:
@@ -41,9 +42,17 @@ def main():
         edges = [(f"h{i}",f"s{i//10}",(25,100)[i%2],500000) for i in range(20)]
         edges += [(f"s{i}",f"s{j}",(100,400)[j-2],(2000000,1725401)[j-2])
                   for i in range(2) for j in (2,3)]
+        if args.scale:
+            lines = ["hosts 128", "switches 12"]
+            edges = [(f"h{i}", f"s{i//16}", (25,100)[i%2], 500000) for i in range(128)]
+            edges += [(f"s{i}", f"s{8+j}", (100,100,100,400)[j], (1000000,1500000,1725401,2000000)[j])
+                      for i in range(8) for j in range(4)]
+            flow_file = args.out / "scale.csv"
+            flow_file.write_text("src,dst,flow_size,start_ns\n" + "".join(
+                f"{i},{(i+67)%128},{8192+i*131},{1000+17*(i%5)}\n" for i in range(128)))
         for a,b,rate,delay in edges:
-            lines.append(f"link {a} {b} {(rate if variant in ('rate','mixed','oversubscribed') else 100)*10**9} "
-                         f"{delay if variant in ('delay','mixed','oversubscribed') else 1000000}")
+            lines.append(f"link {a} {b} {(rate if variant in ('rate','mixed','oversubscribed','scale') else 100)*10**9} "
+                         f"{delay if variant in ('delay','mixed','oversubscribed','scale') else 1000000}")
         topo.write_text("\n".join(lines)+"\n")
         for tcp, name in (("newreno","NewReno"),("dctcp","Dctcp"),("cubic","Cubic")):
             for spray in (0,1):

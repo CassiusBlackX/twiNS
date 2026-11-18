@@ -91,8 +91,8 @@ cmake --build build -j
   (MRG32k3a, stream = the switch's ns-3 node id, as the scenario assigns; `--RngSeed`,
   `--RngRun` as in ns-3).
 - **`--topo=graph --topofile=F`**: any topology (`workloads/topo.py`: FatTree, leaf-spine,
-  Jellyfish, torus, Dragonfly). Hosts are single-homed; links are 100 Gbps with 1 µs delay;
-  switches have at most 32 ports. Routes are the shortest-path equal-cost sets that ns-3's global
+  Jellyfish, torus, Dragonfly). Hosts are single-homed and switches have at most 32 ports.
+  Links default to 100 Gb/s and 1 µs. Add rate in bit/s and delay in ps to override each link. Routes are the shortest-path equal-cost sets that ns-3's global
   routing installs (`--dump_routes` prints them in the format of the scenario's `DUMP_ROUTES`).
 - **`--fail=T:sA:sB[:up],...`** (topology files): at T ns the first link between switches A and
   B goes down (or up): both interfaces drop what arrives, and routes are recomputed at that
