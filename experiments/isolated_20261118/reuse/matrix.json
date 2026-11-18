@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "campaign": "paper-evidence-20261116",
+  "base_commit": "e6b897b",
+  "latency_rounds": 3,
+  "variation_threshold": 0.1,
+  "additional_rounds": 2,
+  "timeout_s": 43200,
+  "batch_budget_gib": 70,
+  "batch_concurrency": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "batch_rounds": 3,
+  "jobs": [
+    {
+      "case": "c_allgather_8m_hpn128",
+      "gpus": "128",
+      "expected_md5": "e540881be6d05a54939c8a37f592d5ca",
+      "old_simai_s": 1.766090121,
+      "old_p0_s": 0.4,
+      "old_p16_s": 0.4,
+      "memory_cap_gib": 12,
+      "selection": "small startup-sensitive collective"
+    },
+    {
+      "case": "c_allgather_512m_hpn1024",
+      "gpus": "1024",
+      "expected_md5": "2b65681a112d899aa776e72f32813a84",
+      "old_simai_s": 410.583818163,
+      "old_p0_s": 12.1,
+      "old_p16_s": 12.3,
+      "memory_cap_gib": 16,
+      "selection": "large collective; safe/window ablations"
+    },
+    {
+      "case": "gpt3_13b_full_hpn128",
+      "gpus": "128",
+      "expected_md5": "1b59c9242c21e7bc5f17c81dcb7b1b64",
+      "old_simai_s": 2296.183934977,
+      "old_p0_s": 590.0,
+      "old_p16_s": 139.7,
+      "memory_cap_gib": 10,
+      "selection": "full 128 GPU training; substantial island gain"
+    },
+    {
+      "case": "llama_65b_full_hpn128",
+      "gpus": "128",
+      "expected_md5": "3b0c170e006ec08916ceaf7a0b976815",
+      "old_simai_s": 2458.313041015,
+      "old_p0_s": 376.4,
+      "old_p16_s": 225.6,
+      "memory_cap_gib": 19,
+      "selection": "full 128 GPU training"
+    },
+    {
+      "case": "gpt3_175b_full_hpn128",
+      "gpus": "128",
+      "expected_md5": "466862ce97cbf47dcb4b0f2bc9f743b9",
+      "old_simai_s": 2416.202373909,
+      "old_p0_s": 373.4,
+      "old_p16_s": 219.1,
+      "memory_cap_gib": 20,
+      "selection": "full 128 GPU training; corrected p64 reference"
+    },
+    {
+      "case": "gpt3_13b_mid_hpn512",
+      "gpus": "512",
+      "expected_md5": "e5073e5fe445c75aa1ee742b98b0687d",
+      "old_simai_s": 2951.705858173,
+      "old_p0_s": 304.4,
+      "old_p16_s": 165.6,
+      "memory_cap_gib": 14,
+      "selection": "512 GPU training; corrected p64 reference"
+    },
+    {
+      "case": "llama_65b_mid_hpn1024",
+      "gpus": "1024",
+      "expected_md5": "13663255a6bead4bc8d9577cb21dedb3",
+      "old_simai_s": 4484.830670596,
+      "old_p0_s": 204.6,
+      "old_p16_s": 230.1,
+      "memory_cap_gib": 27,
+      "selection": "1024 GPU training"
+    },
+    {
+      "case": "gpt3_175b_probe_hpn1024",
+      "gpus": "1024",
+      "expected_md5": "920c967b6d306d2fbe7b9f4d440f12c5",
+      "old_simai_s": 9835.503609547,
+      "old_p0_s": 394.4,
+      "old_p16_s": 443.2,
+      "memory_cap_gib": 39,
+      "selection": "large message cardinality; islands slightly slower in prior run"
+    }
+  ]
+}
