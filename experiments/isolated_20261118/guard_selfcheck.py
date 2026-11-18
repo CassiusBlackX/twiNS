@@ -25,7 +25,7 @@ def main():
    cancelled=True;disk_blocked=True
   finally:c.JOBS=oldjobs;b.BROOT=oldroot
   assert cancelled;states=[read(p) for p in (d/'batch').glob('*trial*/state.json')];assert states and all(x['status']=='interrupted' and not x['active'] and not x['completed'] for x in states)
-  result=dict(utc_ns=time.time_ns(),passed=True,owned_process_received_sigterm=rc,unrelated_control_process_remained_alive=True,foreign_telemetry_pid_never_signalled=True,partial_batch_preserved_and_not_timed=not disk_blocked,batch_cancel_case_replaced_by_real_disk_admission_refusal=disk_blocked,cumulative_cpu_not_confused_by_pid_turnover=True,real_foreign_cpu_positive_control=True,retired_owned_gpu_pid_not_foreign=True,scope='selfcheck of interruption/safety/accounting behavior only; no scientific simulator samples')
+  result=dict(utc_ns=time.time_ns(),passed=True,owned_process_received_sigterm=rc,unrelated_control_process_remained_alive=True,foreign_telemetry_pid_never_signalled=True,partial_batch_preserved_and_not_timed=not disk_blocked,batch_cancel_case_replaced_by_real_disk_admission_refusal=disk_blocked,cumulative_cpu_not_confused_by_pid_turnover=True,synthetic_foreign_cpu_positive_control=True,retired_owned_gpu_pid_not_foreign=True,scope='selfcheck of interruption/safety/accounting behavior only; no scientific simulator samples')
   save(E/'receipts/guard-selfcheck.json',result);print(json.dumps(result))
  finally:
   c.snapshot=old
