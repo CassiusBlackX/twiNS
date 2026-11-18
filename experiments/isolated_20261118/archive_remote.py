@@ -7,13 +7,16 @@ def read(p):
  try:return json.loads(p.read_text())
  except (OSError,ValueError):return {}
 def digest(p):
- s=p.stat();key=(str(p),s.st_size,s.st_mtime_ns)
- if key not in cache:
+ def stamp(s):return (s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+ for _ in range(3):
+  s=p.stat();key=(str(p),*stamp(s))
+  if key in cache:return dict(bytes=s.st_size,sha256=cache[key])
   h=hashlib.sha256()
   with p.open('rb') as f:
    while b:=f.read(8<<20):h.update(b)
-  cache[key]=h.hexdigest()
- return dict(bytes=s.st_size,sha256=cache[key])
+  if stamp(p.stat())!=stamp(s):continue
+  cache[key]=h.hexdigest();return dict(bytes=s.st_size,sha256=cache[key])
+ raise FileNotFoundError('file still changing; index next cycle: '+str(p))
 def save(p,v):
  q=p.with_suffix('.tmp');q.write_text(json.dumps(v,indent=2)+'\n');q.replace(p)
 while True:

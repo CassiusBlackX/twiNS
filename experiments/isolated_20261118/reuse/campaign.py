@@ -131,7 +131,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False,resource_con
  if engine=='simai':
   etc=raw/'etc';(etc/'simulation').mkdir(parents=True,exist_ok=True);(etc/'results').mkdir(exist_ok=True)
   # Include Docker startup in wall. Internal nanosecond timing and cgroup peak are also retained.
-  shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" >/run/internal.wall; exit "$rc"'
+  shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s cpu_usec=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" "$(sed -n \'s/^usage_usec //p\' /sys/fs/cgroup/cpu.stat)" >/run/internal.wall; exit "$rc"'
   cmd=['docker','run','--rm','--name',container,'--label','twins.evidence.campaign=20261118','--label',f'twins.evidence.owner={os.getuid()}','--label','twins.evidence.role=isolated-latency','--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',SIMBIN,f'/work/wl/paper/{n.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
  else:
   affinity='0-16' if engine=='p16' else str(cpu)

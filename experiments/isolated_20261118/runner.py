@@ -18,7 +18,11 @@ def freeze():
   n=j['case'];g=j['gpus']
   for p in [c.SD/'astra-sim-alibabacloud/inputs/config/SimAI.conf',c.AIROOT/f'wl/paper/{n.replace("_hpn","_")}.txt',c.AIROOT/f'topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100',BASE/'validation/simai/SimAI.conf',BASE/f'data/simai/hpn{g}.topo',BASE/f'out/simai/wl/paper/{n.replace("_hpn","_")}.txt']:
    if str(p) not in inputs:
-    h=sha(p);dest=copies/(h+'-'+p.name);shutil.copy2(p,dest);inputs[str(p)]=dict(sha256=h,copy=str(dest.relative_to(E)),bytes=p.stat().st_size)
+    h=sha(p);dest=copies/(h+'-'+p.name)
+    if dest.exists():assert sha(dest)==h,'frozen input copy changed: '+str(dest)
+    else:
+     tmp=dest.with_suffix(dest.suffix+'.tmp');shutil.copy2(p,tmp);tmp.replace(dest)
+    inputs[str(p)]=dict(sha256=h,copy=str(dest.relative_to(E)),bytes=p.stat().st_size)
  binaries={str(p):sha(p) for p in [c.BIN/n for n in ('twins','twins128','twins-ai','twins-astra-stub','twins-island')]+[tcp.CPU,c.SD/c.SIMBIN.removeprefix('/simai/') ]}
  # Include the actual sequential shared libraries and source/config metadata.
  libs=(c.SD/c.SIMBIN.removeprefix('/simai/')).parent.parent/'lib'

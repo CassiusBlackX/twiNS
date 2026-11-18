@@ -29,7 +29,7 @@ def prepare(trial,j,engine,cpu,policy):
  name=j['case'];d=trial/name;d.mkdir(exist_ok=True);raw=RAW/(trial.name+'-'+name);raw.mkdir(exist_ok=True);g=j['gpus'];container='twins-batch-'+trial.name.replace('_','-')+'-'+name.replace('_','-');cap=policy['jobs'][name]['cap_gib']
  if engine=='simai':
   etc=raw/'etc';(etc/'simulation').mkdir(parents=True,exist_ok=True);(etc/'results').mkdir(exist_ok=True)
-  shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" >/run/internal.wall; exit "$rc"'
+  shell='export AS_SEND_LAT=3; unset TWINS_TRACE TWINS_TXTRACE; s=$(date +%s%N); "$1" -t 1 -w "$2" -n "$3" -c /simai/astra-sim-alibabacloud/inputs/config/SimAI.conf > /run/out.txt 2>/run/err.txt; rc=$?; ns=$(( $(date +%s%N)-s )); printf "rc=%s ns=%s peak=%s cpu_usec=%s\\n" "$rc" "$ns" "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null)" "$(sed -n \'s/^usage_usec //p\' /sys/fs/cgroup/cpu.stat)" >/run/internal.wall; exit "$rc"'
   cmd=['docker','run','--rm','--name',container,'--label','twins.evidence.campaign=20261118','--label',f'twins.evidence.owner={os.getuid()}','--label','twins.evidence.role=isolated-throughput','--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpu),'--memory',f'{cap}g','--memory-swap',f'{cap}g','-v',f'{c.SD}:/simai:ro','-v',f'{etc}:/etc/astra-sim','-v',f'{c.AIROOT}:/work:ro','-v',f'{raw}:/run','-w','/run','localhost/simai-build','bash','-c',shell,'_',c.SIMBIN,f'/work/wl/paper/{name.replace("_hpn","_")}.txt',f'/work/topo/AlibabaHPN_{g}g_8gps_DualToR_SinglePlane_200Gbps_H100']
   bin=c.SD/c.SIMBIN.removeprefix('/simai/');affinity=str(cpu)
  else:
@@ -87,7 +87,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
  jobs=sorted(c.JOBS,key=lambda j:-j['old_simai_s'])
  for j in jobs:queue.append(prepare(trial,j,engine,0,policy))
  c.save(trial/'state.json',dict(status='running',utc_ns=time.time_ns(),engine=engine,target_concurrency=concurrency,policy=policy,timing_scope='Docker/process startup + stub + execution + admission; provenance and validation excluded'))
- active=[];done=[];reserved=0;peak=0;events=[];stopmon=threading.Event()
+ active=[];done=[];launched=[];reserved=0;peak=0;events=[];stopmon=threading.Event()
  def monitor():
   foreign_streak=0
   with (trial/'resources.jsonl').open('w',buffering=1) as f:
@@ -97,8 +97,8 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
      pid=t['p'].pid
      if engine=='simai':
       with contextlib.suppress(ValueError):pid=int(c.cmdout(['docker','inspect',t['container'],'--format','{{.State.Pid}}']))
-     processes[t['v']['case']]=c.proc_tree(pid)
-    sample=dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]);bad=c.foreign_gpu(sample) if hasattr(c,'foreign_gpu') else [];foreign_streak=foreign_streak+1 if bad else 0
+     processes[t['v']['case']]=c.proc_tree(pid);t['hostpid']=pid if engine!='simai' or pid!=t['p'].pid else 0
+    sample=dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]);sample['known_owned_pids']=[t['p'].pid for t in launched];c.account_batch_cpu(sample,list(launched));bad=c.foreign_gpu(sample) if hasattr(c,'foreign_gpu') else [];foreign_streak=foreign_streak+1 if bad else 0
     if cancel_event is not None and foreign_streak>=2:sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel_event.set()
     f.write(json.dumps(sample)+'\n');stopmon.wait(5)
  thread=threading.Thread(target=monitor);thread.start();start=time.perf_counter_ns();utc=time.time_ns()
@@ -112,7 +112,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
     cpu=next(i for i in cpu_pool if i not in [t['cpu'] for t in active]);task['cpu']=cpu
     if engine=='simai':
      ix=task['v']['command'].index('--cpuset-cpus');task['v']['command'][ix+1]=str(cpu);task['v']['affinity']=str(cpu)
-    task=launch(task);queue.remove(task);active.append(task);reserved+=cap;peak=max(peak,len(active));events.append(dict(ns=time.perf_counter_ns()-start,action='admit',case=task['j']['case'],cpu=cpu,reserved_gib=reserved,active=len(active)))
+    task=launch(task);launched.append(task);queue.remove(task);active.append(task);reserved+=cap;peak=max(peak,len(active));events.append(dict(ns=time.perf_counter_ns()-start,action='admit',case=task['j']['case'],cpu=cpu,reserved_gib=reserved,active=len(active)))
    if not active:raise RuntimeError('no job fits memory budget')
    now=time.perf_counter_ns()
    for task in list(active):
