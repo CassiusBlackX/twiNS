@@ -145,6 +145,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False,resource_con
  start_utc=time.time_ns();start=time.perf_counter_ns()
  with (d/'process.log').open('w') as f:
   p=sp.Popen(cmd,cwd=raw,stdout=f,stderr=sp.STDOUT,env=env,start_new_session=True)
+  if 'activity' in globals():activity('started',label=d.name,engine=engine,container=container,pid=p.pid,raw=str(raw))
   stop=threading.Event();t=threading.Thread(target=monitor,args=(stop,d/'resources.jsonl',p.pid,engine,container,cpu),daemon=True);t.start()
   try: rc=p.wait(timeout=M['timeout_s'])
   except sp.TimeoutExpired:
@@ -157,6 +158,7 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False,resource_con
     p.wait()
    rc=124
   elapsed=time.perf_counter_ns()-start; end_utc=time.time_ns();stop.set();t.join(20)
+  if 'activity' in globals():activity('finished',label=d.name,engine=engine,rc=rc)
  # Validation is outside timed interval, and outside the next run's interval in latency mode.
  result=dict(label=d.name,case=n,engine=engine,options=list(options),command=cmd,start_utc_ns=start_utc,end_utc_ns=end_utc,wall_ns=elapsed,rc=rc,timeout=timedout,memory_cap_gib=cap if engine=='simai' else None,affinity=str(cpu) if engine=='simai' else affinity,requested_island_workers=16 if engine=='p16' else 0,post=snapshot(),binary_sha256=sha(SD/SIMBIN.removeprefix('/simai/')) if engine=='simai' else sha(BIN/'twins-ai'))
  result['resource_context']=resource_context
@@ -192,7 +194,8 @@ def attempt(label,job,engine,options=(),cpu=0,cap=None,repeat=False,resource_con
   keep=os.environ.get('TWINS_KEEP_REFERENCE_FCT')
   if engine=='simai' and keep and n in ('c_allgather_8m_hpn128','gpt3_13b_full_hpn128','llama_65b_full_hpn128','gpt3_175b_full_hpn128'):
    target=Path(keep)/(n+'.fct');target.parent.mkdir(parents=True,exist_ok=True)
-   if not target.exists():shutil.copy2(raw/'etc/simulation/llama_hpn7_fct.txt',target)
+   if not target.exists():
+    tmp=target.with_name(target.name+'.tmp-'+d.name);shutil.copy2(raw/'etc/simulation/llama_hpn7_fct.txt',tmp);tmp.replace(target)
   for file in [raw/'messages',raw/'actions.dag',raw/'etc/simulation/llama_hpn7_fct.txt']:
    with contextlib.suppress(FileNotFoundError):file.unlink()
  print(json.dumps({k:result[k] for k in ('label','case','engine','wall_ns','status')}),flush=True)

@@ -44,12 +44,12 @@ def cubic():
     print(json.dumps(dict(label=label,accepted=result['accepted'],seconds=(event_ns or 0)/1e9)),flush=True)
  save(EXPORT/'cubic-finished.json',dict(utc_ns=time.time_ns(),executed=192))
 
-def _monitor(stop,d,active,cancel,owned):
+def _monitor(stop,d,active,cancel,owned,engine):
  streak=0
  with (d/'resources.jsonl').open('w',buffering=1) as f:
   while not stop.is_set():
-   tasks=list(active);sample=dict(**c.snapshot(),active=[x['case'] for x in tasks],own_processes_by_job={x['case']:c.proc_tree(x['p'].pid) for x in tasks},cpu_stat=Path('/proc/stat').read_text().split('intr ')[0],known_owned_pids=list(owned));sample['owned_cpu_usage_usec']=sample.get('controller_cpu_usage_usec');bad=foreign_gpu(sample);streak=streak+1 if bad else 0
-   if streak>=2:
+   tasks=list(active);sample=dict(**c.snapshot(),active=[x['case'] for x in tasks],own_processes_by_job={x['case']:c.proc_tree(x['p'].pid) for x in tasks},cpu_stat=Path('/proc/stat').read_text().split('intr ')[0],known_owned_pids=list(owned));sample['owned_cpu_usage_usec']=sample.get('parallel_owned_cpu_usage_usec') if PARALLEL75 else sample.get('controller_cpu_usage_usec');bad=foreign_gpu(sample);streak=streak+1 if bad else 0
+   if streak>=2 and (not PARALLEL75 or engine=='gpu'):
     sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel.set()
     for task in tasks:
      with contextlib.suppress(ProcessLookupError):os.killpg(task['p'].pid,signal.SIGTERM)
@@ -68,7 +68,7 @@ def scan_one(group,engine,setting,r):
   for i in range(0,len(jobs),setting):
    chunk=jobs[i:i+setting];worlds=raw/f'worlds-{i//setting}.txt';lines=[f"flows={INPUT/j['flows']},tcp={j['tcp']},queue={j['queue']},ecnK={j['ecnK']},out={raw/(j['case']+'.csv')}" for j in chunk];worlds.write_text('\n'.join(lines)+'\n');queue.append(dict(jobs=chunk,worlds=worlds,lines=lines))
  save(d/'prepared.json',dict(label=label,manifest_sha256=sha(E/'manifest.json'),engine=engine,setting=setting,job_order=[j['case'] for j in jobs],binary_sha256=sha(CPU) if engine=='cpu' else {x:sha(GPU/x) for x in ('twins','twins128')},exclusive_preflight=pre))
- stop=threading.Event();cancel=threading.Event();owned=set();thread=threading.Thread(target=_monitor,args=(stop,d,active,cancel,owned),daemon=True);thread.start();t0=time.perf_counter_ns();utc=time.time_ns();peak=0;events=[]
+ stop=threading.Event();cancel=threading.Event();owned=set();thread=threading.Thread(target=_monitor,args=(stop,d,active,cancel,owned,engine),daemon=True);thread.start();t0=time.perf_counter_ns();utc=time.time_ns();peak=0;events=[]
  try:
   if engine=='cpu':
    done=[]

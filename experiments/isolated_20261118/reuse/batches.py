@@ -5,6 +5,7 @@ Interrupted batches are retained and entirely repeated; no sum of selected job t
 import concurrent.futures,contextlib,hashlib,json,math,os,signal,subprocess as sp,threading,time
 from pathlib import Path
 import campaign as c
+BUDGET=int(os.environ.get('TWINS_BATCH_BUDGET_GIB','70'))
 ROOT=c.ROOT;OUT=c.OUT;EXP=c.EXPORT;RAW=c.RAW;M=c.M
 BROOT=EXP/'batches-v2';BROOT.mkdir(exist_ok=True)
 def saved(p):return json.loads(p.read_text())
@@ -22,7 +23,7 @@ def cap_manifest():
     if m:peaks.append(int(m[1]))
   cap=max(1,math.ceil((max(peaks)*1.10+(512<<20))/(1<<30))) if peaks else j['memory_cap_gib']
   rows[j['case']]=dict(cap_gib=cap,observed_peaks_bytes=peaks,fallback_historical_cap_gib=j['memory_cap_gib'])
- d=dict(policy='ceil(1.10 * max accepted A3 cgroup peak + 512MiB), minimum 1GiB; same fixed caps in all batches',total_budget_gib=70,jobs=rows)
+ d=dict(policy='ceil(1.10 * max accepted A3 cgroup peak + 512MiB), minimum 1GiB; same fixed caps in all batches',total_budget_gib=BUDGET,jobs=rows)
  c.save(p,d);return d
 
 def prepare(trial,j,engine,cpu,policy):
@@ -42,7 +43,9 @@ def prepare(trial,j,engine,cpu,policy):
 
 def launch(task):
  start=time.perf_counter_ns();utc=time.time_ns();log=(task['d']/'process.log').open('w');p=sp.Popen(task['v']['command'],stdout=log,stderr=sp.STDOUT,cwd=task['raw'],start_new_session=True,env={**os.environ,'AS_SEND_LAT':'3'})
- task.update(p=p,log=log,start=start,start_utc_ns=utc);return task
+ task.update(p=p,log=log,start=start,start_utc_ns=utc)
+ if hasattr(c,'activity'):c.activity('started',label=task['container'],engine=task['v']['engine'],container=task['container'],pid=p.pid,raw=str(task['raw']))
+ return task
 
 def stop(task):
  if task['v']['engine']=='simai':sp.run(['docker','stop','-t','5',task['container']],stdout=sp.DEVNULL,stderr=sp.DEVNULL)
@@ -99,7 +102,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
       with contextlib.suppress(ValueError):pid=int(c.cmdout(['docker','inspect',t['container'],'--format','{{.State.Pid}}']))
      processes[t['v']['case']]=c.proc_tree(pid);t['hostpid']=pid if engine!='simai' or pid!=t['p'].pid else 0
     sample=dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]);sample['known_owned_pids']=[t['p'].pid for t in launched];c.account_batch_cpu(sample,list(launched));bad=c.foreign_gpu(sample) if hasattr(c,'foreign_gpu') else [];foreign_streak=foreign_streak+1 if bad else 0
-    if cancel_event is not None and foreign_streak>=2:sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel_event.set()
+    if cancel_event is not None and foreign_streak>=2 and (os.environ.get('TWINS_RESOURCE_MODE')!='parallel75' or engine!='simai'):sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel_event.set()
     f.write(json.dumps(sample)+'\n');stopmon.wait(5)
  thread=threading.Thread(target=monitor);thread.start();start=time.perf_counter_ns();utc=time.time_ns()
  try:
@@ -108,7 +111,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
    for task in list(queue):
     if len(active)>=concurrency:break
     cap=policy['jobs'][task['j']['case']]['cap_gib'] if engine=='simai' else 0
-    if engine=='simai' and reserved+cap>70:continue
+    if engine=='simai' and reserved+cap>BUDGET:continue
     cpu=next(i for i in cpu_pool if i not in [t['cpu'] for t in active]);task['cpu']=cpu
     if engine=='simai':
      ix=task['v']['command'].index('--cpuset-cpus');task['v']['command'][ix+1]=str(cpu);task['v']['affinity']=str(cpu)
@@ -121,12 +124,13 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
     if timedout:stop(task)
     end=time.perf_counter_ns();task['v'].update(start_utc_ns=task['start_utc_ns'],end_utc_ns=time.time_ns(),wall_ns=end-task['start'],rc=124 if timedout else task['p'].returncode,timeout=timedout)
     task['log'].close();active.remove(task);done.append(task)
+    if hasattr(c,'activity'):c.activity('finished',label=task['container'],engine=engine,rc=task['v']['rc'])
     if engine=='simai':reserved-=policy['jobs'][task['j']['case']]['cap_gib']
     events.append(dict(ns=end-start,action='finish',case=task['j']['case'],reserved_gib=reserved,active=len(active)))
    if reservation_update and engine=='simai':
     remaining=queue+active
     # Bound every possible future admission; releasing this quota cannot delay this batch.
-    bound=min(70,sum(sorted((policy['jobs'][t['j']['case']]['cap_gib'] for t in remaining),reverse=True)[:concurrency]))
+    bound=min(BUDGET,sum(sorted((policy['jobs'][t['j']['case']]['cap_gib'] for t in remaining),reverse=True)[:concurrency]))
     keep=[t['cpu'] for t in active]
     keep += [i for i in cpu_pool if i not in keep][:max(0,min(concurrency,len(remaining))-len(keep))]
     reservation_update(bound,keep)
@@ -139,7 +143,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
   stopmon.set();thread.join(20)
   for task in active:stop(task);task['log'].close()
  validation_start=time.perf_counter_ns();results=[validate(t) for t in done];validation_ns=time.perf_counter_ns()-validation_start
- result=dict(label=label,trial=trial.name,engine=engine,start_utc_ns=utc,makespan_ns=elapsed,validation_ns=validation_ns,target_concurrency=concurrency,peak_actual_concurrency=peak,budget_gib=70,events=events,all_accepted=all(v['accepted'] for v in results),jobs=[v['case'] for v in results],timing_scope='startup + stub + execution + admission; validation/provenance outside batch timer')
+ result=dict(label=label,trial=trial.name,engine=engine,start_utc_ns=utc,makespan_ns=elapsed,validation_ns=validation_ns,target_concurrency=concurrency,peak_actual_concurrency=peak,budget_gib=BUDGET,events=events,all_accepted=all(v['accepted'] for v in results),jobs=[v['case'] for v in results],timing_scope='startup + stub + execution + admission; validation/provenance outside batch timer')
  result.update(cpu_pool=cpu_pool,resource_context=resource_context)
  c.save(receipt,result);c.save(trial/'state.json',dict(status='completed',result=result));print(json.dumps(result),flush=True)
 

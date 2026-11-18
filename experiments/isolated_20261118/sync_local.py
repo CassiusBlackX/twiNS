@@ -6,7 +6,7 @@ from report import report,read
 a=argparse.ArgumentParser();a.add_argument('--once',action='store_true');x=a.parse_args();E=Path('/home/cassius/Work/SpecDES/twiNS/out/isolated-evidence-20261118');D=E/'s50';(E/'receipts').mkdir(exist_ok=True);M=Path('/home/cassius/Projects/TwiNS');REMOTE='s50:Videos/twins-isolated-20261118/out/';cache={}
 while True:
  for part in ('export','receipts'):
-  dest=D/part;dest.mkdir(parents=True,exist_ok=True);r=subprocess.run(['rsync','-a','--exclude=*.tmp','--timeout=30','--bwlimit=4096','-e','ssh -F /home/cassius/.ssh/config -o BatchMode=yes -o ConnectTimeout=10',REMOTE+part+'/',str(dest)+'/'],capture_output=True,text=True)
+  dest=D/part;dest.mkdir(parents=True,exist_ok=True);r=subprocess.run(['rsync','-a','--exclude=*.tmp*','--timeout=30','--bwlimit=4096','-e','ssh -F /home/cassius/.ssh/config -o BatchMode=yes -o ConnectTimeout=10',REMOTE+part+'/',str(dest)+'/'],capture_output=True,text=True)
   with (E/'receipts/sync.jsonl').open('a') as f:f.write(json.dumps(dict(utc_ns=time.time_ns(),part=part,rc=r.returncode,stderr=r.stderr[:2000]))+'\n')
  idx=read(D/'export/archive-index.json');bad=[];missing=[];verified=0
  for rel,v in idx.get('files',{}).items():

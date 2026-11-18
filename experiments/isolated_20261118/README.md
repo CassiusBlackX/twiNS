@@ -57,3 +57,23 @@ ongoing TODO and paper edits. No LaTeX edits, main merge, tag or publication.
 The prior measured times imply about68 hours for the two AI groups when run one
 setting at a time. TCP, MTP and shared-host waits are additional. Plan in days,
 refresh from actual new measurements; do not promise an overnight completion.
+
+
+2026-11-19 authorization update: `parallel75.py` replaces the serial controller.
+Total reservations are75GiB (1GiB observers +74GiB model allowances). CPU references
+use disjoint physical cores, at most four; one GPU lane can overlap P=0. P=16 and
+CPU16/32 scans drain own measured tasks. Foreign GPU activity does not block CPU
+work; competing GPU observations remain excluded from formal timing. The separate
+512MiB contention probe is diagnostic, not one of the81 formal AI observations.
+
+`gpu_host_policy.json` freezes per-model observed high-water marks plus20%+1GiB,
+minimum2GiB. Full training needs substantially more than a fixed10GiB GPU host
+allowance (up to33GiB reserved); the initial startup policy was corrected before
+those GPU models ran, and interrupted startup attempts are preserved. Small
+allgather reserves2GiB, allowing four CPU references plus one GPU task within71GiB.
+Throughput batches retain their original70GiB internal admission policy; whole
+batch reservations may only shrink as unfinished work decreases. MTP starts with
+32GiB per attempt; memory-killed attempts are retained and retried alone at74GiB.
+Shared-memory-bandwidth timings are explicitly not exclusive whole-machine runs.
+`parallel75_selfcheck.py` validates admission and controlled interruption behavior
+on s50; its GPU telemetry is a fixture and never scientific timing data.
