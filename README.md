@@ -54,6 +54,7 @@ faster than SimAI on one core and 5.9–14× faster than SimAI with threads, all
 
 The [extension validation guide](validation/extensions/README.md) describes mixed-rate TCP graphs,
 automatic TCP retries, and selective retransmission for loss-tolerant RDMA and AI workloads.
+The [local validation report](docs/extensions-20261118.md) records the RX 9060 XT experiments and whole-process timings.
 
 ## Build
 
