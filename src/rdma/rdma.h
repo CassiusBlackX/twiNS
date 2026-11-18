@@ -173,11 +173,16 @@ struct TailNode
 #endif
 };
 
+#include "irn.h"
+
 // A frame's contents. The INT hops are IntHop's 64-bit words (lineRate:3 time:24 bytes:20
 // qlen:17, from the low bits).
 struct Pkt
 {
-    uint64_t hop[MAX_HOP];
+    union {
+        uint64_t hop[MAX_HOP];
+        struct { uint32_t seq, size; } sack; // IRN/DCQCN feedback has no INT hops
+    };
     uint32_t flow;
     uint32_t seq;   // data: first byte; ACK/NACK: the receiver's next expected byte
     uint16_t size;  // bytes on the wire
@@ -218,7 +223,7 @@ struct SndQP
     uint32_t rp_stage;
     double alpha;
     uint64_t target;
-    int64_t t_alpha, t_dec, t_rp; // pending timers (-1: none)
+    int64_t t_alpha, t_dec, t_rp, t_irn; // pending timers (-1: none)
     // HPCC (hp); DCTCP (dctcp) also uses last_update_seq and alpha, and has the rest of HPCC's room
     uint32_t last_update_seq;
     int32_t inc_stage;
@@ -271,7 +276,7 @@ struct FlowInfo
     int src, dst;
     uint64_t size;
     int64_t start;      // ns
-    uint32_t sport;     // dport is 100
+    uint16_t sport, dport;
     uint32_t order;     // index in start order
     uint32_t win;       // its window and base RTT (maxBdp and maxRtt, or the pair's with GLOBAL_T 0)
     uint64_t base_rtt;
@@ -314,6 +319,7 @@ struct Port
 
 struct Switch
 {
+    uint32_t irn_ingress;  // Broadcom total ingress pool (IRN)
     uint32_t shared_used; // SwitchMmu::shared_used_bytes
     uint32_t total_hdrm, total_rsrv;
     uint32_t max_shift;   // the largest pfc_a_shift of its ports (the lowest PFC threshold)
@@ -369,6 +375,7 @@ struct LinkInfo
 
 struct Params
 {
+    uint32_t irn, irn_bdp, irn_rto_low, irn_rto_high;
     int cc;               // CC_MODE: 1 DCQCN, 3 HPCC, 8 DCTCP
     int int_size;         // IntHeader::GetStaticSize: 42 (HPCC) or 0
     uint32_t mtu;         // PACKET_PAYLOAD_SIZE
@@ -422,6 +429,12 @@ struct SwInfo
 // and the tx rule (P.simai); everything else is per world (Pw) or per link and port.
 struct Sim
 {
+    IrnSender *irn_sender;
+    IrnMap *irn_receiver;
+    IrnLifetime *irn_lifetime;
+    size_t *irn_off;
+    uint32_t *irn_tx_bits, *irn_rx_bits;
+    unsigned long long *irn_counts;
     int H, S, N, L, K; // hosts, switches, nodes (hosts first), directed links, max ports per node
     int F;             // flows
     Params P;          // world 0's (its rate and delay are every world's)

@@ -408,7 +408,16 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.rate_bound = cfg.u32("RATE_BOUND", 1);
     P.ack_high_prio = cfg.u32("ACK_HIGH_PRIO", 0);
     P.ecn = cfg.u32("ENABLE_QCN", 1);
-    P.qbb = 1;
+    P.irn = cfg.u32("ENABLE_IRN", 0);
+    if (P.irn) P.nack_interval = 4000; // ConWeave RdmaHw NACK suppression interval, ns
+    P.qbb = cfg.u32("ENABLE_PFC", 1);
+    P.irn_rto_low = cfg.u32("IRN_RTO_LOW_NS", 100000);
+    P.irn_rto_high = cfg.u32("IRN_RTO_HIGH_NS", 320000);
+    if (P.irn && (P.cc != 1 || P.qbb || !P.mtu || P.irn_rto_low > P.irn_rto_high))
+    {
+        fprintf(stderr, "IRN requires DCQCN, ENABLE_PFC 0, positive MTU and ordered RTO bounds\n");
+        return false;
+    }
     P.g = cfg.num("EWMA_GAIN", 1.0 / 16);
     P.rate_first_cnp = 1.0;
     P.clamp = cfg.u32("CLAMP_TARGET_RATE", 0);
@@ -698,6 +707,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     }
     P.base_rtt = max_rtt;
     const int has_win = cfg.u32("HAS_WIN", 1);
+    P.irn_bdp = cfg.u32("IRN_BDP", (uint32_t)max_bdp);
     P.win = has_win ? (uint32_t)max_bdp : 0;
     // (twins-island: a server alone, with the whole cluster's maxRtt and maxBdp, which SimAI's
     // GLOBAL_T gives every flow)
@@ -718,7 +728,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 uint64_t r = w.lbps[l];
                 pc.bps = r;
                 const unsigned __int128 product = (unsigned __int128)r * (uint64_t)w.ldelay[l];
-                const unsigned __int128 headroom = product / 8 / 1000000000ull * 3;
+                const unsigned __int128 headroom = P.irn ? product / 8 / 1000000000ull * 2 + 2096 : product / 8 / 1000000000ull * 3;
                 if (product > (unsigned __int128)~0ull || headroom > 0xFFFFFFFFull)
                 {
                     fprintf(stderr, "%s: link headroom exceeds the supported integer range\n", w.name.c_str());
@@ -909,6 +919,7 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     const int FR = order.size();
     {
         std::map<std::pair<int, int>, uint32_t> port;
+        vector<uint16_t> source_port(H, 10000), dest_port(H, 100);
         // ScheduleFlowInputs runs once per start time and starts that time's flows; each
         // StartApplication descends from it through Node::AddApplication's Application::Start
         int64_t prev_t = 0;
@@ -926,6 +937,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 if (!port.count(key))
                     port[key] = 10000;
                 x.sport = port[key]++;
+                x.dport = 100;
+                if (P.irn && !P.simai && !w.dag)
+                {
+                    x.sport = source_port[x.src]++;
+                    x.dport = dest_port[x.dst]++;
+                }
                 x.order = m;
                 Chain c = {};
                 c.root = m + 1;
@@ -1023,9 +1040,9 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                 fprintf(stderr, "%s: flow %zu: no route between GPUs %d and %d\n", w.name.c_str(), i, x.src, x.dst);
                 return false;
             }
-            x.snic = (uint8_t)pick(sv, node_ip(x.src), node_ip(x.dst), (uint16_t)x.sport, 100);
+            x.snic = (uint8_t)pick(sv, node_ip(x.src), node_ip(x.dst), x.sport, x.dport);
             // the receiving queue pair: sip and dip are the receiver's and the sender's
-            x.rnic = (uint8_t)pick(rv, node_ip(x.dst), node_ip(x.src), 100, (uint16_t)x.sport);
+            x.rnic = (uint8_t)pick(rv, node_ip(x.dst), node_ip(x.src), x.dport, x.sport);
         }
     }
     w.start_list.assign(FR, 0);
@@ -1313,6 +1330,13 @@ int main(int argc, char **argv)
     for (auto &w : worlds)
     {
         w.P.delay = D;
+        if (w.P.irn && (!w.P.irn_bdp || w.P.irn_rto_low < D))
+        {
+            fprintf(stderr, "IRN needs positive BDP and RTO at least one slot\n"); return 1;
+        }
+#ifdef TWINS_ASTRA_HOST
+        if (w.P.irn && g_nvl_islands) { fprintf(stderr, "IRN uses GPU network execution\n"); return 1; }
+#endif
         if (w.P.cc == 1 && (w.P.alpha_int < D || w.P.dec_int < D || w.P.rp_int < D))
         {
             fprintf(stderr, "%s: DCQCN timer intervals must be at least the slot (the shortest link delay, %lld ns)\n", w.name.c_str(),
@@ -1446,6 +1470,10 @@ int main(int argc, char **argv)
     s.rtp = dev_copy(rtp);
     // (global windows: the entities' bounds as per-entity windows', which they replace; no ranks
     // ahead, whose wide switches run single slots)
+    // The final ACK on the sender's last hop also schedules receiver-QP
+    // deletion. A single global slot preserves lookahead for that dependency.
+    if (std::any_of(worlds.begin(), worlds.end(), [](const auto &w) { return w.P.irn; }))
+        gwin = kw = 1;
     if (gwin)
     {
         kw = gwin;
@@ -1774,6 +1802,24 @@ int main(int argc, char **argv)
         s.dyn = dev_copy(dyn);
         s.dyn_n = dev_copy(dyn_n);
     }
+    if (std::any_of(Pw.begin(), Pw.end(), [](const Params &p) { return p.irn; }))
+    {
+        vector<size_t> offsets(F + 1, 0);
+        for (int f = 0; f < F; ++f)
+        {
+            const Params &p = Pw[h_world[fi[f].src]];
+            if (p.irn && fi[f].size > UINT32_MAX) { fprintf(stderr, "IRN sequence exceeds 32 bits\n"); return 1; }
+            uint64_t packets = (uint64_t(fi[f].size) + p.mtu - 1) / p.mtu;
+            offsets[f + 1] = offsets[f] + (p.irn ? (packets + 31) / 32 : 0);
+        }
+        s.irn_off = dev_copy(offsets);
+        s.irn_sender = dev_alloc<IrnSender>(F);
+        s.irn_receiver = dev_alloc<IrnMap>(F);
+        s.irn_lifetime = dev_alloc<IrnLifetime>(F);
+        s.irn_tx_bits = dev_alloc<uint32_t>(offsets.back());
+        s.irn_rx_bits = dev_alloc<uint32_t>(offsets.back());
+        s.irn_counts = dev_alloc<unsigned long long>(3);
+    }
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
     s.rx = dev_alloc<RcvQP>(F);
@@ -1859,7 +1905,11 @@ int main(int argc, char **argv)
                 sw[x].total_hdrm += pc[pbase[x] + p].hdrm_cap;
                 sw[x].max_shift = std::max(sw[x].max_shift, pc[pbase[x] + p].shift);
             }
-            sw[x].total_rsrv = RESERVE * n;
+            // The Broadcom fork sums slots [0,n), but ConfigHdrm sets devices 1..n.
+            // Slot zero retains its default 12,500 + two MTUs.
+            if (Pw[s_world[x]].irn && n)
+                sw[x].total_hdrm += 12500u + 2 * 1048u - pc[pbase[x] + n - 1].hdrm_cap;
+            sw[x].total_rsrv = (Pw[s_world[x]].irn ? 8 * 1048u : RESERVE) * n;
             for (int p = 0; p < n; p++)
             {
                 Port &pt = ps[pbase[x] + p];
@@ -1867,7 +1917,7 @@ int main(int argc, char **argv)
                 pt.ob_last = -(1ll << 16); // (as s.msg_cnt starts: no slot)
                 pt.tc_at = -1;
                 // ConfigEcnStream(port, node * SwitchMmu::pCnt + device)
-                pt.rng = nsm_rng::stream_state(1, (uint64_t)node * Pw[s_world[x]].ecn_pcnt + (p + 1), 1);
+                pt.rng = nsm_rng::stream_state(1, Pw[s_world[x]].irn ? 0 : (uint64_t)node * Pw[s_world[x]].ecn_pcnt + (p + 1), 1);
             }
         }
         s.sw = dev_copy(sw);
@@ -2423,6 +2473,12 @@ int main(int argc, char **argv)
       if(file){fwrite(corpus.data(),sizeof(corpus[0]),corpus.size(),file);fclose(file);}
     }
 #endif
+    if (s.irn_counts)
+    {
+        unsigned long long n[3];
+        CK(cudaMemcpy(n, s.irn_counts, sizeof(n), cudaMemcpyDeviceToHost));
+        printf("IRN selective feedback %llu, retransmitted packets %llu, timeouts %llu\n", n[0], n[1], n[2]);
+    }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
     if (ev[36])
         fprintf(stderr, "error: a persistent launch's blocks did not all run (--persist=0)\n");

@@ -1457,7 +1457,7 @@ __host__ __device__ __forceinline__ uint32_t data_hdr(const Params &P) { return 
 __host__ __device__ __forceinline__ uint32_t data_size(const Params &P, uint32_t payload) { return payload + data_hdr(P); }
 __device__ __forceinline__ uint32_t ack_size(const Params &P)
 {
-    int base = 12 + P.seq_extra + P.int_size, pad = 60 - 14 - 20 - base;
+    int base = 12 + (P.irn ? 6 : 0) + P.seq_extra + P.int_size, pad = 60 - 14 - 20 - base;
     return (pad > 0 ? pad : 0) + base + 20 + 14;
 }
 constexpr uint32_t PFC_SIZE = 9 + 20 + 14;
@@ -1652,6 +1652,15 @@ __device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
 }
 
 // QbbNetDevice::TransmitStart: TransmitComplete after tx, the peer's Receive after tx + delay
+__device__ inline void irn_final_hop(const Sim &s, const Pkt &p, int link, int64_t now, int64_t at, const Chain &parent)
+{
+    if (p.kind != K_NACK || s.link_dst[link] != p.src || p.seq < s.fi[p.flow].size)
+        return;
+    auto &life = s.irn_lifetime[p.flow];
+    if (atomicCAS(&life.close_at, 0ull, (unsigned long long)at) == 0)
+        cpush(&life.close_chain, ccode(at - now, p.ord), parent);
+}
+
 template <int ND>
 __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
 {
@@ -1690,6 +1699,7 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
     f->ts = ts;
     f->c = c.cur;
     f->p = p;
+    if (c.P->irn) irn_final_hop(s, p, c.ob().link, c.now, ts, c.cur);
     trace_tx(s, c.now, c.h, c.d, p);
 }
 
@@ -1701,6 +1711,23 @@ __device__ __forceinline__ void h_schedule_ns(HCtx<ND> &c, int64_t at)
     hq_ok &= ~(1u << (MAXD + c.d));
 }
 
+template <int ND>
+__device__ inline void irn_arm(HCtx<ND> &c, int f)
+{
+    IrnSender &r = c.s->irn_sender[f];
+    uint32_t interval = r.max_seq - r.highest_ack > 3 * c.P->mtu ? c.P->irn_rto_high : c.P->irn_rto_low;
+    SndQP &q = c.s->qp[f];
+    q.t_irn = c.now + interval;
+    int64_t &minimum = c.stv[c.s->qp[f].nic].due_min;
+    if (q.t_irn < minimum) minimum = q.t_irn;
+    cpush(&r.timer_chain, ccode(interval, c.ord++), c.cur);
+}
+
+__device__ inline void irn_skip_sent(const Sim &s, const Params &p, int f)
+{
+    SndQP &q = s.qp[f];
+    q.snd_nxt = irn_skip(s.irn_sender[f].sack, s.irn_tx_bits + s.irn_off[f], q.snd_nxt, q.size, p.mtu);
+}
 // RdmaEgressQueue::GetNextQindex: -1 the ACK queue, -1024 none, else the QP's index in the group
 template <int ND>
 __device__ __forceinline__ int next_qindex(HCtx<ND> &c)
@@ -1715,7 +1742,16 @@ __device__ __forceinline__ int next_qindex(HCtx<ND> &c)
     for (int qi = 1; qi <= fcount; qi++)
     {
         idx = idx + 1 == fcount ? 0 : idx + 1; // (qi + m_rrlast) % fcount
-        const SndQP &q = s.qp[list[idx]];
+        int f = list[idx];
+        const SndQP &q = s.qp[f];
+        if (c.P->irn)
+        {
+            irn_skip_sent(s, *c.P, f);
+            auto &r = s.irn_sender[f];
+            uint64_t length = bytes_left(q) < c.P->mtu ? bytes_left(q) : c.P->mtu;
+            if (length && uint32_t(r.max_seq - r.highest_ack) + length >= c.P->irn_bdp &&
+                uint64_t(r.highest_ack) + c.P->irn_bdp <= q.snd_nxt) continue;
+        }
         if (!(c.st().paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
         {
             if (q.next_avail > c.now)
@@ -1774,9 +1810,17 @@ __device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
         p.sport = (uint16_t)s.fi[f].sport;
         p.seq = (uint32_t)q.snd_nxt;
         p.size = (uint16_t)data_size(*c.P, payload);
+        if (c.P->irn)
+        {
+            auto &r = s.irn_sender[f];
+            if (p.seq <= r.max_seq && (p.seq || q.t_irn >= 0))
+                atomicAdd(s.irn_counts + 1, 1ull);
+            if (p.seq > r.max_seq) r.max_seq = p.seq;
+        }
         q.snd_nxt += payload;
         h_transmit(c, p);
         // RdmaHw::PktSent, UpdateNextAvail
+        if (c.P->irn) irn_arm(c, f);
         q.last_pkt = p.size;
         q.next_avail = c.now + qp_tx(*c.P, q, c.P->rate_bound ? q.rate : q.max_rate, p.size);
         return;
@@ -1785,7 +1829,10 @@ __device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
     for (int i = 0; i < c.st().qp_n; i++)
     {
         const SndQP &q = s.qp[list[i]];
+        if (c.P->irn) irn_skip_sent(s, *c.P, list[i]);
         if (bytes_left(q) == 0 && !c.P->simai) // ns-3-alibabacloud dropped this skip
+            continue;
+        if (c.P->irn && q.next_avail <= c.now)
             continue;
         t = q.next_avail < t ? q.next_avail : t;
     }
@@ -2050,6 +2097,29 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
     hsel(c, q.nic); // the queue pair's NIC (GetNicIdxOfQp): rate changes, TriggerTransmit
     if (p.seq > q.snd_una)
         q.snd_una = p.seq;
+    if (c.P->irn)
+    {
+        auto &r = s.irn_sender[f];
+        auto *bits = s.irn_tx_bits + s.irn_off[f];
+        if (p.seq > r.highest_ack) r.highest_ack = p.seq;
+        if (p.sack.size)
+            irn_mark(r.sack, bits, p.sack.seq / c.P->mtu);
+        q.snd_una = irn_skip(r.sack, bits, q.snd_una, q.size, c.P->mtu);
+        while (r.sack.count && uint64_t(r.sack.first) * c.P->mtu < q.snd_una)
+            irn_remove_first(r.sack, bits);
+        if (q.snd_nxt < q.snd_una) q.snd_nxt = q.snd_una;
+        if (q.snd_una >= r.recovery_seq) r.recovery = false;
+        irn_skip_sent(s, *c.P, f);
+        if (q.snd_una >= q.size) q.t_irn = -1;
+        else if (q.snd_nxt > q.snd_una) irn_arm(c, f);
+        if (p.sack.size && !r.recovery)
+        {
+            r.recovery_seq = q.snd_nxt;
+            q.snd_nxt = q.snd_una;
+            r.recovery = true;
+        }
+        if (!p.sack.size) r.recovery = false;
+    }
     if (q.snd_una >= q.size)
     {
         // QpComplete
@@ -2069,7 +2139,7 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
             c.ord += dag_fire(s, f, 0, c.now, c.cur, c.ord); // (the ACK event's next events follow its callback's)
 #endif
     }
-    if (p.kind == K_NACK)
+    if (!c.P->irn && p.kind == K_NACK)
         q.snd_nxt = q.snd_una;
     if (p.cnp && c.P->cc == 1 && !q.done) // (after QpComplete its timers would touch nothing else)
         dcqcn_cnp(c, f, q);
@@ -2095,11 +2165,42 @@ __device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
     // data for a flow received whole: if the sender has completed by now, ns-3 has deleted the
     // receiving queue pair, and a new one would answer with a NACK (not modelled; needs a drop)
     if (r.expected >= s.fi[p.flow].size)
-        atomicAdd(&s.ev[13], 1ull);
+    {
+        if (!c.P->irn)
+            atomicAdd(&s.ev[13], 1ull);
+        else
+        {
+            auto &life = s.irn_lifetime[p.flow];
+            int64_t at = atomicAdd(&life.close_at, 0ull);
+            if (!life.reopened && at && (at < c.now ||
+                (at == c.now && before(s, at, 0, life.close_chain, at, 0, c.cur))))
+            {
+                // A whole receiver QP has no remaining SACK bits. ReceiveUdp
+                // creates an empty QP on its first access after qp_finish.
+                r = RcvQP{};
+                life.reopened = true;
+            }
+        }
+    }
     // ReceiverCheckSeq (m_milestone_rx is reset to the ACK interval on every packet)
     int x;
     uint32_t expected = r.expected;
-    if (p.seq == expected)
+    if (c.P->irn)
+    {
+        auto &m = s.irn_receiver[p.flow];
+        auto *bits = s.irn_rx_bits + s.irn_off[p.flow];
+        if (p.seq > expected)
+        {
+            unsigned segment = p.seq / c.P->mtu;
+            if (irn_contains(bits, segment) && c.now < r.nack_timer) return;
+            irn_mark(m, bits, segment);
+            r.nack_timer = c.now + c.P->nack_interval;
+        }
+        else if (p.seq == expected)
+            r.expected = irn_skip(m, bits, uint64_t(expected) + payload, s.fi[p.flow].size, c.P->mtu);
+        x = m.count ? 2 : 1;
+    }
+    else if (p.seq == expected)
     {
         r.expected = expected + payload;
         if (r.expected >= c.P->ack_interval)
@@ -2128,8 +2229,15 @@ __device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
         atomicAdd(&s.ev[11], 1ull);
     Pkt a = p;
     a.kind = x == 1 ? K_ACK : K_NACK;
+    if (c.P->irn)
+    {
+        a.kind = K_NACK;
+        a.sack.seq = x == 2 ? p.seq : 0;
+        a.sack.size = x == 2 ? payload : 0;
+        if (x == 2) atomicAdd(s.irn_counts, 1ull);
+    }
     a.seq = r.expected;
-    a.cnp = p.ecn ? 1 : 0;
+    a.cnp = p.ecn || (c.P->irn && p.seq > expected);
     a.ecn = 0;
     a.size = (uint16_t)ack_size(*c.P);
     hsel(c, s.fi[p.flow].rnic); // the receiving queue pair's NIC (GetNicIdxOfRxQp)
@@ -2152,6 +2260,7 @@ __device__ __forceinline__ void h_start(HCtx<ND> &c, int f)
     SndQP &q = s.qp[f];
     q = SndQP{};
     q.size = fi.size;
+    q.t_irn = -1;
     if (fi.fast)
     {
         atomicAdd(&s.srv_fact[s.h_srv[c.h]], 1); // (its server's GPUs run single slots until it completes)
@@ -2194,13 +2303,14 @@ constexpr int MAX_DUE = 64;
 
 __device__ const Chain &due_chain(const Sim &s, const Due &d)
 {
+    if (d.kind == 3) return s.irn_sender[d.flow].timer_chain;
     const QPChains &qc = s.qc[d.flow];
     return d.kind == 0 ? qc.alpha : d.kind == 1 ? qc.dec : qc.rp;
 }
 __device__ __forceinline__ int64_t due_now(const Sim &s, const Due &d)
 {
     const SndQP &q = s.qp[d.flow];
-    return d.kind == 0 ? q.t_alpha : d.kind == 1 ? q.t_dec : q.t_rp;
+    return d.kind == 0 ? q.t_alpha : d.kind == 1 ? q.t_dec : d.kind == 2 ? q.t_rp : q.t_irn;
 }
 
 // a host's arrival of the slot in LDS: its frame (the index in s.msg for its chain), its arrival's
@@ -2228,6 +2338,7 @@ __device__ __forceinline__ void h_start_dyn(HCtx<ND> &c, int f)
     int64_t pi = s.wp_off[w] + (int64_t)a * hn + b, pr = s.wp_off[w] + (int64_t)b * hn + a;
     uint16_t port = s.pcnt[pi]++;
     x.sport = port;
+    x.dport = 100;
     x.start = c.now;
     const PairNic &sn = s.pnic[pi], &rn = s.pnic[pr];
     if (x.fast)
@@ -2279,7 +2390,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                 {
                     // (the timers due in the window must fit in the list)
                     const Host &st = s.hs[bi.base + d];
-                    if (st.due_min < t1 && st.qp_n * 3 > MAX_DUE)
+                    if (st.due_min < t1 && st.qp_n * (3 + int(WP.irn)) > MAX_DUE)
                         total = HPOOL + 1;
                 }
             }
@@ -2395,10 +2506,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             for (int i = 0; i < c.stv[d].qp_n; i++)
             {
                 const SndQP &q = s.qp[list[i]];
-                int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
-                for (int k = 0; k < 3; k++)
+                int64_t t[4] = {q.t_alpha, q.t_dec, q.t_rp, q.t_irn};
+                for (int k = 0; k < 4; k++)
                     mn = t[k] >= 0 && t[k] < mn ? t[k] : mn;
-                for (int k = 0; k < 3; k++)
+                for (int k = 0; k < 4; k++)
                     if (t[k] >= 0 && t[k] < t1)
                     {
                         if (ndue == MAX_DUE)
@@ -2656,7 +2767,18 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
         else if (bk == 3)
         {
             Due x = due[di++];
-            dcqcn_timer(c, x.flow, x.kind);
+            if (x.kind == 3)
+            {
+                SndQP &q = s.qp[x.flow];
+                auto &r = s.irn_sender[x.flow];
+                q.t_irn = -1;
+                r.recovery = true;
+                q.snd_nxt = q.snd_una;
+                atomicAdd(s.irn_counts + 2, 1ull);
+                hsel(c, q.nic);
+                h_dequeue(c);
+            }
+            else dcqcn_timer(c, x.flow, x.kind);
         }
         else
         {
@@ -2694,8 +2816,8 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                 for (int i = 0; i < st.qp_n; i++)
                 {
                     const SndQP &q = s.qp[list[i]];
-                    int64_t t[3] = {q.t_alpha, q.t_dec, q.t_rp};
-                    for (int k = 0; k < 3; k++)
+                    int64_t t[4] = {q.t_alpha, q.t_dec, q.t_rp, q.t_irn};
+                    for (int k = 0; k < 4; k++)
                         mn = t[k] >= 0 && t[k] < mn ? t[k] : mn;
                 }
                 c.stv[d].due_min = mn;
@@ -2831,6 +2953,7 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     f->ts = ts;
     f->c = cur;
     f->p = p;
+    if (c.P->irn) irn_final_hop(s, p, c.w[port].ob.link, c.now, ts, cur);
     trace_tx(s, c.now, c.node, port, p);
 }
 
@@ -2924,7 +3047,16 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     const Params &P = *c.P;
     Port &pt = c.w[port].pt;
     Port &in = c.w[p.inport].pt;
-    if (c.safe)
+    if (P.irn)
+    {
+        uint32_t shared = pt.egr > 1049 ? pt.egr - 1049 : 0;
+        c.sw.shared_used -= shared < p.size ? shared : p.size;
+        c.sw.irn_ingress -= p.size;
+        in.ing -= p.size;
+        in.hdrm -= in.hdrm < p.size ? in.hdrm : p.size;
+        pt.egr -= p.size;
+    }
+    else if (c.safe)
     {
         // no headroom anywhere, no port paused: RemoveFromIngressAdmission takes it from ing
         atomicSub(&in.ing, (uint32_t)p.size);
@@ -2951,12 +3083,13 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
         // SwitchMmu::ShouldSendCN
         bool mark = false;
         const uint32_t kmin = c.w[port].kmin, kmax = c.w[port].kmax;
-        if (pt.egr > kmax)
+        uint32_t ecn_bytes = P.irn ? (pt.egr > 1049 ? pt.egr - 1049 : 0) : pt.egr;
+        if (ecn_bytes > kmax)
             mark = true;
-        else if (pt.egr > kmin)
+        else if (ecn_bytes > kmin)
         {
-            double pr = pcfg(c, port).pmax * (double)(pt.egr - kmin) / (double)(kmax - kmin);
-            mark = nsm_rng::rand_u01(pt.rng) < pr;
+            double pr = pcfg(c, port).pmax * (double)(ecn_bytes - kmin) / (double)(kmax - kmin);
+            mark = nsm_rng::rand_u01(P.irn ? c.w[0].pt.rng : pt.rng) < pr;
         }
         if (mark)
         {
@@ -3002,7 +3135,8 @@ __device__ __forceinline__ int s_route(const Sim &s, const Params &P, int x, con
     *q = (P.ack_high_prio && !data) ? 0 : PG;
     if (rt.n == 0)
         return -1;
-    uint32_t w2 = data ? (p.sport | 100u << 16) : (100u | (uint32_t)p.sport << 16);
+    uint32_t dport = P.irn && !P.simai ? s.fi[p.flow].dport : 100u;
+    uint32_t w2 = data ? (p.sport | dport << 16) : (dport | (uint32_t)p.sport << 16);
     uint32_t hsh = ecmp_hash(node_ip(src), node_ip(dst), w2, si.seed);
     return s.rtp[rt.off + hsh % rt.n];
 }
@@ -3012,7 +3146,31 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     const Sim &s = *c.s;
     if (out < 0)
         return;
-    if (q != 0 && c.safe)
+    if (q != 0 && c.P->irn)
+    {
+        // Author's Broadcom model, one data priority. Guaranteed bytes are
+        // the first MTU+1 on each output. Queue 0 bypasses admission.
+        auto &in = c.w[inport].pt;
+        auto &egress = c.w[out].pt.egr;
+        uint32_t pool = c.P->buffer_size - c.sw.total_rsrv;
+        uint32_t shared = egress > 1049 ? egress - 1049 : 0;
+        uint32_t ingress_limit = pool - c.sw.total_hdrm;
+        if (c.sw.irn_ingress + p.size > c.P->buffer_size ||
+            c.sw.shared_used + p.size > pool ||
+            shared + p.size > pool - c.sw.shared_used ||
+            (in.ing + p.size > 1048 && c.sw.irn_ingress > ingress_limit &&
+             in.hdrm + p.size > pcfg(c, inport).hdrm_cap))
+        {
+            atomicAdd(&s.ev[0], 1ull);
+            return;
+        }
+        c.sw.irn_ingress += p.size;
+        if (c.sw.irn_ingress > ingress_limit) in.hdrm += p.size;
+        in.ing += p.size;
+        egress += p.size;
+        c.sw.shared_used += (egress > 1049 ? egress - 1049 : 0) - shared;
+    }
+    else if (q != 0 && c.safe)
     {
         // below every threshold for the whole slot: no drop, no headroom, no PAUSE; only ing
         // changes (shared_used follows from it at the end of the slot)
@@ -3047,7 +3205,7 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
                    out + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, inport), p.src, p.dst, p.seq, c.w[out].pt.q3_n);
 #endif
         // CheckAndSendPfc
-        if (!c.nvs && !in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c, inport)))
+        if (c.P->qbb && !c.nvs && !in.mmu_paused && (in.hdrm > 0 || shared_used(in) >= pfc_thresh(c, inport)))
         {
             s_send_pfc(c, inport, 0);
             in.mmu_paused = 1;
@@ -3357,7 +3515,7 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = pooled && total <= LK && nsl * D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
+    bool safe = !WP.irn && pooled && total <= LK && nsl * D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
     // (the ports' sums and checks by their lanes: a wide switch's ports, one after the other, cost
     // more than its events)
     __shared__ unsigned long long sw_sum;

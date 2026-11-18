@@ -1,0 +1,49 @@
+diff --git i/scratch/network-load-balance.cc w/scratch/network-load-balance.cc
+index 5cc09f4..09bdd45 100644
+--- i/scratch/network-load-balance.cc
++++ w/scratch/network-load-balance.cc
+@@ -195,6 +195,29 @@ uint32_t flow_num;
+ /**
+  * Read flow input from file "flowf"
+  */
++static FILE *tx_out;
++static uint64_t tx_from = 0, tx_until = UINT64_MAX;
++
++static void tx_begin(uint32_t node, uint32_t dev, Ptr<const Packet> p)
++{
++    uint64_t now = Simulator::Now().GetTimeStep();
++    if (now < tx_from || now > tx_until)
++        return;
++    CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
++    ch.getInt = 1;
++    p->PeekHeader(ch);
++    char kind = '?';
++    uint32_t a = Settings::ip_to_node_id(Ipv4Address(ch.sip)), b = Settings::ip_to_node_id(Ipv4Address(ch.dip)), sport = 0, seq = 0;
++    if (ch.l3Prot == 0x11)
++        kind = 'D', sport = ch.udp.sport, seq = ch.udp.seq;
++    else if (ch.l3Prot == 0xFC || ch.l3Prot == 0xFD)
++        kind = ch.l3Prot == 0xFC ? 'A' : 'N', sport = ch.ack.dport, seq = ch.ack.seq;
++    else if (ch.l3Prot == 0xFE)
++        kind = ch.pfc.time > 0 ? 'P' : 'R', a = ch.pfc.qIndex, b = 0;
++    fprintf(tx_out, "%lu %u %u %c %u %u %u %u %u %u\n", now, node, dev, kind, a, b, sport, seq, p->GetSize(),
++            (unsigned)(ch.m_tos & 3));
++}
++
+ void ReadFlowInput() {
+     if (flow_input.idx < flow_num) {
+         flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.maxPacketCount >>
+@@ -1790,6 +1813,14 @@ int main(int argc, char *argv[]) {
+     Simulator::Schedule(Seconds(flowgen_start_time),
+                         &stop_simulation_middle);  // check every 100us
+     Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
++    if (const char *path = getenv("TWINS_TXTRACE")) {
++        tx_out = fopen(path, "w");
++        for (uint32_t i = 0; i < n.GetN(); ++i)
++            for (uint32_t j = 0; j < n.Get(i)->GetNDevices(); ++j) {
++                Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(n.Get(i)->GetDevice(j));
++                if (dev) dev->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&tx_begin, i, dev->GetIfIndex()));
++            }
++    }
+     Simulator::Run();
+ 
+     /*-----------------------------------------------------------------------------*/
