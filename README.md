@@ -52,6 +52,9 @@ nothing or lose; see [docs/ai/speed.md](docs/ai/speed.md). On that host the 42 p
 faster than SimAI on one core and 5.9–14× faster than SimAI with threads, all identical
 ([docs/ai/paper.md](docs/ai/paper.md), "On an RTX 5090").
 
+The [extension validation guide](validation/extensions/README.md) describes mixed-rate TCP graphs,
+automatic TCP retries, and selective retransmission for loss-tolerant RDMA and AI workloads.
+
 ## Build
 
 ```shell
@@ -118,7 +121,7 @@ cmake --build build -j
 ## How it works
 
 **Execution model.**
-- Time advances in slots of one link propagation delay (1 µs), the lookahead: a frame sent in
+- Time advances in slots of the shortest link propagation delay (1 µs on the default fabric), the lookahead: a frame sent in
   slot s reaches the next hop no earlier than slot s + 1.
 - Within a slot, every host (one GPU thread) and every switch port processes its own events in
   timestamp order, with picosecond timestamps. Slots synchronize entities without quantizing
@@ -188,7 +191,7 @@ Hadoop, lunaWrite, data mining) at 30–70% load (`docs/workloads.md`).
 A few runs (3 of 138 k=8 and 8 of 48 k=16 sweep configurations, k16 a2a30 NewReno with spraying)
 contain simultaneous events whose recorded histories are equal over all 9 runs a 64-byte frame
 holds. TwiNS counts such undecided ties and warns; `twins128` (128-byte frames, 25 runs) decides
-them, and the validation scripts and `bench/sweep.py` rerun with it when needed.
+them. The default executable retries affected worlds with longer histories and host timer ordering.
 
 For comparison:
 - The GeDES model is off by 15–92% in mean FCT on the same workloads.
@@ -378,10 +381,11 @@ them, see `validation/README.md`.
   which is 1.2–1.5× slower. The lean kernel is within 1.1–1.45× of the first version, which
   modelled only that case.
 - **Event-order ties.** When two simultaneous events have equal histories beyond what a frame
-  records, the order is a guess; TwiNS reports these (`undecided-ties`) and `twins128` reaches
-  further back.
-- **Topology files.** Links all run at 100 Gbps with 1 µs delay (the slot is the propagation
-  delay; mixed rates are not modelled yet); hosts have one link.
+  records, TwiNS reports an undecided tie. The driver tries successively longer histories,
+  reports wall time for each pass, and returns a failure status on an unresolved final pass.
+- **Topology files.** A TCP graph link accepts optional positive `rate_bps delay_ps` columns.
+  Omitted fields select 100 Gb/s and 1 µs. Hosts have one link. Mixed graphs select the general
+  kernel, whose arrival ring and history storage are sized for the graph.
 - **Protocols.** RDMA (PFC, DCQCN, HPCC, DCTCP) is modelled by `twins-rdma`, against the HPCC
   simulator rather than ns-3.46; see `validation/hpcc/README.md` for what it does not cover.
 - **What exactness is relative to.** It is defined against sequential ns-3.46.1 built with GCC

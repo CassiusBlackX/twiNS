@@ -37,7 +37,8 @@ sequential ns-3's event order.
 
 ```shell
 cd ns-3.46.1 && patch -p1 < .../validation/ns3/ipv4-global-routing.patch
-cp .../validation/ns3/twins-ref.cc scratch/
+patch -p1 < .../validation/ns3/flow-ecmp.patch
+cp .../validation/ns3/twins-ref.cc .../src/link_timing.h scratch/
 ./ns3 configure -d optimized && ./ns3 build scratch/twins-ref
 ```
 
