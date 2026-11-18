@@ -8,6 +8,26 @@
 namespace rdma
 {
 
+#ifdef TWINS_IRN_PROFILE
+__device__ __forceinline__ unsigned long long device_clock()
+{
+#ifdef __CUDA_ARCH__
+    unsigned long long ticks;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ticks));
+    return ticks;
+#elif defined(__HIP_DEVICE_COMPILE__)
+    return wall_clock64();
+#else
+    return 0;
+#endif
+}
+__device__ __forceinline__ SlotSample *sample(const Sim &s, int64_t slot, int node)
+{
+    int64_t delta=slot-s.sample_first;
+    if (!s.samples || delta<0 || (delta%64) || delta/64>=s.sample_count) return nullptr;
+    return &s.samples[(size_t)(delta/64)*s.N+node];
+}
+#endif
 // ------------------------------------------------------------------ ns-3.17 time and rates
 // Seconds(x) for 0 <= x: int64x64_t(x) is floor(x) . floor(frac(x) 2^64) in 64.64 fixed point;
 // multiplying by 10^9 (int64x64_t::Mul, exact here) and taking the high word (Time(int64x64_t))
@@ -1513,7 +1533,7 @@ __device__ __forceinline__ uint32_t ecmp_hash(uint32_t w0, uint32_t w1, uint32_t
 
 __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, int port, const Pkt &p)
 {
-    if (!s.tx || now < s.tx_from || now > s.tx_until)
+    if (!s.tx || now < s.tx_from || now > s.tx_until || (s.tx_ports && !s.tx_ports[size_t(node) * s.K + port]))
         return;
     unsigned long long i = atomicAdd(s.tx_cnt, 1ull);
     if (i >= s.tx_cap)
@@ -3354,6 +3374,10 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
     Chain *tcs = s.p_tc + bi.base;
     const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + nsl * D;
     const int node = s.H + x, deg = bi.deg;
+#ifdef TWINS_IRN_PROFILE
+    SlotSample *profile = lane==0 ? sample(s,slot,node) : nullptr;
+    if (profile) profile->begin=device_clock();
+#endif
     const Params &WP = s.Pw[s.s_world[x]];
     Port *gp = s.ps + bi.base;
     // ports, and the bounds of their arrivals: at most the last frame of slot s - 2 (a frame
@@ -3809,6 +3833,13 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         // all events in order, by lane 0 (a few ports: a scan is cheaper than the lanes' barriers)
         if (lane == 0)
         {
+#ifdef TWINS_IRN_PROFILE
+            if (profile) {
+                for(int p=0;p<deg;++p)
+                    profile->active_ports += cnt[p]>0 || (w[p].pt.tc_at>=0 && w[p].pt.tc_at<t1);
+                profile->serial_begin=device_clock();
+            }
+#endif
             SCtx c;
             c.s = &s;
             c.x = x;
@@ -3953,6 +3984,9 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
     #endif
             }
             s.sw[x] = c.sw;
+#ifdef TWINS_IRN_PROFILE
+            if (profile) profile->serial_end=device_clock();
+#endif
     #ifdef RDMA_PROF
             for (int i = 0; i < 4; i++)
                 atomicAdd(&s.ev[24 + i], ph[i]);
@@ -4224,6 +4258,9 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         }
 #endif
     }
+#ifdef TWINS_IRN_PROFILE
+    if (profile) profile->end=device_clock();
+#endif
     return act ? 1 : 0;
 }
 
@@ -4494,7 +4531,14 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
 #ifdef RDMA_PROF
         long long c0 = clock64();
 #endif
+#ifdef TWINS_IRN_PROFILE
+        auto *profile = lane==0 ? sample(s,slot+j,h) : nullptr;
+        if(profile) profile->begin=device_clock();
+#endif
         act |= host_step<ND>(s, bi, slot + j, &w, lane, lanes, pool, hints, due, nsl, h_dev, h_dag);
+#ifdef TWINS_IRN_PROFILE
+        if(profile) profile->end=device_clock();
+#endif
         if (nsl > 1 && hints[0] > HPOOL)
         {
             nsl = 1;

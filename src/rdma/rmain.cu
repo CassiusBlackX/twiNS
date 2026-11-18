@@ -2035,12 +2035,39 @@ int main(int argc, char **argv)
     if (!tx_file.empty())
     {
         s.tx_cap = 64ull << 20;
+        if (const char *path = getenv("TWINS_TRACE_PORTS"))
+        {
+            std::ifstream in(path);
+            std::vector<uint8_t> mask(size_t(N) * K);
+            int node, dev;
+            while (in >> node >> dev)
+            {
+                if (node < 0 || node >= N || dev < 1 || dev > deg[node]) {
+                    fprintf(stderr, "invalid trace port %d %d\n", node, dev);
+                    return 1;
+                }
+                mask[size_t(node) * K + dev - 1] = 1;
+            }
+            if (!in.eof() || std::none_of(mask.begin(), mask.end(), [](uint8_t x) { return x != 0; })) {
+                fprintf(stderr, "cannot read trace ports from %s\n", path);
+                return 1;
+            }
+            s.tx_ports = dev_copy(mask);
+            s.tx_cap = 4ull << 20;
+        }
         s.tx = dev_alloc<TxRec>(s.tx_cap);
         if (P.irn) s.irn_wire = dev_alloc<IrnWire>(s.tx_cap);
         s.tx_cnt = dev_alloc<unsigned long long>(1);
         s.tx_from = tx_from;
         s.tx_until = tx_until;
     }
+#ifdef TWINS_IRN_PROFILE
+    if (const char *first=getenv("TWINS_SAMPLE_FIRST_SLOT")) {
+        s.sample_first=atoll(first);
+        s.sample_count=256;
+        s.samples=dev_alloc<SlotSample>(size_t(s.N)*s.sample_count);
+    }
+#endif
     s.ev = dev_alloc<unsigned long long>(40);
     {
         Memo m;
@@ -2306,6 +2333,21 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
     if (g_cl)
         g_cl->nvl_fct(fi, fct, done); // (--nvl-record / --nvl-oracle: the flows within servers)
+#endif
+#ifdef TWINS_IRN_PROFILE
+    if(s.samples) {
+        vector<SlotSample> samples(size_t(s.N)*s.sample_count);
+        CK(cudaMemcpy(samples.data(),s.samples,samples.size()*sizeof(SlotSample),cudaMemcpyDeviceToHost));
+        FILE *pf=fopen("device-intervals.txt","w");
+        if(!pf) return 1;
+        for(size_t i=0;i<samples.size();++i) {
+            const auto &v=samples[i];
+            if(v.end>v.begin) fprintf(pf,"%lld %zu %d %llu %llu %llu %llu %u\n",
+                (long long)(s.sample_first+64*(i/s.N)),i%s.N,int(i%s.N>=size_t(s.H)),
+                v.begin,v.end,v.serial_begin,v.serial_end,v.active_ports);
+        }
+        fclose(pf);
+    }
 #endif
     unsigned long long ev[40];
     CK(cudaMemcpy(ev, s.ev, sizeof(ev), cudaMemcpyDeviceToHost));

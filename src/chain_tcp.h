@@ -145,7 +145,10 @@ enum : int
 // leads equal, are decided by their roots' set-up order. Every case in which the recorded
 // history cannot tell the reference's order is undecided: equal lossy codes, a truncated chain
 // that runs out, a saturated count that runs out, equal roots. (Appendix A, Lemma A.2.)
-__host__ __device__ inline int chain_cmp_impl(const HistoryWord *a, const HistoryWord *b, int *why, unsigned long long *steps)
+#ifdef TWINS_SCALE_HIST
+__device__ unsigned long long comparison_runs[2][CHAIN_RUNS+1];
+#endif
+__host__ __device__ inline int chain_cmp_impl(const HistoryWord *a, const HistoryWord *b, int *why, unsigned long long *steps, unsigned *runs)
 {
     int dummy;
     if (!why)
@@ -160,6 +163,9 @@ __host__ __device__ inline int chain_cmp_impl(const HistoryWord *a, const Histor
         ++*steps;
 #endif
         HistoryWord ca = ia < CHAIN_RUNS ? a[2 * ia] : 0, cb = ib < CHAIN_RUNS ? b[2 * ib] : 0;
+#ifdef TWINS_SCALE_HIST
+        *runs = unsigned(ia + (ca != 0) > ib + (cb != 0) ? ia + (ca != 0) : ib + (cb != 0));
+#endif
         if (ca == 0 || cb == 0)
         {
             if ((ca == 0 && ta) || (cb == 0 && tb))
@@ -219,7 +225,12 @@ __host__ __device__ inline int chain_cmp_impl(const HistoryWord *a, const Histor
 
 __host__ __device__ inline int chain_cmp(const HistoryWord *a,const HistoryWord *b,int *why=nullptr) {
  unsigned long long steps=0;
- int r=chain_cmp_impl(a,b,why,&steps);
+ unsigned runs=0;
+ int reason=0;
+ int r=chain_cmp_impl(a,b,why ? why : &reason,&steps,&runs);
+#if defined(TWINS_SCALE_HIST) && (defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__))
+ atomicAdd(&comparison_runs[r == 0 && (why ? *why : reason) == TIE_TRUNC][runs], 1ull);
+#endif
 #ifdef TWINS_EVIDENCE
  twins_evidence::comparison(steps);
 #endif

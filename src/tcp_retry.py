@@ -19,6 +19,16 @@ def run(binary, args):
                  if line and not line.startswith("#")]
         args = [v for v in args if v != world_arg]
     sizes = [64, 128, 256, 512]
+    initial = next((v for v in args if v.startswith("--start-history=")), None)
+    level = 0
+    if initial:
+        profiles = [str(size) for size in sizes]
+        value = initial.split("=", 1)[1]
+        if value not in profiles:
+            raise ValueError("--start-history accepts 64, 128, 256 or 512")
+        level = profiles.index(value)
+        args = [v for v in args if v != initial]
+    initial_level = level
     with tempfile.TemporaryDirectory() as tmp:
         def attempt(ids, level, expanded):
             nonlocal sim, total_flows
@@ -55,7 +65,7 @@ def run(binary, args):
             if not complete:
                 sys.stderr.write(log + result.stderr)
                 return False
-            if level == 0 and not expanded:
+            if level == initial_level and not expanded:
                 total_flows += int(complete[1])
             active = affected("active-ovf")
             ties = affected("undecided-ties")
@@ -64,6 +74,10 @@ def run(binary, args):
             print(f"TCP pass bytes={frame_bytes} sized_active={int(expanded)} worlds={len(ids)} "
                   f"active_ovf={count('active-ovf')} ties={count('undecided-ties')} "
                   f"wall_s={time.monotonic()-t:.6f}", flush=True)
+            if active or ties:
+                for line in log.splitlines():
+                    if line.startswith(("TCP arrival ring", "TCP compared runs", "TCP heterogeneous")):
+                        print(line, flush=True)
             if any(count(f) for f in ("ooo-ovf", "rtt-ovf", "ring-ovf", "due-ovf")):
                 sys.stderr.write(log + result.stderr)
                 return False
@@ -87,7 +101,7 @@ def run(binary, args):
                                          expanded or bool(group & active)):
                     return False
             return True
-        ok = attempt(list(range(len(lines))) if lines is not None else [0], 0, False)
+        ok = attempt(list(range(len(lines))) if lines is not None else [0], level, False)
     if ok and lines is not None:
         print(f"flows {total_flows} completed {total_flows} across {len(lines)} worlds")
     print(f"Simulation Duration: {sim:.6f}s\nTotal TCP wall: {time.monotonic()-start:.6f}s")

@@ -427,6 +427,12 @@ struct SwInfo
 // Worlds are independent networks run side by side (a batch): their hosts come first, then their
 // switches, links and flows, in world order. They share the slot (P.delay, the shortest link delay)
 // and the tx rule (P.simai); everything else is per world (Pw) or per link and port.
+#ifdef TWINS_IRN_PROFILE
+struct SlotSample {
+    unsigned long long begin, end, serial_begin, serial_end;
+    unsigned active_ports;
+};
+#endif
 struct Sim
 {
     IrnSender *irn_sender;
@@ -583,7 +589,13 @@ struct Sim
     struct TxRec *tx;
     struct IrnWire *irn_wire;
     unsigned long long *tx_cnt, tx_cap;
+#ifdef TWINS_IRN_PROFILE
+    SlotSample *samples;
+    int64_t sample_first;
+    int sample_count;
+#endif
     int64_t tx_from, tx_until;
+    const uint8_t *tx_ports; // optional diagnostic mask indexed by node and zero-based port
     unsigned long long *ev; // counters (see main)
 };
 

@@ -1120,6 +1120,8 @@ int main(int argc, char **argv)
     printf("TCP heterogeneous slot %lld ps, %d banks, %d frames/slot, %zu-byte frame, %d history runs\n",
            (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
 #endif
+    printf("TCP arrival ring links=%d banks=%d frames_per_link_bucket=%d frame_bytes=%zu allocation_bytes=%zu\n",
+           s.L, banks, tx_capacity, sizeof(Frame), (size_t)banks * s.L * (tx_capacity * sizeof(Frame) + sizeof(long long)));
     s.msg = dalloc<Frame>((size_t)banks * s.L * tx_capacity);
     s.msg_cnt = dalloc<long long>((size_t)banks * s.L);
     {
@@ -1227,6 +1229,18 @@ int main(int argc, char **argv)
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
            " | undecided-ties %llu\n",
            M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25]);
+#ifdef TWINS_SCALE_HIST
+    unsigned long long general[2][CHAIN_RUNS+1], basic_runs[2][CHAIN_RUNS+1]{};
+    CHECK(hipMemcpyFromSymbol(general,HIP_SYMBOL(kfull::comparison_runs),sizeof(general)));
+#ifndef TWINS_LINK_TIMING
+    CHECK(hipMemcpyFromSymbol(basic_runs,HIP_SYMBOL(kbasic::comparison_runs),sizeof(basic_runs)));
+#endif
+    for(int truncated=0; truncated<2; ++truncated) {
+        printf("TCP compared runs truncated=%d bins=",truncated);
+        for(int n=0;n<=CHAIN_RUNS;++n) printf("%s%llu",n?",":"",general[truncated][n]+basic_runs[truncated][n]);
+        printf("\n");
+    }
+#endif
 #ifdef TWINS_EVIDENCE
     twins_evidence::report();
 #endif

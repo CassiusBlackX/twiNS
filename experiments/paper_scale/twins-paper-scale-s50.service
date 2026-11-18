@@ -1,0 +1,15 @@
+[Unit]
+Description=TwiNS 9950X and RTX 5090 measurements after the prior experiment queue
+After=network-online.target
+ConditionPathExists=!%h/Work/SpecDES/twins-paper-scale/out/campaign/s50/finished.json
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Work/SpecDES/twins-paper-scale
+ExecStart=/usr/bin/python -u experiments/paper_scale/s50_queue.py
+Restart=on-failure
+RestartSec=90
+Nice=10
+
+[Install]
+WantedBy=default.target
