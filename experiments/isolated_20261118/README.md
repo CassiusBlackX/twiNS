@@ -33,6 +33,11 @@ CPU multi-process concurrency is internal to one measured throughput setting.
   incomplete runs, and2-hour timeouts remain evidence; completion and equality
   are distinct. The `-t1` MTP scheduler is not the `NS3_MTP=OFF` sequential control.
 
+The frozen source retains32-bit per-logical-process MTP UID counters while the
+sequential core event UID is64-bit. This inherited representation is audited in
+`receipts/mtp-uid-audit.json`; no new MTP model patch is silently added. Identical
+source/patches do not make the two schedulers' ordering semantics equal.
+
 Before each setting observe a short idle window: GPU<8%, aggregate background
 CPU<one logical core, sufficient available memory. This is observed quiescence,
 not an OS reservation; desktop and foreign work are never stopped. Resource

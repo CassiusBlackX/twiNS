@@ -22,5 +22,10 @@ while True:
   verified+=1
  check=dict(utc_ns=time.time_ns(),remote_index_utc_ns=idx.get('utc_ns'),verified=verified,indexed=len(idx.get('files',{})),missing=missing,hash_mismatches=bad,passed=bool(idx) and not bad and not missing,scope=idx.get('scope'));(E/'receipts/archive-verification.json').write_text(json.dumps(check,indent=2)+'\n');report(E,M)
  done=read(D/'export/all-finished.json')
- if x.once or done and check['passed'] and idx.get('utc_ns',0)>=done['utc_ns']:break
+ if done and check['passed'] and idx.get('utc_ns',0)>=done['utc_ns']:
+  plot_python=Path('/tmp/twins-paper-plot-env/bin/python')
+  with (E/'receipts/final-plot.log').open('w') as log:
+   subprocess.run([str(plot_python) if plot_python.exists() else 'python3',str(Path(__file__).with_name('plot.py')),'--evidence',str(E)],stdout=log,stderr=subprocess.STDOUT,env={**__import__('os').environ,'MPLCONFIGDIR':'/tmp/twins-mpl'})
+  break
+ if x.once:break
  time.sleep(30)
