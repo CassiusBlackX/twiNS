@@ -21,6 +21,8 @@ def execute(command, cwd, env, log):
 
 def wire(path):
     rows = [line.split() for line in path.read_text().splitlines()]
+    if not rows or any(len(row) != 14 for row in rows):
+        raise ValueError("expected IRN wire fields in " + str(path))
     return sorted(rows, key=lambda row: tuple(map(int, row[:3])))
 
 

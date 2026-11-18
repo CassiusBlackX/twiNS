@@ -1525,6 +1525,16 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
     r.kind = p.kind;
     r.size = p.size;
     r.ecn = p.ecn;
+    if (s.irn_wire)
+    {
+        bool ack = p.kind == K_NACK || p.kind == K_ACK;
+        auto &extra = s.irn_wire[i];
+        extra.sack_seq = ack ? p.sack.seq : 0;
+        extra.sack_bytes = ack ? p.sack.size : 0;
+        extra.cnp = ack ? p.cnp : 0;
+        extra.dport = s.fi[p.flow].dport;
+        r.index = i;
+    }
     if (p.kind >= K_PAUSE)
     {
         r.a = p.q;

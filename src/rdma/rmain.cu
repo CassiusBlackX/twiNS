@@ -2036,6 +2036,7 @@ int main(int argc, char **argv)
     {
         s.tx_cap = 64ull << 20;
         s.tx = dev_alloc<TxRec>(s.tx_cap);
+        if (P.irn) s.irn_wire = dev_alloc<IrnWire>(s.tx_cap);
         s.tx_cnt = dev_alloc<unsigned long long>(1);
         s.tx_from = tx_from;
         s.tx_until = tx_until;
@@ -2411,11 +2412,23 @@ int main(int argc, char **argv)
         std::sort(r.begin(), r.end(), [](const TxRec &a, const TxRec &b) {
             return a.ts != b.ts ? a.ts < b.ts : a.node != b.node ? a.node < b.node : a.dev < b.dev;
         });
+        vector<IrnWire> feedback(s.irn_wire ? n : 0);
+        if (s.irn_wire)
+            CK(cudaMemcpy(feedback.data(), s.irn_wire, n * sizeof(IrnWire), cudaMemcpyDeviceToHost));
         FILE *ft = fopen(tx_file.c_str(), "w");
+        if (!ft) { perror("opening txtrace"); return 1; }
         const char kinds[] = "DANPR";
         for (auto &x : r)
-            fprintf(ft, "%lld %d %d %c %u %u %u %u %u %u\n", (long long)x.ts, x.node, x.dev, kinds[x.kind], x.a, x.b, x.sport, x.seq,
-                    x.size, x.ecn);
+        {
+            fprintf(ft, "%lld %d %d %c %u %u %u %u %u %u", (long long)x.ts, x.node, x.dev, kinds[x.kind],
+                    x.a, x.b, x.sport, x.seq, x.size, x.ecn);
+            if (s.irn_wire)
+            {
+                const auto &f = feedback[x.index];
+                fprintf(ft, " %u %u %u %u", f.dport, f.sack_seq, f.sack_bytes, f.cnp);
+            }
+            fputc('\n', ft);
+        }
         fclose(ft);
     }
 #ifdef RDMA_PROF

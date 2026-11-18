@@ -14,8 +14,9 @@ def load(path):
     with open(path) as f:
         for line in f:
             v = line.split()
-            if len(v) == 10:
-                rows.append((int(v[0]), int(v[1]), int(v[2]), v[3], int(v[4]), int(v[5]), int(v[6]), int(v[7]), int(v[8]), int(v[9])))
+            if len(v) not in (10, 14):
+                raise ValueError("invalid transmission record: " + line)
+            rows.append((*map(int, v[:3]), v[3], *map(int, v[4:])))
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     return rows
 

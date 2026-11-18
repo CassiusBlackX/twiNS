@@ -1,10 +1,12 @@
 diff --git i/scratch/network-load-balance.cc w/scratch/network-load-balance.cc
-index 5cc09f4..09bdd45 100644
+index 5cc09f4..ce9d103 100644
 --- i/scratch/network-load-balance.cc
 +++ w/scratch/network-load-balance.cc
-@@ -195,6 +195,29 @@ uint32_t flow_num;
- /**
-  * Read flow input from file "flowf"
+@@ -21,2 +21,3 @@
+ #include <ns3/assert.h>
++#include <ns3/qbb-header.h>
+ #include <ns3/rdma-client-helper.h>
+@@ -197,2 +198,28 @@ uint32_t flow_num;
   */
 +static FILE *tx_out;
 +static uint64_t tx_from = 0, tx_until = UINT64_MAX;
@@ -25,16 +27,15 @@ index 5cc09f4..09bdd45 100644
 +        kind = ch.l3Prot == 0xFC ? 'A' : 'N', sport = ch.ack.dport, seq = ch.ack.seq;
 +    else if (ch.l3Prot == 0xFE)
 +        kind = ch.pfc.time > 0 ? 'P' : 'R', a = ch.pfc.qIndex, b = 0;
-+    fprintf(tx_out, "%lu %u %u %c %u %u %u %u %u %u\n", now, node, dev, kind, a, b, sport, seq, p->GetSize(),
-+            (unsigned)(ch.m_tos & 3));
++    const bool feedback = kind == 'A' || kind == 'N';
++    const unsigned dport = feedback ? ch.ack.sport : ch.udp.dport;
++    fprintf(tx_out, "%lu %u %u %c %u %u %u %u %u %u %u %u %u %u\n", now, node, dev, kind, a, b,
++            sport, seq, p->GetSize(), (unsigned)(ch.m_tos & 3), dport, feedback ? ch.ack.irnNack : 0,
++            feedback ? ch.ack.irnNackSize : 0, feedback ? ((ch.ack.flags >> qbbHeader::FLAG_CNP) & 1) : 0);
 +}
 +
  void ReadFlowInput() {
-     if (flow_input.idx < flow_num) {
-         flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.maxPacketCount >>
-@@ -1790,6 +1813,14 @@ int main(int argc, char *argv[]) {
-     Simulator::Schedule(Seconds(flowgen_start_time),
-                         &stop_simulation_middle);  // check every 100us
+@@ -1792,2 +1819,10 @@ int main(int argc, char *argv[]) {
      Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
 +    if (const char *path = getenv("TWINS_TXTRACE")) {
 +        tx_out = fopen(path, "w");
@@ -45,5 +46,3 @@ index 5cc09f4..09bdd45 100644
 +            }
 +    }
      Simulator::Run();
- 
-     /*-----------------------------------------------------------------------------*/

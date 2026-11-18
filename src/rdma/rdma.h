@@ -581,6 +581,7 @@ struct Sim
 #endif
     // tracing: every transmission start in [tx_from, tx_until]
     struct TxRec *tx;
+    struct IrnWire *irn_wire;
     unsigned long long *tx_cnt, tx_cap;
     int64_t tx_from, tx_until;
     unsigned long long *ev; // counters (see main)
@@ -653,6 +654,13 @@ struct PairNic
     uint8_t sn, s[3], rn, r[3];
 };
 
+struct IrnWire
+{
+    uint32_t sack_seq;
+    uint16_t sack_bytes, dport;
+    uint8_t cnp;
+};
+
 // one transmission start (rdma-ref --txtrace)
 struct TxRec
 {
@@ -661,6 +669,7 @@ struct TxRec
     uint32_t a, b, sport, seq; // src/dst host (PFC: queue, 0)
     uint16_t size;
     uint8_t kind, ecn;
+    uint32_t index; // original offset of the optional IRN feedback fields
 };
 
 // a link's frames arriving in a slot: their count, and the index of the first in s.msg
