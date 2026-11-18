@@ -89,6 +89,7 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
  c.save(trial/'state.json',dict(status='running',utc_ns=time.time_ns(),engine=engine,target_concurrency=concurrency,policy=policy,timing_scope='Docker/process startup + stub + execution + admission; provenance and validation excluded'))
  active=[];done=[];reserved=0;peak=0;events=[];stopmon=threading.Event()
  def monitor():
+  foreign_streak=0
   with (trial/'resources.jsonl').open('w',buffering=1) as f:
    while not stopmon.is_set():
     tasks=list(active);processes={}
@@ -97,7 +98,9 @@ def batch(label,engine,concurrency,policy,cpu_pool=None,resource_context=None,re
      if engine=='simai':
       with contextlib.suppress(ValueError):pid=int(c.cmdout(['docker','inspect',t['container'],'--format','{{.State.Pid}}']))
      processes[t['v']['case']]=c.proc_tree(pid)
-    f.write(json.dumps(dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]))+'\n');stopmon.wait(5)
+    sample=dict(**c.snapshot(),active=[t['v']['case'] for t in tasks],reserved_gib=reserved,own_processes_by_job=processes,cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]);bad=c.foreign_gpu(sample) if hasattr(c,'foreign_gpu') else [];foreign_streak=foreign_streak+1 if bad else 0
+    if cancel_event is not None and foreign_streak>=2:sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel_event.set()
+    f.write(json.dumps(sample)+'\n');stopmon.wait(5)
  thread=threading.Thread(target=monitor);thread.start();start=time.perf_counter_ns();utc=time.time_ns()
  try:
   while queue or active:

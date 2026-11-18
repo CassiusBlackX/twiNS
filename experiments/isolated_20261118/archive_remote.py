@@ -29,6 +29,9 @@ while True:
   if p.name not in ('archive-index.json','health.json','state.json'):files.add(p)
  for p in (X/'mtp').glob('summary-*.json'):files.add(p)
  if read(X/'pilot-pipeline-finished.json'):files.update(p for p in (X/'pilot-pipeline').rglob('*') if p.is_file() and not p.name.endswith('.tmp'))
+ for root in ('interrupted-scans','preempted-cubic'):files.update(p for p in (X/root).rglob('*') if p.is_file() and not p.name.endswith('.tmp'))
+ for p in (X/'ai-batches').glob('*trial*/state.json'):
+  if read(p).get('status')=='interrupted':files.update(q for q in p.parent.rglob('*') if q.is_file() and not q.name.endswith('.tmp'))
  if read(E/'receipts/prepared.json'):files.update(p for p in (E/'receipts').rglob('*') if p.is_file() and not p.name.endswith('.tmp'))
  idx={}
  for p in sorted(files):

@@ -44,10 +44,16 @@ def cubic():
     print(json.dumps(dict(label=label,accepted=result['accepted'],seconds=(event_ns or 0)/1e9)),flush=True)
  save(EXPORT/'cubic-finished.json',dict(utc_ns=time.time_ns(),executed=192))
 
-def _monitor(stop,d,active):
+def _monitor(stop,d,active,cancel):
+ streak=0
  with (d/'resources.jsonl').open('w',buffering=1) as f:
   while not stop.is_set():
-   tasks=list(active);f.write(json.dumps(dict(**c.snapshot(),active=[x['case'] for x in tasks],own_processes_by_job={x['case']:c.proc_tree(x['p'].pid) for x in tasks},cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]))+'\n');stop.wait(5)
+   tasks=list(active);sample=dict(**c.snapshot(),active=[x['case'] for x in tasks],own_processes_by_job={x['case']:c.proc_tree(x['p'].pid) for x in tasks},cpu_stat=Path('/proc/stat').read_text().split('intr ')[0]);bad=foreign_gpu(sample);streak=streak+1 if bad else 0
+   if streak>=2:
+    sample.update(interrupted_for_external_gpu=True,external_gpu=bad);cancel.set()
+    for task in tasks:
+     with contextlib.suppress(ProcessLookupError):os.killpg(task['p'].pid,signal.SIGTERM)
+   f.write(json.dumps(sample)+'\n');stop.wait(5)
 def scan_one(group,engine,setting,r):
  jobs=MANIFEST[group];formal=f'{group}-r{r}-{engine}{setting}';label=next_label(EXPORT/'tcp-scans',formal)
  if label is None:return
@@ -62,11 +68,12 @@ def scan_one(group,engine,setting,r):
   for i in range(0,len(jobs),setting):
    chunk=jobs[i:i+setting];worlds=raw/f'worlds-{i//setting}.txt';lines=[f"flows={INPUT/j['flows']},tcp={j['tcp']},queue={j['queue']},ecnK={j['ecnK']},out={raw/(j['case']+'.csv')}" for j in chunk];worlds.write_text('\n'.join(lines)+'\n');queue.append(dict(jobs=chunk,worlds=worlds,lines=lines))
  save(d/'prepared.json',dict(label=label,manifest_sha256=sha(E/'manifest.json'),engine=engine,setting=setting,job_order=[j['case'] for j in jobs],binary_sha256=sha(CPU) if engine=='cpu' else {x:sha(GPU/x) for x in ('twins','twins128')},exclusive_preflight=pre))
- stop=threading.Event();thread=threading.Thread(target=_monitor,args=(stop,d,active),daemon=True);thread.start();t0=time.perf_counter_ns();utc=time.time_ns();peak=0;events=[]
+ stop=threading.Event();cancel=threading.Event();thread=threading.Thread(target=_monitor,args=(stop,d,active,cancel),daemon=True);thread.start();t0=time.perf_counter_ns();utc=time.time_ns();peak=0;events=[]
  try:
   if engine=='cpu':
    done=[]
    while queue or active:
+    if cancel.is_set():raise InterruptedError('foreign GPU activity interrupted this scan')
     while queue and len(active)<setting:
      t=queue.pop(0);used={x['cpu'] for x in active};cpu=next(i for i in range(setting) if i not in used);cmd=cpu_cmd(t['job'],t['out'],0,str(cpu));f=t['log'].open('w');p=sp.Popen(cmd,stdout=f,stderr=sp.STDOUT,start_new_session=True);t.update(cpu=cpu,p=p,f=f,cmd=cmd,start=time.perf_counter_ns());active.append(t);peak=max(peak,len(active));events.append(dict(action='start',case=t['case'],cpu=cpu,ns=time.perf_counter_ns()-t0,active=len(active)))
     for t in list(active):
@@ -99,8 +106,13 @@ def scan_one(group,engine,setting,r):
     if binary=='twins' and rc==0 and indices:
      ids=sorted(indices);redo=[js[i] for i in ids];ls=[lines[i] for i in ids];wf=worlds.with_name(worlds.name+'.long');wf.write_text('\n'.join(ls)+'\n');run_group(redo,ls,wf,'twins128')
    statuses={}
-   for t in queue:run_group(t['jobs'],t['lines'],t['worlds'],'twins')
+   for t in queue:
+    if cancel.is_set():raise InterruptedError('foreign GPU activity interrupted this scan')
+    run_group(t['jobs'],t['lines'],t['worlds'],'twins')
   elapsed=time.perf_counter_ns()-t0;end_utc=time.time_ns()
+ except InterruptedError:
+  save(d/'interrupted.json',dict(utc_ns=time.time_ns(),elapsed_ns=time.perf_counter_ns()-t0,reason='foreign GPU competition; entire scan will be repeated',partial_events=events))
+  raise
  finally:
   stop.set();thread.join(20)
   for t in active:
@@ -125,5 +137,15 @@ def scans():
   settings=[('cpu',16),('cpu',32)]+([('gpu',1),('gpu',138)] if group=='scan138' else [('gpu',32)])
   for r in (1,2,3):
    shift=(r-1)%len(settings)
-   for eng,setting in settings[shift:]+settings[:shift]:scan_one(group,eng,setting,r)
+   for eng,setting in settings[shift:]+settings[:shift]:
+    while True:
+     try:scan_one(group,eng,setting,r);break
+     except InterruptedError:
+      formal=f'{group}-r{r}-{eng}{setting}'
+      for d in (EXPORT/'tcp-scans').glob(formal+'*'):
+       if (d/'interrupted.json').exists() and not (d/'result.json').exists():
+        dest=EXPORT/'interrupted-scans'/(d.name+'-'+str(time.time_ns()));dest.parent.mkdir(exist_ok=True);d.rename(dest)
+        raw=RAW/d.name
+        if raw.is_dir() and raw.resolve().parent==RAW.resolve():shutil.rmtree(raw)
+      state(stage='waiting_after_external_interruption',setting=formal);time.sleep(10)
  save(EXPORT/'tcp-scans-finished.json',dict(utc_ns=time.time_ns(),batches=21))

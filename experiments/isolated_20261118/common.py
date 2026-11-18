@@ -17,6 +17,32 @@ _snapshot=c.snapshot
 def snapshot():
  v=_snapshot();v['gpu_pmon']=c.cmdout(['nvidia-smi','pmon','-c','1','-s','u']);return v
 c.snapshot=snapshot
+def foreign_gpu(sample):
+ own={p['pid'] for p in c.proc_tree(os.getpid())}|{sample.get('pid')}|{p['pid'] for p in sample.get('own_processes',[])}|{p['pid'] for ps in sample.get('own_processes_by_job',{}).values() for p in ps};bad=[]
+ for line in sample.get('gpu_pmon','').splitlines():
+  f=line.split()
+  if len(f)>4 and f[0].isdigit() and f[1].isdigit() and f[3].isdigit() and int(f[1]) not in own and int(f[3])>=20:bad.append(dict(pid=int(f[1]),sm_percent=int(f[3])))
+ return bad
+def guarded_monitor(stop,path,pid,role,container,cpu):
+ """Two sampled external GPU bursts abort only the exact owned Popen/container.
+ No foreign PID is ever signalled. Partial timing is retained and excluded.
+ """
+ streak=0
+ with path.open('w',buffering=1) as f:
+  while not stop.is_set():
+   x=snapshot();x.update(pid=pid,bound_cpu=cpu);hostpid=pid
+   if role=='simai':
+    with contextlib.suppress(Exception):hostpid=int(c.cmdout(['docker','inspect',container,'--format','{{.State.Pid}}']))
+   x['own_processes']=c.proc_tree(hostpid);x['cpu_stat']=Path('/proc/stat').read_text().split('intr ')[0]
+   with contextlib.suppress(OSError):x['process_status']=Path(f'/proc/{pid}/status').read_text()
+   bad=foreign_gpu(x);streak=streak+1 if bad else 0
+   if streak>=2:
+    x.update(interrupted_for_external_gpu=True,external_gpu=bad);f.write(json.dumps(x)+'\n')
+    if role=='simai' and container and container.startswith(('twins-evidence-iso18-','iso18-mtp-')):sp.run(['docker','stop','-t','2',container],stdout=sp.DEVNULL,stderr=sp.DEVNULL)
+    with contextlib.suppress(ProcessLookupError):os.killpg(pid,signal.SIGTERM)
+    return
+   f.write(json.dumps(x)+'\n');stop.wait(5)
+c.monitor=guarded_monitor;c.foreign_gpu=foreign_gpu
 _audit=c.audit_interference
 def audit(samples,engine,cpu=0):
  samples=[dict(s,own_processes=s.get('own_processes',[])+[p for ps in s.get('own_processes_by_job',{}).values() for p in ps]) for s in samples]
@@ -26,7 +52,7 @@ def audit(samples,engine,cpu=0):
   for line in s.get('gpu_pmon','').splitlines():
    fields=line.split()
    if len(fields)>4 and fields[0].isdigit() and fields[1].isdigit() and fields[3].isdigit() and int(fields[1]) not in own and int(fields[3])>=20:foreign.append(dict(utc_ns=s.get('utc_ns'),pid=int(fields[1]),sm_percent=int(fields[3])))
- v.update(foreign_gpu_pmon_samples=foreign,suspected=v['suspected'] or bool(foreign),policy='Any sampled foreign GPU work >=20% invalidates timing; output correctness is independent.');return v
+ v.update(foreign_gpu_pmon_samples=foreign,interrupted_for_external_gpu=any(s.get('interrupted_for_external_gpu') for s in samples),suspected=v['suspected'] or bool(foreign),policy='Any sampled foreign GPU work >=20% invalidates timing; two consecutive samples abort only owned processes; output correctness is independent.');return v
 c.audit_interference=audit
 def next_label(folder,base,summary=False):
  """Retain contaminated attempts; a later pass gets a fresh directory/summary label."""

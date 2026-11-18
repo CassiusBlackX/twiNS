@@ -17,13 +17,13 @@ def latency():
     idle=idle_slot(label,required_gib=j['memory_cap_gib']+1 if eng=='simai' else 12)
     v=c.attempt(label,j,eng,resource_context=dict(policy='isolated-20261118',co_run_allowed=False,preflight=idle,single_measured_setting=True,source_core=MANIFEST['source_core'],background_scope='idle admission and samples; desktop/foreign processes are not stopped'))
     v['formal_id']=formal;v['components']=components((path.parent/'process.log').read_text());v['timing_eligible']=not v['interference']['suspected'];save(path,v)
-    if v['accepted']:cleanup_raw(label)
+    if v['accepted'] or v['interference'].get('interrupted_for_external_gpu'):cleanup_raw(label)
  for r in (1,2,3):
   for setting,opts in [('serial',['--serial']),('gwin0',['--gwin=0']),('both',['--serial','--gwin=0'])]:
    formal=f'iso18-ablation-r{r}-{setting}';label=next_label(EXPORT/'attempts',formal)
    if label is None:continue
    path=EXPORT/'attempts'/label/'result.json';idle=idle_slot(label,required_gib=12);v=c.attempt(label,c.JOBS[1],'p0',opts,resource_context=dict(policy='isolated-20261118',co_run_allowed=False,preflight=idle));v['formal_id']=formal;v['components']=components((path.parent/'process.log').read_text());v['timing_eligible']=not v['interference']['suspected'];save(path,v)
-   if v['accepted']:cleanup_raw(label)
+   if v['accepted'] or v['interference'].get('interrupted_for_external_gpu'):cleanup_raw(label)
  os.environ.pop('TWINS_KEEP_REFERENCE_FCT',None)
  save(EXPORT/'ai-latency-finished.json',dict(utc_ns=time.time_ns(),planned_latency=72,planned_ablation=9))
 def throughput():
@@ -33,8 +33,21 @@ def throughput():
   for eng,con in settings[rot:]+settings[:rot]:
    formal=f'iso18-cpu-r{r}-c{con}' if eng=='simai' else f'iso18-{eng}-r{r}';label=next_label(b.BROOT,formal,True)
    if label is None:continue
-   idle=idle_slot(label,required_gib=1+min(70,sum(sorted((x['cap_gib'] for x in policy['jobs'].values()),reverse=True)[:con])) if eng=='simai' else 12)
-   b.batch(label,eng,con,policy,cpu_pool=list(range(16)),resource_context=dict(policy='isolated-20261118',co_running_batches_allowed=False,preflight=idle,single_measured_setting=True,source_core=MANIFEST['source_core']))
+   while True:
+    idle=idle_slot(label,required_gib=1+min(70,sum(sorted((x['cap_gib'] for x in policy['jobs'].values()),reverse=True)[:con])) if eng=='simai' else 12);cancel=threading.Event()
+    try:
+     b.batch(label,eng,con,policy,cpu_pool=list(range(16)),resource_context=dict(policy='isolated-20261118',co_running_batches_allowed=False,preflight=idle,single_measured_setting=True,source_core=MANIFEST['source_core']),cancel_event=cancel);break
+    except InterruptedError:
+     if not cancel.is_set():raise
+     # A whole batch is repeated; partial job walls are never stitched together.
+     for trial in b.BROOT.glob(label+'-trial*'):
+      if read(trial/'state.json').get('status')!='interrupted':continue
+      cleaned=[]
+      for raw in RAW.glob(trial.name+'-*'):
+       if raw.is_dir() and raw.resolve().parent==RAW.resolve():
+        cleaned.append(dict(directory=raw.name,bytes=sum(p.stat().st_size for p in raw.rglob('*') if p.is_file())));shutil.rmtree(raw)
+      if cleaned:save(trial/'interrupted-raw-cleanup.json',dict(scope='regenerable partial outputs after interrupted-batch receipt; no accepted result deleted',files=cleaned))
+     state(stage='waiting_after_external_interruption',setting=label);time.sleep(10)
    v=read(b.BROOT/(label+'.json'));p=b.BROOT/v['trial'];interference=audit([json.loads(l) for l in (p/'resources.jsonl').read_text().splitlines()],eng);v.update(formal_id=formal,timing_eligible=not interference['suspected'],interference=interference)
    save(b.BROOT/(label+'.json'),v)
    for q in p.glob('*/result.json'):
