@@ -34,7 +34,7 @@ __device__ __forceinline__ SlotSample *sample(const Sim &s, int64_t slot, int no
 // gives floor(x) 10^9 + floor(lo 10^9 / 2^64)
 __host__ __device__ __forceinline__ int64_t ns_seconds(double x)
 {
-    double hi = floor(x);
+    double hi = __builtin_floor(x);
     uint64_t lo = (uint64_t)((x - hi) * 18446744073709551616.0);
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
     uint64_t q = __umul64hi(lo, 1000000000ull);
@@ -1997,7 +1997,7 @@ __device__ __forceinline__ void hpcc_update(HCtx<ND> &c, SndQP &q, const Pkt &p,
             if (dt > q.base_rtt)
                 dt = q.base_rtt;
             // GCC contracts this to fma(u, B - dt, U dt) (-march=native)
-            q.u = fma(q.u, (double)(q.base_rtt - dt), U * (double)dt) / (double)q.base_rtt;
+            q.u = __builtin_fma(q.u, (double)(q.base_rtt - dt), U * (double)dt) / (double)q.base_rtt;
             double max_c = q.u / P.u_target;
             if (max_c >= 1 || (uint32_t)q.inc_stage >= P.mi_thresh)
             {
@@ -2075,7 +2075,7 @@ __device__ __forceinline__ void dctcp_ack(HCtx<ND> &c, SndQP &q, const Pkt &p)
         else
         {
             const double frac = (double)q.ecn_cnt / (double)q.batch;
-            q.alpha = fma(1 - P.g, q.alpha, P.g * (frac < 1.0 ? frac : 1.0)); // as GCC contracts it
+            q.alpha = __builtin_fma(1 - P.g, q.alpha, P.g * (frac < 1.0 ? frac : 1.0)); // as GCC contracts it
             q.last_update_seq = (uint32_t)q.snd_nxt;
             q.ecn_cnt = 0;
             // (after a NACK snd_nxt can be behind the ACK: this wraps as in the fork)
@@ -2108,7 +2108,7 @@ __device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
     if (kind == 0)
     {
         if (q.alpha_cnp)
-            q.alpha = fma(1 - P.g, q.alpha, P.g); // as GCC contracts it
+            q.alpha = __builtin_fma(1 - P.g, q.alpha, P.g); // as GCC contracts it
         else
             q.alpha = (1 - P.g) * q.alpha;
         q.alpha_cnp = 0;
@@ -2990,6 +2990,8 @@ __device__ __forceinline__ const Chain &sc_cur(SCtx &c)
 __device__ __forceinline__ const PortCfg &pcfg(const SCtx &c, int port) { return c.s->pc[c.s->pbase[c.x] + port]; }
 __device__ __forceinline__ uint32_t pfc_thresh(const SCtx &c, int port)
 {
+    if (c.sw.fixed_pfc_limit)
+        return c.sw.fixed_pfc_limit;
     const Params &P = *c.P;
     return (P.buffer_size - c.sw.total_hdrm - c.sw.total_rsrv - c.sw.shared_used) >> pcfg(c, port).shift;
 }
@@ -3639,6 +3641,8 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         // the sum itself takes the threshold through 0)
         int64_t room = (int64_t)(uint32_t)(WP.buffer_size - sw.total_hdrm - sw.total_rsrv) - amax;
         int64_t th_min = room > 0 ? room >> sw.max_shift : -1;
+        if (sw.fixed_pfc_limit)
+            th_min = sw.fixed_pfc_limit;
         bad = sw_bad;
         if (irn_check)
         {
@@ -4349,7 +4353,8 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
 #ifdef TWINS_MMU_AUDIT
         if(!s.si[x].nvs && t1<=400000) {
           const Port &a=w[p].pt;const Switch &b=s.sw[x];
-          unsigned th=(WP.buffer_size-b.total_hdrm-b.total_rsrv-b.shared_used)>>s.pc[s.pbase[x]+p].shift;
+          unsigned th=b.fixed_pfc_limit ? b.fixed_pfc_limit :
+            (WP.buffer_size-b.total_hdrm-b.total_rsrv-b.shared_used)>>s.pc[s.pbase[x]+p].shift;
           printf("mmu_boundary %lld %d %d %u %u %u %u %u %u %d %d\n",(long long)t1,node,p+1,b.shared_used,a.ing,a.hdrm,a.egr,a.mmu_paused,th,(int)safe,nsl);
         }
 #endif

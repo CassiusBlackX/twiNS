@@ -411,6 +411,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
     P.irn = cfg.u32("ENABLE_IRN", 0);
     if (P.irn) P.nack_interval = 4000; // ConWeave RdmaHw NACK suppression interval, ns
     P.qbb = cfg.u32("ENABLE_PFC", 1);
+    P.fixed_pfc = cfg.u32("TWINS_FIXED_PFC", 0);
+    if (P.fixed_pfc && (P.irn || !P.qbb))
+    {
+        fprintf(stderr, "TWINS_FIXED_PFC requires ENABLE_PFC 1 and ENABLE_IRN 0\n");
+        return false;
+    }
     P.irn_rto_low = cfg.u32("IRN_RTO_LOW_NS", 100000);
     P.irn_rto_high = cfg.u32("IRN_RTO_HIGH_NS", 320000);
     if (P.irn && (P.cc != 1 || P.qbb || !P.mtu || P.irn_rto_low > P.irn_rto_high))
@@ -1913,6 +1919,17 @@ int main(int argc, char **argv)
             if (Pw[s_world[x]].irn && n)
                 sw[x].total_hdrm += 12500u + 2 * 1048u - pc[pbase[x] + n - 1].hdrm_cap;
             sw[x].total_rsrv = (Pw[s_world[x]].irn ? 8 * 1048u : RESERVE) * n;
+            const Params &p = Pw[s_world[x]];
+            if (p.fixed_pfc && !si[x].nvs && n)
+            {
+                const uint64_t reserved = uint64_t(sw[x].total_hdrm) + sw[x].total_rsrv;
+                if (reserved >= p.buffer_size || (p.buffer_size - reserved) / n < p.mtu + RESUME_OFFSET)
+                {
+                    fprintf(stderr, "switch %u has insufficient space for fixed PFC partitions\n", node);
+                    return 1;
+                }
+                sw[x].fixed_pfc_limit = (p.buffer_size - reserved) / n;
+            }
             for (int p = 0; p < n; p++)
             {
                 Port &pt = ps[pbase[x] + p];

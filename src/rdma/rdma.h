@@ -323,6 +323,7 @@ struct Switch
     uint32_t shared_used; // SwitchMmu::shared_used_bytes
     uint32_t total_hdrm, total_rsrv;
     uint32_t max_shift;   // the largest pfc_a_shift of its ports (the lowest PFC threshold)
+    uint32_t fixed_pfc_limit; // optional equal per-ingress partition of the shared buffer
     // wide switches number the events of their slots run in order (not safe); a TransmitComplete's
     // key is its event's number and its ordinal there, and simultaneous TransmitCompletes run in key
     // order (their chains differ first at the scheduling events, whose order is that number's)
@@ -410,6 +411,7 @@ struct Params
     // switch
     uint32_t buffer_size;
     uint32_t pfc_shift;
+    uint32_t fixed_pfc;
     uint32_t kmin, kmax;  // bytes
     double pmax;
 };

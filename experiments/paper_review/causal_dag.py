@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 
 
-def dag(path):
+def dag(path, *, normalize_main_order=False):
     timers={}
     causes={}
     flow_rows=[]
+    main_order=[]
     for line in path.read_text().splitlines():
         row=line.split()
         if not row or row[0].startswith("#"):
@@ -25,8 +26,16 @@ def dag(path):
             child,parent=row[1:3]
             ordinal=int(row[3]) if len(row)>3 else None
             causes.setdefault(child,[]).append((parent,ordinal))
+            if normalize_main_order and parent=="m":
+                main_order.append((len(main_order) if ordinal is None else ordinal,child))
         else:
             raise ValueError(f"unexpected record {row}")
+
+    # Historical SimAI records main's ns-3 UIDs while the live frontend
+    # records main's scheduling order. Use that order for both recordings.
+    for index, (_, child) in enumerate(sorted(main_order)):
+        causes[child] = [(parent, index if parent=="m" else ordinal)
+                         for parent,ordinal in causes[child]]
 
     @cache
     def timer(key):
