@@ -4,14 +4,35 @@ CPU work proceeds through foreign GPU activity. GPU observations retain the exte
 activity exclusion. Shared-memory-bandwidth timing is explicitly not exclusive.
 """
 import argparse
+from collections import Counter
 from common import *
 import ai,tcp,runner
 P=EXPORT/'parallel75';P.mkdir(exist_ok=True)
 BUDGET=75;OVERHEAD=1;MODEL_BUDGET=BUDGET-OVERHEAD
+GIB = 2**30
+DISK_HEADROOM_BYTES = 4 * GIB
+DEFAULT_DISK_RESERVATION_BYTES = 6 * GIB
 CORE_ORDER=[8,4,12,2,10,6,14,1,9,3,11,5,13,7] # physical cores; 0 GPU,15 observer
 POLICY=read(ai.POLICY)
 GPU_POLICY=read(Path(__file__).with_name('gpu_host_policy.json'))
 def gpu_memory(case):return GPU_POLICY['jobs'][case]['reserved_gib']
+
+def disk_reservation(task):
+    if task['kind'] == 'scan':
+        # The scan writes one final CSV per input. Allow for failed output copies,
+        # per-process logs, receipts and file-system allocation overhead as well.
+        reference_bytes = sum(
+            (INPUT / job['reference']).stat().st_size
+            for job in MANIFEST[task['group']]
+        )
+        return 512 * 2**20 + 4 * reference_bytes
+    if task['kind'] == 'mtp':
+        ref = E / 'reference-cache' / (task['case'] + '.fct')
+        if ref.is_file():
+            # Allow for the FCT and the per-message detail CSV seen in SimAI.
+            return GIB + 5 * ref.stat().st_size
+    return DEFAULT_DISK_RESERVATION_BYTES
+
 def tasks():
  out=[]
  def add(kind,formal,engine,memory,ncores,phase,**kw):out.append(dict(kind=kind,formal=formal,engine=engine,memory=memory,ncores=ncores,phase=phase,**kw))
@@ -84,7 +105,7 @@ def supervise():
  os.sched_setaffinity(0,{15})
  with (E/'exclusive-campaign.lock').open('a') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);runner.freeze()
-  all_tasks=tasks();save(P/'plan.json',dict(created_utc_ns=time.time_ns(),total_budget_gib=BUDGET,observer_gib=OVERHEAD,gpu_host_memory_policy=GPU_POLICY,model_budget_gib=MODEL_BUDGET,batch_internal_budget_gib=b.BUDGET,tasks=all_tasks,authorization='User 2026-11-19: start early, parallelize where accuracy permits, 75GB budget; overrides older exclusive-only admission requirement',core_policy='no own overlap on physical SMT siblings; P16/wide CPU tasks drain all other measured tasks'))
+  all_tasks=tasks();save(P/'plan.json',dict(created_utc_ns=time.time_ns(),total_budget_gib=BUDGET,observer_gib=OVERHEAD,gpu_host_memory_policy=GPU_POLICY,model_budget_gib=MODEL_BUDGET,batch_internal_budget_gib=b.BUDGET,disk_headroom_bytes=DISK_HEADROOM_BYTES,tasks=all_tasks,authorization='User 2026-11-19: start early, parallelize where accuracy permits, 75GB budget; overrides older exclusive-only admission requirement',core_policy='no own overlap on physical SMT siblings; P16/wide CPU tasks drain all other measured tasks'))
   pending=[t for t in all_tasks if result(t) is None];active={};retry={};last_gpu=0;gpu_quiet=False;cpu_phase=0;mtp_added=False
   def shutdown(signum,frame):
    # Only containers with both our campaign and UID label and our raw mount qualify.
@@ -128,12 +149,18 @@ def supervise():
    # Avoid launching the next phase until active CPU tasks of the previous phase drain.
    phase=min([phase]+[x['task']['phase'] for x in active.values() if x['task']['engine'] in ('cpu','simai','mtp')])
    wide_wait=any(t['phase']==phase and t['ncores']==16 for t in cpu_pending)
+   blocked = Counter()
+   free_bytes = shutil.disk_usage(E).free
+   available_memory = available_gib()
    candidates=sorted(pending,key=lambda t:(t['phase'],0 if t['engine'] in ('gpu','p0','p16') else 1,-c.BY[t['case']]['old_simai_s'] if t['kind']=='latency' and t['engine']=='simai' else 0,t['formal']))
    for t in candidates:
     if retry.get(t['formal'],0)>time.monotonic():continue
     gpu=t['engine'] in ('gpu','p0','p16')
     if not gpu and t['phase']!=phase:continue
-    if gpu and t['kind']!='probe' and (not gpu_quiet or (wide_wait and t['phase']>=phase and not any(x['task']['engine'] in ('cpu','simai','mtp') for x in active.values()))):continue
+    if gpu and t['kind']!='probe' and not gpu_quiet:
+     blocked['external_gpu_activity'] += 1
+     continue
+    if gpu and t['kind']!='probe' and wide_wait and t['phase']>=phase and not any(x['task']['engine'] in ('cpu','simai','mtp') for x in active.values()):continue
     if t['kind']=='latency' and t['engine']=='simai':
      peers=[x['task'] for x in active.values() if x['task']['kind']=='latency' and x['task']['engine']=='simai']
      if len(peers)>=4:continue
@@ -141,7 +168,15 @@ def supervise():
      if any(u['case']==t['case'] for u in peers) and other_cases:continue
     # P16 owns all physical cores, admitted at a drained boundary whenever possible.
     alloc=allocate(t,[x['alloc'] for x in active.values()])
-    if alloc is None or available_gib()<t['memory']+2 or shutil.disk_usage(E).free<10*2**30:continue
+    if alloc is None or available_memory < t['memory'] + 2:
+     blocked['cpu_or_memory_reservation'] += 1
+     continue
+    if 'disk_reservation_bytes' not in t:
+     t['disk_reservation_bytes'] = disk_reservation(t)
+    reserved_disk = sum(x['task']['disk_reservation_bytes'] for x in active.values())
+    if free_bytes < DISK_HEADROOM_BYTES + reserved_disk + t['disk_reservation_bytes']:
+     blocked['disk_space'] += 1
+     continue
     task=dict(t,**alloc);mask=','.join(map(str,alloc['cores']))
     if t['engine']=='mtp' and t['threads']==32:mask='0-31'
     elif t['engine']=='cpu' and t['setting']==32:mask='0-31'
@@ -151,8 +186,8 @@ def supervise():
     spec=P/'tasks'/(t['formal']+'.json');save(spec,task);q=P/'quotas'/(t['formal']+'.json')
     if q.exists():q.unlink()
     log=(P/'tasks'/(t['formal']+'.log')).open('a');p=sp.Popen([sys.executable,str(Path(__file__)),'--worker',str(spec)],env=env,stdout=log,stderr=sp.STDOUT,start_new_session=True)
-    pending.remove(t);active[t['formal']]=dict(task=t,alloc=alloc,p=p,log=log);c.append(P/'dispatch.jsonl',dict(utc_ns=time.time_ns(),action='started',formal=t['formal'],**alloc,total_reserved_gib=OVERHEAD+sum(x['alloc']['memory'] for x in active.values()),peers=list(active)))
-   book=dict(utc_ns=time.time_ns(),resource_epoch='parallel75-20261119',budget_gib=BUDGET,reserved_gib=OVERHEAD+sum(x['alloc']['memory'] for x in active.values()),active=[dict(formal=k,pid=x['p'].pid,engine=x['task']['engine'],**x['alloc']) for k,x in active.items()],queued=len(pending),cpu_phase=phase,gpu_admission_open=gpu_quiet)
+    pending.remove(t);active[t['formal']]=dict(task=t,alloc=alloc,p=p,log=log);c.append(P/'dispatch.jsonl',dict(utc_ns=time.time_ns(),action='started',formal=t['formal'],**alloc,total_reserved_gib=OVERHEAD+sum(x['alloc']['memory'] for x in active.values()),peers=list(active),disk_free_bytes=free_bytes,disk_reservation_bytes=t['disk_reservation_bytes']))
+   book=dict(utc_ns=time.time_ns(),resource_epoch='parallel75-20261119',budget_gib=BUDGET,reserved_gib=OVERHEAD+sum(x['alloc']['memory'] for x in active.values()),active=[dict(formal=k,pid=x['p'].pid,engine=x['task']['engine'],**x['alloc']) for k,x in active.items()],queued=len(pending),cpu_phase=phase,gpu_admission_open=gpu_quiet,disk_free_bytes=free_bytes,admission_blockers=dict(blocked))
    save(P/'active.json',book);state(stage='parallel75',**book);time.sleep(2)
   for case in sorted({t['case'] for t in all_tasks if t['kind']=='mtp'}):
    xs=[result(t) for t in all_tasks if t['kind']=='mtp' and t['case']==case];xs=[v for v in xs if v]

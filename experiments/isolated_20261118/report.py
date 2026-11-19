@@ -30,6 +30,14 @@ def report(E,materials=None):
  parallel=read(X/'parallel75/active.json')
  if parallel:
   lines+=['',f'parallel75 当前预留 {parallel.get("reserved_gib",0)}/{parallel.get("budget_gib",75)} GiB，活跃 {len(parallel.get("active",[]))} 个设置，排队 {parallel.get("queued",0)}；GPU准入 {parallel.get("gpu_admission_open")}。']
+  free_bytes=parallel.get('disk_free_bytes')
+  if free_bytes is not None:
+   lines.append(f'远端根盘可用空间 {free_bytes / 2**30:.2f} GiB。')
+  blockers=parallel.get('admission_blockers',{})
+  if blockers.get('disk_space'):
+   lines.append(f'当前有 {blockers["disk_space"]} 项符合阶段与 CPU/GPU 资源条件，正在等待磁盘空间。')
+  if blockers.get('external_gpu_activity'):
+   lines.append(f'当前有 {blockers["external_gpu_activity"]} 项 GPU 性能测量在等待空闲窗口。')
   for item in parallel.get('active',[]):lines.append(f'- `{item["formal"]}`：物理核 {item["cores"]}，预留 {item["memory"]} GiB。')
  output=dict(updated=now,state=state,parallel75=parallel,cubic=cubic,scans=scans,archived_old_monitor_scans=old_scans,latency=lat,batches=batches,mtp=mtp,archive_verification=ver)
  lines+=['','## 验收与计时覆盖','','| 分组 | 已有有效计时/预定 | 输出验收 |','|---|---:|---:|',f'| CUBIC | {len(cubic)}/192 | 匹配 {sum(x["accepted"] for x in cubic)}；Unison差异单列 |',f'| TCP两组扫描 | {len(scans)}/21批 | 全部配置通过 {sum(x["all_accepted"] for x in scans)} 批 |',f'| AI延迟及消融 | {len(lat)}/81 | 通过 {sum(x["accepted"] for x in lat)} |',f'| AI吞吐 | {len(batches)}/18批 | 全部作业通过 {sum(x["all_accepted"] for x in batches)} 批 |',f'| MTP正式尝试 | {sum(x.get("phase")!="pilot" for x in mtp)}（18个线程扫描点+条件性最佳复测） | 完成/差异/中止逐项保留 |']
