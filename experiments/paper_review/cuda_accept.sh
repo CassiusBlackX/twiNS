@@ -98,6 +98,14 @@ rc=$?
 set -e
 printf '%s\n' "$rc" > "$sent/remote.rc"
 RSYNC_RSH='ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=20' \
-    rsync -a --checksum "s50:$review_host/project/results/$stamp/" "$sent/"
+    rsync -a --checksum --exclude=wire-layout "s50:$review_host/project/results/$stamp/" "$sent/"
+"${ssh_cmd[@]}" "cd '$review_host/project/results/$stamp' && find . -type f -print0 | sort -z | xargs -0 -r sha256sum" \
+    > "$sent/returned-files.sha256"
+if [[ -s $sent/returned-files.sha256 ]]; then
+    (cd "$sent" && sha256sum --quiet -c returned-files.sha256)
+    # Keep the canonical raw results only on this machine after verification.
+    "${ssh_cmd[@]}" "cd '$review_host/project/results' && test \"\$(pwd -P)\" = '$review_host/project/results' && \
+        test -d '$stamp' && test ! -L '$stamp' && rm -rf -- '$stamp'"
+fi
 python3 experiments/paper_review/cuda_report.py "$prior" "$review" "$sent" > "$sent/acceptance.json"
 exit "$rc"
