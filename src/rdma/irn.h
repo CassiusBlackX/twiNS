@@ -45,7 +45,7 @@ struct IrnSender
 {
     IrnMap sack;
     uint32_t max_seq, highest_ack, recovery_seq;
-    bool recovery;
+    bool recovery, transmitted;
     Chain timer_chain;
 };
 

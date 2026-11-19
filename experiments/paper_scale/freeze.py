@@ -19,7 +19,7 @@ def topology(hosts):
                 edges.append((hosts + leaves+8*p+i, hosts + 2*leaves+8*i+j))
     return switches, edges
 
-def generate(root, hosts, template):
+def generate(root, hosts, template, *, irn_seed=101):
     d = root / str(hosts)
     d.mkdir()
     switches, edges = topology(hosts)
@@ -35,7 +35,8 @@ def generate(root, hosts, template):
     (d/'fabric.txt').write_text(f'{hosts+switches} {switches} {len(edges)}\n'+' '.join(map(str,range(hosts,hosts+switches)))+'\n'+''.join(f'{a} {b} 100Gbps 1000ns 0\n' for a,b in edges))
     for layout in ('tcp','tcp-holdout','spread','incast'):
         dst=d/layout;dst.mkdir()
-        rng=random.Random(102 if layout=='tcp-holdout' else 101)
+        seed = 102 if layout == 'tcp-holdout' else 101 if layout == 'tcp' else irn_seed
+        rng=random.Random(seed)
         rows=[]
         for t in range(10):
             shift=rng.randrange(1,hosts//8)*8

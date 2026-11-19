@@ -1774,22 +1774,29 @@ __device__ __forceinline__ int next_qindex(HCtx<ND> &c)
         idx = idx + 1 == fcount ? 0 : idx + 1; // (qi + m_rrlast) % fcount
         int f = list[idx];
         const SndQP &q = s.qp[f];
+        bool window_allowed = !win_bound(*c.P, q);
         if (c.P->irn)
         {
+            // ConWeave keeps finished entries at their original group indices.
+            if (q.done)
+                continue;
+            const auto &r = s.irn_sender[f];
+            const uint64_t left = bytes_left(q);
+            const uint64_t length = left < c.P->mtu ? left : c.P->mtu;
+            window_allowed &= uint64_t(uint32_t(r.max_seq - r.highest_ack)) + length < c.P->irn_bdp
+                           || uint64_t(r.highest_ack) + c.P->irn_bdp > q.snd_nxt;
+            // The author tests the BDP/window before GetBytesLeft mutates snd_nxt
+            // and consumes a front SACK block, even if this QP cannot send.
             irn_skip_sent(s, *c.P, f);
-            auto &r = s.irn_sender[f];
-            uint64_t length = bytes_left(q) < c.P->mtu ? bytes_left(q) : c.P->mtu;
-            if (length && uint32_t(r.max_seq - r.highest_ack) + length >= c.P->irn_bdp &&
-                uint64_t(r.highest_ack) + c.P->irn_bdp <= q.snd_nxt) continue;
         }
-        if (!(c.st().paused >> PG & 1) && bytes_left(q) > 0 && !win_bound(*c.P, q))
+        if (!(c.st().paused >> PG & 1) && bytes_left(q) > 0 && window_allowed)
         {
             if (q.next_avail > c.now)
                 continue;
             res = idx;
             break;
         }
-        else if (q.snd_una >= q.size)
+        else if (!c.P->irn && q.snd_una >= q.size)
             min_finish = idx < min_finish ? idx : min_finish;
     }
     if (min_finish < INT_MAX)
@@ -1814,7 +1821,37 @@ __device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
     const Sim &s = *c.s;
     if (c.st().tc_at >= 0)
         return;
+#ifdef TWINS_AUDIT_IRN_QUEUE
+    const bool auditQueue =
+        (c.h == 32 && c.now >= 2000640000 && c.now <= 2000651060) ||
+        (c.h == 233 && c.now >= 2000457000 && c.now <= 2000468550);
+    if (auditQueue)
+    {
+        printf("rr-state %lld %d %d %d %d\n", (long long)c.now, c.h,
+               c.st().rr, c.st().qp_n, c.st().ackq_n);
+        const int *entries = s.qps + (size_t)c.nic() * s.qps_cap;
+        for (int i = 0; i < c.st().qp_n; ++i)
+        {
+            int f = entries[i];
+            const SndQP &qp = s.qp[f];
+            const IrnSender &r = s.irn_sender[f];
+            uint64_t left = bytes_left(qp);
+            bool admitted = uint64_t(uint32_t(r.max_seq - r.highest_ack))
+                           + (left < c.P->mtu ? left : c.P->mtu) < c.P->irn_bdp
+                           || uint64_t(r.highest_ack) + c.P->irn_bdp > qp.snd_nxt;
+            printf("rr-candidate %lld %d %d %d %d %llu %llu %lld %d\n",
+                   (long long)c.now, c.h, i, f, int(qp.done),
+                   (unsigned long long)qp.snd_una, (unsigned long long)qp.snd_nxt,
+                   (long long)qp.next_avail, int(admitted));
+        }
+    }
+#endif
     int idx = next_qindex(c);
+#ifdef TWINS_AUDIT_IRN_QUEUE
+    if (auditQueue)
+        printf("rr-selected %lld %d %d %d\n", (long long)c.now, c.h, idx,
+               idx >= 0 ? s.qps[(size_t)c.nic() * s.qps_cap + idx] : -1);
+#endif
     if (idx == -1)
     {
         Pkt p = s.ackq[(size_t)c.nic() * s.ackq_cap + c.st().ackq_head];
@@ -1843,9 +1880,10 @@ __device__ __forceinline__ void h_dequeue(HCtx<ND> &c)
         if (c.P->irn)
         {
             auto &r = s.irn_sender[f];
-            if (p.seq <= r.max_seq && (p.seq || q.t_irn >= 0))
+            if (r.transmitted && p.seq <= r.max_seq)
                 atomicAdd(s.irn_counts + 1, 1ull);
             if (p.seq > r.max_seq) r.max_seq = p.seq;
+            r.transmitted = true;
         }
         q.snd_nxt += payload;
         h_transmit(c, p);
@@ -2133,7 +2171,11 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         auto *bits = s.irn_tx_bits + s.irn_off[f];
         if (p.seq > r.highest_ack) r.highest_ack = p.seq;
         if (p.sack.size)
+        {
+            // ReceiveAck counts a SACK only after finding a live sender QP.
+            atomicAdd(s.irn_counts + 3, 1ull);
             irn_mark(r.sack, bits, p.sack.seq / c.P->mtu);
+        }
         q.snd_una = irn_skip(r.sack, bits, q.snd_una, q.size, c.P->mtu);
         while (r.sack.count && uint64_t(r.sack.first) * c.P->mtu < q.snd_una)
             irn_remove_first(r.sack, bits);
@@ -3077,7 +3119,14 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
     const Params &P = *c.P;
     Port &pt = c.w[port].pt;
     Port &in = c.w[p.inport].pt;
-    if (P.irn)
+    if (P.irn && c.safe)
+    {
+        // The certificate excludes headroom and shared admission decisions.
+        // Every lane owns its egress and uses ingress atomics for queue bytes.
+        atomicSub(&in.ing, (uint32_t)p.size);
+        pt.egr -= p.size;
+    }
+    else if (P.irn)
     {
         uint32_t shared = pt.egr > 1049 ? pt.egr - 1049 : 0;
         c.sw.shared_used -= shared < p.size ? shared : p.size;
@@ -3119,7 +3168,14 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
         else if (ecn_bytes > kmin)
         {
             double pr = pcfg(c, port).pmax * (double)(ecn_bytes - kmin) / (double)(kmax - kmin);
-            mark = nsm_rng::rand_u01(P.irn ? c.w[0].pt.rng : pt.rng) < pr;
+            const double draw = nsm_rng::rand_u01(P.irn ? c.w[0].pt.rng : pt.rng);
+            mark = draw < pr;
+#ifdef TWINS_AUDIT_IRN_ECN
+            if (c.node == 156 && c.now <= 22441)
+                printf("sw-draw %lld %d %u %d %d %u %.17g %.17g %d\n",
+                       (long long)c.now, port + 1, ecn_bytes, p.src, p.dst, p.seq,
+                       draw, pr, int(mark));
+#endif
         }
         if (mark)
         {
@@ -3176,7 +3232,7 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     const Sim &s = *c.s;
     if (out < 0)
         return;
-    if (q != 0 && c.P->irn)
+    if (q != 0 && c.P->irn && !c.safe)
     {
         // Author's Broadcom model, one data priority. Guaranteed bytes are
         // the first MTU+1 on each output. Queue 0 bypasses admission.
@@ -3549,7 +3605,9 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         }
     __syncthreads();
     // is the slot safe? (every lane decides alike)
-    bool safe = !WP.irn && pooled && total <= LK && nsl * D <= 65535 && deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
+    const bool irn_check = WP.irn && s.irn_parallel && nsl == 1 && !s.si[x].nvs && deg <= 127;
+    bool safe = (!WP.irn || irn_check) && pooled && total <= LK && nsl * D <= 65535 &&
+                deg <= lanes && (WIDE || deg <= SAFE_LANES) && !s.serial;
     // (the ports' sums and checks by their lanes: a wide switch's ports, one after the other, cost
     // more than its events)
     __shared__ unsigned long long sw_sum;
@@ -3582,7 +3640,26 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         int64_t room = (int64_t)(uint32_t)(WP.buffer_size - sw.total_hdrm - sw.total_rsrv) - amax;
         int64_t th_min = room > 0 ? room >> sw.max_shift : -1;
         bad = sw_bad;
-        for (int p = lane; p < deg && !bad; p += lanes)
+        if (irn_check)
+        {
+            const uint64_t limit = WP.buffer_size;
+            const uint64_t reserves = sw.total_rsrv;
+            const uint64_t headroom = sw.total_hdrm;
+            const uint64_t upper = uint64_t(sw.irn_ingress) + sw_sum;
+            // Upper bounds every ingress and egress prefix, even if all
+            // arrivals precede all departures. Two copies bound the
+            // per-egress shared demand plus the aggregate shared occupancy.
+            bad |= reserves + headroom + upper > limit || reserves + 2 * upper > limit;
+            for (int p = lane; p < deg && WP.ecn && !bad; p += lanes)
+            {
+                // The reference uses one stream per switch. Require zero
+                // probability draws in this slot to preserve its stream.
+                const uint64_t bytes = uint64_t(w[p].pt.egr) + sw_sum;
+                if (bytes > uint64_t(w[p].kmin) + 1049)
+                    bad = 1;
+            }
+        }
+        for (int p = lane; p < deg && !irn_check && !bad; p += lanes)
         {
             int64_t su = (int64_t)w[p].pt.ing + abytes[p] - RESERVE;
             if ((su > 0 ? su : 0) >= th_min)
@@ -3600,6 +3677,13 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
     }
     if (nsl > 1 && !safe)
         return 2;
+    if (lane == 0 && irn_check)
+    {
+        bool busy = total != 0;
+        for (int p = 0; p < deg && !busy; ++p)
+            busy = w[p].pt.tc_at >= 0 && w[p].pt.tc_at < t1;
+        if (busy) atomicAdd(s.irn_counts + (safe ? 4 : 5), 1ull);
+    }
     bool act = false;
     if (safe)
     {
@@ -3807,6 +3891,7 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         if (lane == 0)
             sw_sum = 0;
         __syncthreads();
+        if (!irn_check)
         {
             uint32_t my = 0;
             for (int p = lane; p < deg; p += lanes)
@@ -3821,7 +3906,18 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         if (lane == 0)
         {
             Switch sw = s.sw[x];
-            sw.shared_used += (uint32_t)sw_sum;
+            if (irn_check)
+            {
+                sw.irn_ingress = sw.shared_used = 0;
+                for (int p = 0; p < deg; ++p)
+                {
+                    sw.irn_ingress += w[p].pt.ing;
+                    if (w[p].pt.egr > 1049)
+                        sw.shared_used += w[p].pt.egr - 1049;
+                }
+            }
+            else
+                sw.shared_used += (uint32_t)sw_sum;
             s.sw[x] = sw;
 #ifdef RDMA_PROF
             atomicAdd(&s.ev[31], 1ull);

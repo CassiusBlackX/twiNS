@@ -1,0 +1,17 @@
+# TwiNS paper review, November 20
+
+The input baseline is `6964735`. Local evidence is under `out/review`. The independent CPU host is a87 and the HIP device is the local RX 9060 XT. The prior s50 campaign and its successor retain their own executable and inputs. CUDA acceptance uses a new build and distinct receipts after that queue releases the GPU.
+
+## Reproducing the protocol repairs
+
+- Run `prefix.py` on both reference and GPU with `--last-start=2000600000` for the 512-flow IRN reproducer. `accept_irn_regression.py` requires the old kernel to diverge and the new kernel to match the independent author's prefix and all completed flows.
+- `freeze_holdout.py` generates IRN seed 103 from the recorded topology, with matched ECN on/off configurations. Seed 101 uses the earlier immutable inputs. `irn_matrix_report.py` requires the original reference for each output identity, start time and FCT.
+- Run both `prefix.py … ai-small` and `prefix.py … ai-large` for the original 1 and 64 MiB cases. The independent author's transport runs SimAI's same ASTRA frontend inside its native event loop. The GPU's emitted SACK count is distinct from the live QP receive count. The latter is what the author adapter counts. The retransmission counter keeps the first-send state even when an RTO clears its timer.
+- The 128-GPU fixture uses the archived HPN128 topology and 64 MiB AllToAll workload. `ai128.py freeze` changes delay spelling from decimal milliseconds to the same integer nanoseconds for the author, and sets the same global-window parameter as SimAI. Use `widen_author_switch.py` plus `paper_scale/oracle/relink.py` to compile the author's two larger per-port arrays and all affected units. Under ECMP the actual channel delays feed path RTTs. The author driver's equal-hop-delay assertion remains in standalone and ConWeave load-balancing mode. The widened author's small AI fixture must still match exactly before accepting the 128-GPU result.
+- An opt-in IRN switch experiment exposes `--irn-parallel` and falls back to ordered service if strict queue and ECN bounds fail. `irn_parallel_trials.sh` tests equal outputs on the same binary with both switches, separates the wire pass, and measures full process walls three times.
+
+## Evidence and remaining limits
+
+- The full 31-run TCP build faults in the first switch FIFO service even for the two-host fixture in `fixtures/wide`. First three slots execute, and bypassing the first switch FIFO operation lets the fourth diagnostic slot execute. Clang 22 and the isolated Clang 20 build both fault on RX at `-O2`. Disabling vectorization or unrolling, changing wave width and LDS promotion, outlining FIFO methods, and eliminating private frame/history copies did not remove it. The existing HIP `-O0` option remains the stable fallback. Logs, compile commands and diagnostic diffs are retained with the results.
+- The CPU HPCC probe compares the original per-call random construction with explicit allocation of a fresh stream at that same runtime decision, and with the existing per-port model. The prototype uses the live allocator and generates draws itself. GPU coordination remains a separate requirement.
+- The GeDES probe pairs switches and arrival CSVs at two sizes. A light route-controlled workload allows both models to finish. A 10 ms bounded run of the earlier paper inputs is also retained. Report completed flows, finish time, slots and separate loop/process timing under each model's transport rules.

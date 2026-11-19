@@ -440,7 +440,7 @@ struct Sim
     IrnLifetime *irn_lifetime;
     size_t *irn_off;
     uint32_t *irn_tx_bits, *irn_rx_bits;
-    unsigned long long *irn_counts;
+    unsigned long long *irn_counts; // emitted SACK, retransmitted data, RTO, received live-QP SACK
     int H, S, N, L, K; // hosts, switches, nodes (hosts first), directed links, max ports per node
     int F;             // flows
     Params P;          // world 0's (its rate and delay are every world's)
@@ -513,6 +513,7 @@ struct Sim
     int64_t max_slots;
     int host_blocks, spread; // spread: lanes per entity (see rdma_slot)
     int serial;              // switches run every slot's events on one lane (no safe slots)
+    int irn_parallel;        // opt-in Broadcom admission proof for a single slot
     int64_t *fct;       // [F] completion time - start (ns), -1: not yet
     int64_t *sent;      // [F] simai: its first SendComplete (ns), -1: none yet
     // DAG: children of flow g at ch_list[ch_off[g] ..] (child << 1 | kind: 0 received, 1 sent);

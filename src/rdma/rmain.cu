@@ -1076,6 +1076,7 @@ int main(int argc, char **argv)
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
+    bool irn_parallel = false;
     bool tail_set = false;
     bool tail_auto = false;
     int tail_max = 27; // (the most it may be: less if the GPU has no more room)
@@ -1129,6 +1130,8 @@ int main(int argc, char **argv)
             spread = std::max(1, std::min(BLOCK, atoi(v.c_str())));
         else if (k == "--serial")
             serial = 1;
+        else if (k == "--irn-parallel")
+            irn_parallel = true;
         else if (k == "--win")
         {
             kw = std::max(1, std::min(255, atoi(v.c_str())));
@@ -1818,7 +1821,7 @@ int main(int argc, char **argv)
         s.irn_lifetime = dev_alloc<IrnLifetime>(F);
         s.irn_tx_bits = dev_alloc<uint32_t>(offsets.back());
         s.irn_rx_bits = dev_alloc<uint32_t>(offsets.back());
-        s.irn_counts = dev_alloc<unsigned long long>(3);
+        s.irn_counts = dev_alloc<unsigned long long>(6);
     }
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
@@ -2107,6 +2110,7 @@ int main(int argc, char **argv)
     // a block (one wave) per host and per switch; a switch keeps its ports in LDS
     s.spread = spread;
     s.serial = serial || spread < SAFE_LANES;
+    s.irn_parallel = irn_parallel;
     // LDS: a host's arrival pool; a switch's ports and int workspace, for the most ports of its kernel
     auto per_sw = [&](int k) { return (size_t)k * sizeof(SwPortLds) + sw_ints(k) * sizeof(int); };
     s.apool = dev_alloc<ArrLds>((size_t)S * POOL);
@@ -2530,9 +2534,11 @@ int main(int argc, char **argv)
 #endif
     if (s.irn_counts)
     {
-        unsigned long long n[3];
+        unsigned long long n[6];
         CK(cudaMemcpy(n, s.irn_counts, sizeof(n), cudaMemcpyDeviceToHost));
         printf("IRN selective feedback %llu, retransmitted packets %llu, timeouts %llu\n", n[0], n[1], n[2]);
+        printf("IRN selective feedback processed by live QPs %llu\n", n[3]);
+        if (s.irn_parallel) printf("IRN active switch slots: %llu parallel, %llu fallback\n", n[4], n[5]);
     }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
     if (ev[36])

@@ -22,6 +22,7 @@ extern "C" void enqueue_flow(int id,int src,int dst,unsigned long long size) {
     Simulator::Schedule(NanoSeconds(3000),&open_flow,id,src,dst,size);
 }
 static void live_tx(unsigned node,unsigned dev,Ptr<const Packet> p) {
+    // SimAI schedules SendPacketComplete only for frames in this size range.
     if(p->GetSize()<=60 || p->GetSize()>=9000) return;
     CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
     ch.getInt=1;

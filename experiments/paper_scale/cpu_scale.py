@@ -7,6 +7,7 @@ def main():
     for name in ('root','tcp_ref','irn_ref'):p.add_argument(name,type=Path)
     p.add_argument('--modes',nargs='+',default=['heterogeneous','uniform','spread','incast'])
     p.add_argument('--workers',type=int,default=3)
+    p.add_argument('--tcp-input',choices=('tcp','tcp-holdout'),default='tcp')
     a=p.parse_args();r=a.root.resolve()
     def case(v):
         mode,h=v
@@ -14,7 +15,7 @@ def main():
         if (d/'receipt.json').exists():return
         src=r/'inputs'/str(h);tcp=mode in ('heterogeneous','uniform')
         if tcp:
-            cmd=[a.tcp_ref.resolve(),'--topo=file','--hostq=red','--tcp=ns3::TcpDctcp','--flowEcmp=1','--stop=0.1',f'--flows={src}/tcp/flows.csv',f'--topofile={src}/{mode}.graph','--out=reference.fct']
+            cmd=[a.tcp_ref.resolve(),'--topo=file','--hostq=red','--tcp=ns3::TcpDctcp','--flowEcmp=1','--stop=0.1',f'--flows={src}/{a.tcp_input}/flows.csv',f'--topofile={src}/{mode}.graph','--out=reference.fct']
         else:
             for n in ('config','ref.flows'):shutil.copyfile(src/mode/n,d/n)
             (d/'config').write_text((d/'config').read_text().replace('../fabric.txt',str(src/'fabric.txt')))

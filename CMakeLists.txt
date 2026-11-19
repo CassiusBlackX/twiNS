@@ -74,7 +74,8 @@ foreach(T IN LISTS tcp_targets)
             # history kernel. Keep device optimizations and out-of-line calls.
             if(CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 22 AND CMAKE_HIP_COMPILER_VERSION VERSION_LESS 23)
                 if(T STREQUAL "twins512-links" AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1200")
-                    # The 31-run switch kernel faults at -O1/-O2 on multilevel fabrics.
+                    # The 31-run switch kernel faults at -O1/-O2, including the
+                    # two-host FIFO reproducer in experiments/paper_review/fixtures.
                     target_compile_options(${T} PRIVATE -O0 -fno-inline-functions)
                 else()
                     target_compile_options(${T} PRIVATE -O2 -fno-inline-functions)

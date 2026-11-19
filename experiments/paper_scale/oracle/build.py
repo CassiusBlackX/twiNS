@@ -5,13 +5,22 @@ p=argparse.ArgumentParser()
 for key in ('tree','frontend','out','libdir'):p.add_argument(key,type=Path)
 p.add_argument('--simai-objects',type=Path)
 p.add_argument('--simai-libs',type=Path)
-a=p.parse_args();base=Path(__file__).resolve().parent;root=base.parents[2];tree=a.tree.resolve();out=a.out.resolve();out.mkdir(exist_ok=True,parents=True)
+a=p.parse_args()
+base=Path(__file__).resolve().parent
+root=next(p for p in base.parents if (p/'src/astra/frontend.h').is_file())
+tree=a.tree.resolve()
+out=a.out.resolve()
+out.mkdir(exist_ok=True,parents=True)
 s=(tree/'scratch/network-load-balance.cc').read_text()
 def edit(old,new):
     global s
     if s.count(old)!=1:raise ValueError(old)
     s=s.replace(old,new)
 edit('uint64_t avg_nic_rate;', 'uint64_t avg_nic_rate = 0;')
+# Live ECMP uses each installed channel's delay. The fixed-hop formulas
+# later in the author driver apply to the ConWeave load balancer only.
+edit('assert(std::to_string(one_hop_delay) + "ns" == link_delay);',
+     'if (!getenv("AI_WORKLOAD") || lb_mode != 0) assert(std::to_string(one_hop_delay) + "ns" == link_delay);')
 # Frozen scale fixtures express integer nanoseconds. The legacy Seconds(double)
 # conversion can truncate these exact decimal inputs a nanosecond early.
 assert s.count('Seconds(flow_input.start_time)') == 2
@@ -31,6 +40,9 @@ edit('if (dev) dev->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&
                     if (keep) dev->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&tx_begin, i, dev->GetIfIndex()));
                 }''')
 edit('static FILE *tx_out;', (base/'live.inc').read_text()+'\nstatic FILE *tx_out;')
+edit('        tx_out = fopen(path, "w");', '''        tx_out = fopen(path, "w");
+        if (!tx_out) return 2;
+        if (const char *until = getenv("TWINS_TXTRACE_MAX_NS")) tx_until = std::stoull(until);''')
 edit('    Settings::cnt_finished_flows++;','''    if (live_fct) {
         fprintf(live_fct, "%d %lu %lu\\n", q->m_flow_id,q->startTime.GetTimeStep(),(Simulator::Now()-q->startTime).GetTimeStep());
         deliver(0,q->m_flow_id);
