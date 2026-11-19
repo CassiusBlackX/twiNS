@@ -66,6 +66,38 @@ def result(t):
   if (t['kind']=='probe' or v.get('timing_eligible')) and (t['kind']!='scan' or v.get('monitor_schema',1)>=2):return v
  return None
 
+def previous_failures(pending):
+    """Recover retry history from the dispatch log and completed scan receipts."""
+    counts = Counter()
+    ended = {}
+    names = {task['formal'] for task in pending}
+    dispatch_log = P / 'dispatch.jsonl'
+    if dispatch_log.exists():
+        with dispatch_log.open() as stream:
+            for line in stream:
+                with contextlib.suppress(ValueError):
+                    event = json.loads(line)
+                    name = event.get('formal')
+                    if name in names and event['action'] == 'finished' and not event.get('timing_eligible'):
+                        counts[name] += 1
+                        ended[name] = event['utc_ns']
+    # A service reload at a completed worker boundary can precede its dispatch footer.
+    for task in pending:
+        if task['kind'] != 'scan' or task['engine'] != 'cpu':
+            continue
+        attempts = [read(path) for path in receipt_paths(task) if path.exists()]
+        attempts = [result for result in attempts if result.get('monitor_schema', 0) >= 2]
+        name = task['formal']
+        counts[name] = max(counts[name], len(attempts))
+        ended[name] = max([ended.get(name, 0)] + [result['end_utc_ns'] for result in attempts])
+    return counts, ended
+
+def retry_delay(task, failed_attempts):
+    if task['kind'] == 'scan' and task['engine'] == 'cpu':
+        # Background CPU conditions can persist across many 50-minute sweeps.
+        return min(4 * 3600, 30 * 60 * 2 ** min(3, failed_attempts - 1))
+    return 60
+
 def worker(t):
  os.sched_setaffinity(0,{15}) # observers/validation, not the measured children
  cores=t['cores'];eng=t['engine'];kind=t['kind'];ctx=dict(policy='parallel75-20261119',co_run_allowed=eng!='p16' and len(cores)<16,total_budget_gib=BUDGET,observer_reservation_gib=OVERHEAD,initial_reservation_gib=t['memory'],physical_cores=cores,dispatch_log='export/parallel75/dispatch.jsonl',scope='disjoint physical cores; memory quotas guaranteed; RAM bandwidth/power remain shared; not an exclusive workstation timing')
@@ -106,7 +138,12 @@ def supervise():
  with (E/'exclusive-campaign.lock').open('a') as lock:
   fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);runner.freeze()
   all_tasks=tasks();save(P/'plan.json',dict(created_utc_ns=time.time_ns(),total_budget_gib=BUDGET,observer_gib=OVERHEAD,gpu_host_memory_policy=GPU_POLICY,model_budget_gib=MODEL_BUDGET,batch_internal_budget_gib=b.BUDGET,disk_headroom_bytes=DISK_HEADROOM_BYTES,tasks=all_tasks,authorization='User 2026-11-19: start early, parallelize where accuracy permits, 75GB budget; overrides older exclusive-only admission requirement',core_policy='no own overlap on physical SMT siblings; P16/wide CPU tasks drain all other measured tasks'))
-  pending=[t for t in all_tasks if result(t) is None];active={};retry={};last_gpu=0;gpu_quiet=False;cpu_phase=0;mtp_added=False
+  pending=[t for t in all_tasks if result(t) is None];active={};last_gpu=0;gpu_quiet=False;mtp_added=False
+  failures, last_failure = previous_failures(pending)
+  retry = {
+      task['formal']: last_failure[task['formal']] / 1e9 + retry_delay(task, failures[task['formal']])
+      for task in pending if failures[task['formal']]
+  }
   def shutdown(signum,frame):
    # Only containers with both our campaign and UID label and our raw mount qualify.
    ids=sp.check_output(['docker','ps','-q','--filter','label=twins.evidence.campaign=20261118','--filter',f'label=twins.evidence.owner={os.getuid()}'],text=True).split()
@@ -130,7 +167,9 @@ def supervise():
     if v and x['task']['kind']=='mtp' and not v.get('complete') and v.get('rc') in (137,-9) and x['task']['memory']<MODEL_BUDGET:
      old=x['task'];new=dict(old,memory=MODEL_BUDGET,formal=old['formal'].replace('-mtp-sweep-','-mtp-memory-retry-sweep-'),mtp_phase='memory-retry-sweep');all_tasks.append(new);pending.append(new)
     if v is None:
-     retry[key]=time.monotonic()+60;pending.append(x['task'])
+     failures[key] += 1
+     retry[key] = time.time() + retry_delay(x['task'], failures[key])
+     pending.append(x['task'])
      if x['p'].returncode not in (0,1):raise RuntimeError('worker failed: '+key)
    # After all sweep receipts, select each model's fastest completed configuration.
    if not mtp_added and not any(t['kind']=='mtp' for t in pending) and not any(x['task']['kind']=='mtp' for x in active.values()):
@@ -145,16 +184,19 @@ def supervise():
    if time.monotonic()-last_gpu>5:
     # Check only foreign compute PIDs: our own current GPU task does not close admission.
     sample=c.snapshot();own={p['pid'] for p in c.proc_tree(os.getpid())};gpu_quiet=not foreign_gpu(dict(sample,known_owned_pids=list(own)));g=sample.get('gpu','').split(',');gpu_quiet &= float(g[0])<8 if len(g)>1 and not any(x['alloc']['gpu'] for x in active.values()) else True;last_gpu=time.monotonic()
-   cpu_pending=[t for t in pending if t['engine'] in ('cpu','simai','mtp')];phase=min((t['phase'] for t in cpu_pending),default=5)
+   now = time.time()
+   ready = [t for t in pending if retry.get(t['formal'], 0) <= now]
+   cpu_pending=[t for t in ready if t['engine'] in ('cpu','simai','mtp')];phase=min((t['phase'] for t in cpu_pending),default=5)
    # Avoid launching the next phase until active CPU tasks of the previous phase drain.
    phase=min([phase]+[x['task']['phase'] for x in active.values() if x['task']['engine'] in ('cpu','simai','mtp')])
    wide_wait=any(t['phase']==phase and t['ncores']==16 for t in cpu_pending)
    blocked = Counter()
    free_bytes = shutil.disk_usage(E).free
    available_memory = available_gib()
-   candidates=sorted(pending,key=lambda t:(t['phase'],0 if t['engine'] in ('gpu','p0','p16') else 1,-c.BY[t['case']]['old_simai_s'] if t['kind']=='latency' and t['engine']=='simai' else 0,t['formal']))
+   if len(ready) < len(pending):
+    blocked['retry_cooldown'] = len(pending) - len(ready)
+   candidates=sorted(ready,key=lambda t:(t['phase'],0 if t['engine'] in ('gpu','p0','p16') else 1,failures[t['formal']],-c.BY[t['case']]['old_simai_s'] if t['kind']=='latency' and t['engine']=='simai' else 0,t['formal']))
    for t in candidates:
-    if retry.get(t['formal'],0)>time.monotonic():continue
     gpu=t['engine'] in ('gpu','p0','p16')
     if not gpu and t['phase']!=phase:continue
     if gpu and t['kind']!='probe' and not gpu_quiet:
