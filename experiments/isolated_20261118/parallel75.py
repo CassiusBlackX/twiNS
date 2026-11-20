@@ -67,7 +67,7 @@ def result(t):
  return None
 
 def previous_failures(pending):
-    """Recover retry history from the dispatch log and completed scan receipts."""
+    """Recover retry history from the dispatch log and completed receipts."""
     counts = Counter()
     ended = {}
     names = {task['formal'] for task in pending}
@@ -83,20 +83,43 @@ def previous_failures(pending):
                         ended[name] = event['utc_ns']
     # A service reload at a completed worker boundary can precede its dispatch footer.
     for task in pending:
-        if task['kind'] != 'scan' or task['engine'] != 'cpu':
+        is_cpu_scan = task['kind'] == 'scan' and task['engine'] == 'cpu'
+        is_mtp = task['kind'] == 'mtp'
+        if not is_cpu_scan and not is_mtp:
             continue
         attempts = [read(path) for path in receipt_paths(task) if path.exists()]
-        attempts = [result for result in attempts if result.get('monitor_schema', 0) >= 2]
+        attempts = [
+            result for result in attempts
+            if 'end_utc_ns' in result
+            and not result.get('timing_eligible')
+            and (is_mtp or result.get('monitor_schema', 0) >= 2)
+        ]
         name = task['formal']
         counts[name] = max(counts[name], len(attempts))
         ended[name] = max([ended.get(name, 0)] + [result['end_utc_ns'] for result in attempts])
     return counts, ended
 
 def retry_delay(task, failed_attempts):
-    if task['kind'] == 'scan' and task['engine'] == 'cpu':
-        # Background CPU conditions can persist across many 50-minute sweeps.
+    if (task['kind'], task['engine']) in {('scan', 'cpu'), ('batch', 'simai')}:
+        # Let other settings proceed before repeating a long CPU measurement.
         return min(4 * 3600, 30 * 60 * 2 ** min(3, failed_attempts - 1))
+    if task['kind'] == 'mtp' and task.get('mtp_phase') == 'repeat-best':
+        # Repeating a contaminated 30–60 minute run immediately held up AI batches.
+        return min(3600, 10 * 60 * 2 ** min(3, failed_attempts - 1))
     return 60
+
+def cpu_phase_allows(task, phase, mtp_sweep_finished, draining_wide_setting):
+    if task['phase'] == phase:
+        return True
+    # After selecting the MTP repeat settings, the rest of the throughput
+    # matrix has no dependency on those repeats. Keep a boundary for a ready
+    # P16/wide CPU measurement, so a six-hour batch cannot make it wait.
+    return (
+        mtp_sweep_finished
+        and task['kind'] == 'batch'
+        and task['engine'] == 'simai'
+        and not draining_wide_setting
+    )
 
 def worker(t):
  os.sched_setaffinity(0,{15}) # observers/validation, not the measured children
@@ -173,13 +196,21 @@ def supervise():
      if x['p'].returncode not in (0,1):raise RuntimeError('worker failed: '+key)
    # After all sweep receipts, select each model's fastest completed configuration.
    if not mtp_added and not any(t['kind']=='mtp' for t in pending) and not any(x['task']['kind']=='mtp' for x in active.values()):
+    new_repeats = []
     for case in sorted({t['case'] for t in all_tasks if t['kind']=='mtp'}):
      xs=[result(t) for t in all_tasks if t['kind']=='mtp' and t['case']==case];complete=[v for v in xs if v and v.get('complete')]
      if not complete:save(EXPORT/'mtp'/('summary-'+case+'.json'),dict(case=case,fastest_completed_threads=None,status='no completed timing-eligible MTP setting'));continue
      best=min(complete,key=lambda v:v['wall_ns'])
      for r in (2,3):
       t=dict(kind='mtp',formal=f'iso18-mtp-repeat-best-{case}-t{best["threads"]}-r{r}',engine='mtp',memory=best.get('memory_cap_gib',32),ncores=min(16,best['threads']),phase=3,case=case,threads=best['threads'],round=r,mtp_phase='repeat-best');all_tasks.append(t)
-      if result(t) is None:pending.append(t)
+      if result(t) is None:new_repeats.append(t)
+    repeat_failures, repeat_ends = previous_failures(new_repeats)
+    for task in new_repeats:
+     name = task['formal']
+     if repeat_failures[name]:
+      failures[name] = repeat_failures[name]
+      retry[name] = repeat_ends[name] / 1e9 + retry_delay(task, failures[name])
+    pending.extend(new_repeats)
     mtp_added=True
    if time.monotonic()-last_gpu>5:
     # Check only foreign compute PIDs: our own current GPU task does not close admission.
@@ -198,7 +229,9 @@ def supervise():
    candidates=sorted(ready,key=lambda t:(t['phase'],0 if t['engine'] in ('gpu','p0','p16') else 1,failures[t['formal']],-c.BY[t['case']]['old_simai_s'] if t['kind']=='latency' and t['engine']=='simai' else 0,t['formal']))
    for t in candidates:
     gpu=t['engine'] in ('gpu','p0','p16')
-    if not gpu and t['phase']!=phase:continue
+    if not gpu and not cpu_phase_allows(t,phase,mtp_added,wide_wait):
+     blocked['cpu_phase_order'] += 1
+     continue
     if gpu and t['kind']!='probe' and not gpu_quiet:
      blocked['external_gpu_activity'] += 1
      continue
