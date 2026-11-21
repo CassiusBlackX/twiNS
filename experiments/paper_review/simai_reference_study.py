@@ -83,16 +83,16 @@ def toggle_variants(source):
     write_once(device,before,after+before)
 
 
-def docker(source,cap,cpus):
+def docker(source,cap,cpus,writable=False):
     return ['docker','run','--rm','--network=none','--ulimit','core=0',
             '--label','twins.evidence.campaign=simai-reference-20261122',
             '--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(cpus),
-            f'--memory={cap}g',f'--memory-swap={cap}g','-v',f'{source}:/simai']
+            f'--memory={cap}g',f'--memory-swap={cap}g','-v',f'{source}:/simai:'+('rw' if writable else 'ro')]
 
 
 def build(source,out):
     out.mkdir(parents=True)
-    base=docker(source,22,'8-13')+[IMAGE]
+    base=docker(source,22,'8-13',writable=True)+[IMAGE]
     config=['cmake','-S',f'/simai/{SIM}','-B',f'/simai/{SIM}/trial-cmake','-G','Ninja',
             '-DCMAKE_BUILD_TYPE=release','-DNS3_MTP=OFF','-DNS3_NATIVE_OPTIMIZATIONS=ON',
             '-DNS3_WARNINGS_AS_ERRORS=OFF','-DCMAKE_CXX_FLAGS=-include cstdint',
@@ -109,7 +109,7 @@ def build(source,out):
         event_id_symbol=[s for s in symbols.splitlines() if 'EventId::EventId(ns3::Ptr<ns3::EventImpl>' in s]))
 
 
-def execute(source,results,work,name,workload,variant,core,cap):
+def execute(source,results,work,name,workload,variant,core,cap,threads=1,binary=BINARY):
     raw=work/name
     result=results/name
     raw.mkdir(parents=True)
@@ -124,7 +124,7 @@ def execute(source,results,work,name,workload,variant,core,cap):
     topology='/work/topo/AlibabaHPN_128g_8gps_DualToR_SinglePlane_200Gbps_H100'
     command=docker(source,cap,core)+options+['-v',f'{ORACLE}:/work:ro',
         '-v',f'{etc}:/etc/astra-sim','-v',f'{raw}:/run','-w','/run',IMAGE,
-        'timeout','7200',BINARY,'-t','1','-w',workload_path,'-n',topology,'-c',CONFIG]
+        'timeout','7200',binary,'-t',str(threads),'-w',workload_path,'-n',topology,'-c',CONFIG]
     start=time.monotonic_ns()
     with (result/'run.log').open('wb') as log:
         rc=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT).returncode
@@ -180,10 +180,21 @@ def main():
         futures={name:pool.submit(execute,off,out,raw,name+'-off',name+'_full','',core,cap)
                  for name,core,cap in runs}
         anchors={}
+        anchor_fcts={}
         for name,future in futures.items():
             result,fct=future.result()
             reference=PREVIOUS/'out/reference-cache'/(name+'_full_hpn128.fct')
             anchors[name]={'run':result,'vs_historical_uid64_off':compare(fct,reference)}
+            anchor_fcts[name]=fct
+    mtp_binary=f'/simai/{SIM}/build-mtp/scratch/ns3.36.1-AstraSimNetwork-optimized'
+    # If the OFF builds differ, directly compare a fresh MTP output to the matched
+    # source OFF run rather than inferring the comparison through the UID64 files.
+    for name,threads,cores in [('gpt3_13b',16,'0-15'),('llama_65b',1,8),('gpt3_175b',2,'12,14')]:
+        anchor=anchors[name]
+        if anchor['run']['complete'] and not anchor['vs_historical_uid64_off'].get('byte_equal'):
+            recorded,fct=execute(source,out,raw,name+'-mtp-followup',name+'_full','',
+                                 cores,32,threads=threads,binary=mtp_binary)
+            anchor['mtp_followup']={'run':recorded,'versus_same_source_off':compare(fct,anchor_fcts[name])}
     save(out/'matched-off-summary.json',anchors)
     matrix={}
     for width in (64,32):
