@@ -2997,7 +2997,11 @@ __device__ __forceinline__ uint32_t pfc_thresh(const SCtx &c, int port)
 }
 __device__ __forceinline__ uint32_t shared_used(const Port &p) { return p.ing > RESERVE ? p.ing - RESERVE : 0; }
 
-__device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
+__device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+                                         , double ecn_probability = -1
+#endif
+)
 {
     const Sim &s = *c.s;
     int64_t tx = link_txo(s, c.w[port].ob, p.size);
@@ -3028,8 +3032,22 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     f->c = cur;
     f->p = p;
     if (c.P->irn) irn_final_hop(s, p, c.w[port].ob.link, c.now, ts, cur);
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    if (s.global_ecn && ecn_probability >= 0)
+    {
+        GlobalEcn &state = *s.global_ecn;
+        unsigned index = atomicAdd(&state.count, 1u);
+        if (index < state.capacity)
+            state.decisions[index] = {f, c.now, c.sw.evseq, ecn_probability,
+                                      uint32_t(c.node), uint32_t(port), p.ord, c.w[port].pt.egr};
+        else
+            atomicAdd(&state.unresolved, 1u);
+        return; // write the wire record once the probabilistic marking decision is applied
+    }
+#endif
     trace_tx(s, c.now, c.node, port, p);
 }
+
 
 __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p)
 {
@@ -3159,6 +3177,9 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
                    port + 1, p.size, in.ing, in.hdrm, c.sw.shared_used, pfc_thresh(c, p.inport), p.src, p.dst, p.seq, pt.q3_n);
 #endif
     }
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    double ecn_probability = -1;
+#endif
     if (P.ecn && !c.nvs)
     {
         // SwitchMmu::ShouldSendCN
@@ -3170,6 +3191,12 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
         else if (ecn_bytes > kmin)
         {
             double pr = pcfg(c, port).pmax * (double)(ecn_bytes - kmin) / (double)(kmax - kmin);
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+            if (s.global_ecn)
+                ecn_probability = pr;
+            else
+            {
+#endif
             const double draw = nsm_rng::rand_u01(P.irn ? c.w[0].pt.rng : pt.rng);
             mark = draw < pr;
 #ifdef TWINS_AUDIT_IRN_ECN
@@ -3177,6 +3204,9 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
                 printf("sw-draw %lld %d %u %d %d %u %.17g %.17g %d\n",
                        (long long)c.now, port + 1, ecn_bytes, p.src, p.dst, p.seq,
                        draw, pr, int(mark));
+#endif
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+            }
 #endif
         }
         if (mark)
@@ -3207,7 +3237,11 @@ __device__ __forceinline__ void s_start_q3(SCtx &c, int port, Pkt p)
         p.nhop++;
     }
     pt.tx_bytes += p.size;
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    s_transmit(c, port, p, ecn_probability);
+#else
     s_transmit(c, port, p);
+#endif
 }
 
 // SwitchNode::SendToDev
@@ -4016,6 +4050,10 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
                 c.now = bt;
                 c.ord = 0;
                 c.cur_ok = false;
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+                if (s.global_ecn)
+                    ++c.sw.evseq;
+#endif
     #ifdef RDMA_PROF
                 nev++;
                 long long q1 = clock64();
@@ -4908,6 +4946,92 @@ __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, 
 // kernel argument, its address (taken by the contexts) put a copy in every wave's scratch at its
 // start, and every field read went there
 __constant__ Sim c_sim;
+
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+// Iterate the reference switch callbacks in their original global order.
+// Sent frames first become readable at a later slot, so preparing the ECN
+// bit here cannot affect queue lengths or another dequeue in this slot.
+__global__ void apply_global_ecn()
+{
+    const Sim &s = c_sim;
+    GlobalEcn &state = *s.global_ecn;
+    unsigned count = state.count;
+    state.count = 0;
+    if (state.unresolved)
+        return;
+    for (unsigned i = 1; i < count; ++i)
+    {
+        EcnDecision item = state.decisions[i];
+        unsigned j = i;
+        while (j)
+        {
+            const EcnDecision &before = state.decisions[j - 1];
+            bool move = false;
+            if (before.when != item.when)
+                move = before.when > item.when;
+            else if (before.node == item.node)
+            {
+                if (before.event_sequence == item.event_sequence && before.ordinal == item.ordinal)
+                {
+                    printf("global-ecn-unresolved local time=%lld node=%u event=%llu ordinal=%u\n",
+                           (long long)item.when, item.node,
+                           (unsigned long long)item.event_sequence, item.ordinal);
+                    ++state.unresolved;
+                    return;
+                }
+                move = before.event_sequence > item.event_sequence ||
+                       (before.event_sequence == item.event_sequence && before.ordinal > item.ordinal);
+            }
+            else
+            {
+                bool inexact = false;
+                const int cmp = ccmp_walk(s.root_rank, 0, before.frame->c, 0, item.frame->c, &inexact);
+                if (inexact || cmp == 0)
+                {
+                    const Chain &a = before.frame->c, &b = item.frame->c;
+                    printf("global-ecn-unresolved cross time=%lld nodes=%u,%u ports=%u,%u "
+                           "flows=%u,%u roots=%u,%u tails=%llu,%llu lost=%d\n",
+                           (long long)item.when, before.node, item.node, before.port + 1, item.port + 1,
+                           before.frame->p.flow, item.frame->p.flow, a.root, b.root,
+                           (unsigned long long)a.tail, (unsigned long long)b.tail, int(inexact));
+                    for (int k = 0; k < RUNS; ++k)
+                        printf("global-ecn-lineage %d %u %u %u %u\n",
+                               k, a.r[k].code, a.r[k].cnt, b.r[k].code, b.r[k].cnt);
+                    ++state.unresolved;
+                    return;
+                }
+                move = cmp > 0;
+            }
+            if (!move)
+                break;
+            state.decisions[j] = before;
+            --j;
+        }
+        state.decisions[j] = item;
+    }
+    for (unsigned i = 0; i < count; ++i)
+    {
+        const EcnDecision &decision = state.decisions[i];
+        auto current = state.initial;
+        const double draw = nsm_rng::rand_u01(current);
+        state.jump.next(state.initial);
+        const bool mark = draw < decision.probability;
+        if (mark)
+        {
+            decision.frame->p.ecn = 3;
+            atomicAdd(&s.ev[1], 1ull);
+        }
+        trace_tx(s, decision.when, decision.node, decision.port, decision.frame->p);
+        if (state.log_draws)
+            printf("ecn-draw %llu %llu %u %u %u %u %a %a %d\n",
+                   (unsigned long long)decision.when, (unsigned long long)state.stream,
+                   decision.node, decision.port + 1, PG, decision.queue_bytes, draw,
+                   decision.probability, int(mark));
+        ++state.stream;
+    }
+}
+#endif
+
 
 // A block is one wave (BLOCK lanes, --spread at most): the compiler may give it all the registers
 constexpr int BLOCK = 32;

@@ -207,6 +207,27 @@ struct LFrame
 };
 static_assert(sizeof(LFrame) % 8 == 0, "LFrame");
 
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+struct EcnDecision
+{
+    LFrame *frame;
+    int64_t when;
+    uint64_t event_sequence;
+    double probability;
+    uint32_t node, port, ordinal, queue_bytes;
+};
+
+struct GlobalEcn
+{
+    EcnDecision *decisions;
+    unsigned capacity, count, unresolved;
+    uint64_t stream;
+    nsm_rng::State initial;
+    nsm_rng::StreamJump jump;
+    bool log_draws;
+};
+#endif
+
 // A queue pair (sender side), RdmaQueuePair
 struct SndQP
 {
@@ -437,6 +458,9 @@ struct SlotSample {
 #endif
 struct Sim
 {
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    GlobalEcn *global_ecn;
+#endif
     IrnSender *irn_sender;
     IrnMap *irn_receiver;
     IrnLifetime *irn_lifetime;

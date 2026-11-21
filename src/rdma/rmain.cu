@@ -1083,6 +1083,10 @@ int main(int argc, char **argv)
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
     bool irn_parallel = false;
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    bool global_ecn = false, global_ecn_log = false;
+    uint64_t global_ecn_stream = 0;
+#endif
     bool tail_set = false;
     bool tail_auto = false;
     int tail_max = 27; // (the most it may be: less if the GPU has no more room)
@@ -1138,6 +1142,21 @@ int main(int argc, char **argv)
             serial = 1;
         else if (k == "--irn-parallel")
             irn_parallel = true;
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+        else if (k == "--ecn-global-stream")
+        {
+            char *end;
+            global_ecn_stream = strtoull(v.c_str(), &end, 10);
+            if (v.empty() || v[0] == '-' || *end || global_ecn_stream >= (1ull << 63))
+            {
+                fprintf(stderr, "--ecn-global-stream expects a nonnegative automatic ns-3 stream index\n");
+                return 1;
+            }
+            global_ecn = true;
+        }
+        else if (k == "--ecn-global-log")
+            global_ecn_log = true;
+#endif
         else if (k == "--win")
         {
             kw = std::max(1, std::min(255, atoi(v.c_str())));
@@ -1450,6 +1469,25 @@ int main(int argc, char **argv)
         return 1;
     }
     Params P = Pw[0];
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    if (global_ecn)
+    {
+        if (W != 1 || P.simai || P.irn || !P.ecn)
+        {
+            fprintf(stderr, "global ECN prototype requires one standalone HPCC world with ECN enabled\n");
+            return 1;
+        }
+        // All tentative markings must be resolved after their slot, before
+        // any destination can read the frames. Preserve the serial per-switch
+        // merge and do not advance any entity ahead of the common boundary.
+        gwin = 0;
+        kw = 1;
+        serial = 1;
+        persist = 0;
+        printf("global ECN initial automatic stream %llu (seed 1, run 1)\n",
+               (unsigned long long)global_ecn_stream);
+    }
+#endif
     if (W == 1)
         printf("maxRtt=%llu maxBdp=%u\n", (unsigned long long)P.base_rtt, P.win);
     else
@@ -1457,6 +1495,19 @@ int main(int argc, char **argv)
 
     // ---- device state
     Sim s = {};
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    if (global_ecn)
+    {
+        GlobalEcn state{};
+        state.capacity = 65536;
+        state.decisions = dev_alloc<EcnDecision>(state.capacity);
+        state.stream = global_ecn_stream;
+        state.initial = nsm_rng::absolute_stream_state(1, global_ecn_stream, 1);
+        state.jump = nsm_rng::stream_jump();
+        state.log_draws = global_ecn_log;
+        s.global_ecn = dev_copy(vector<GlobalEcn>{state});
+    }
+#endif
     s.H = H, s.S = S, s.N = N, s.L = L, s.K = K, s.F = F;
     s.P = P;
     s.fD = fdiv_make(P.delay);
@@ -2208,6 +2259,10 @@ int main(int argc, char **argv)
     bool ranks = false;
     for (int x = 0; x < S; x++)
         ranks |= rk_ok[x] != 0;
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    if (global_ecn)
+        ranks = false;
+#endif
     const int GS = 64;
 #ifdef TWINS_ASTRA
     // the closed loop's graph while windows run (the limit comes sooner than its last launch); GS
@@ -2253,6 +2308,10 @@ int main(int argc, char **argv)
             CK(hipEventRecord(ejc, sc));
             CK(hipStreamWaitEvent(sa, ejc, 0));
         }
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+        if (global_ecn)
+            apply_global_ecn<<<1, 1, 0, sa>>>();
+#endif
         if (ranks && i % rank_every == 0)
         {
             int r = i / rank_every;
@@ -2558,6 +2617,20 @@ int main(int argc, char **argv)
         if (s.irn_parallel) printf("IRN active switch slots: %llu parallel, %llu fallback\n", n[4], n[5]);
     }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+    if (global_ecn)
+    {
+        GlobalEcn result{};
+        CK(cudaMemcpy(&result, s.global_ecn, sizeof(result), cudaMemcpyDeviceToHost));
+        printf("global ECN draws %llu, unresolved ordering or capacity %u\n",
+               (unsigned long long)(result.stream - global_ecn_stream), result.unresolved);
+        if (result.unresolved)
+        {
+            fprintf(stderr, "error: global ECN ordering or capacity unresolved\n");
+            bad = true;
+        }
+    }
+#endif
     if (ev[36])
         fprintf(stderr, "error: a persistent launch's blocks did not all run (--persist=0)\n");
     if (ev[14] || ev[15] || ev[32] || ev[33])

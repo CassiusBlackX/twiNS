@@ -137,16 +137,15 @@ struct Powers
 };
 
 // the state of UniformRandomVariable::SetStream(stream) under RngSeed seed, RngRun run
-inline State stream_state(uint32_t seed, uint64_t stream, uint64_t run)
+inline State absolute_stream_state(uint32_t seed, uint64_t stream, uint64_t run)
 {
     const uint64_t m1 = 4294967087ull, m2 = 4294944443ull;
     const Mat A1 = {{0, 1, 0}, {0, 0, 1}, {m1 - 810728, 1403580, 0}};
     const Mat A2 = {{0, 1, 0}, {0, 0, 1}, {m2 - 1370589, 0, 527612}};
     static const Powers s1(A1, m1, 127), s2(A2, m2, 127), r1(A1, m1, 76), r2(A2, m2, 76);
     uint64_t v1[3] = {seed, seed, seed}, v2[3] = {seed, seed, seed};
-    uint64_t target = (1ull << 63) + stream;
-    s1.advance(m1, target, v1);
-    s2.advance(m2, target, v2);
+    s1.advance(m1, stream, v1);
+    s2.advance(m2, stream, v2);
     r1.advance(m1, run, v1);
     r2.advance(m2, run, v2);
     State x;
@@ -157,6 +156,55 @@ inline State stream_state(uint32_t seed, uint64_t stream, uint64_t run)
     }
     return x;
 }
+
+inline State stream_state(uint32_t seed, uint64_t stream, uint64_t run)
+{
+    return absolute_stream_state(seed, (1ull << 63) + stream, run);
+}
+
+#ifdef TWINS_GLOBAL_ECN_PROTOTYPE
+// Auto-allocated ns-3 streams advance by one full MRG32k3a stream
+// (2^127 steps), irrespective of how many draws a stream has consumed.
+struct StreamJump
+{
+    Mat a, b;
+    RNG_FN void next(State &state) const
+    {
+        const uint64_t modulus[2] = {4294967087ull, 4294944443ull};
+        State result;
+        for (int part = 0; part < 2; ++part)
+        {
+            const Mat &matrix = part ? b : a;
+            const uint64_t m = modulus[part];
+            for (int row = 0; row < 3; ++row)
+            {
+                uint64_t value = 0;
+                for (int col = 0; col < 3; ++col)
+                {
+                    // The factors are both below 2^32. Reduce each term
+                    // before the addition to avoid accumulating overflow.
+                    value = (value + (matrix[row][col] * uint64_t(state.s[3 * part + col])) % m) % m;
+                }
+                result.s[3 * part + row] = double(value);
+            }
+        }
+        state = result;
+    }
+};
+
+inline StreamJump stream_jump()
+{
+    const uint64_t m1 = 4294967087ull, m2 = 4294944443ull;
+    StreamJump jump = {{{0, 1, 0}, {0, 0, 1}, {m1 - 810728, 1403580, 0}},
+                       {{0, 1, 0}, {0, 0, 1}, {m2 - 1370589, 0, 527612}}};
+    for (int i = 0; i < 127; ++i)
+    {
+        mat_mul(jump.a, jump.a, jump.a, m1);
+        mat_mul(jump.b, jump.b, jump.b, m2);
+    }
+    return jump;
+}
+#endif
 } // namespace nsm_rng
 
 #endif
