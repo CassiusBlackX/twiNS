@@ -186,11 +186,14 @@ if __name__=='__main__':
     for name in ('source','data','inventory','build','out'):
         parser.add_argument(name,type=lambda value:Path(value).resolve())
     parser.add_argument('--workers',type=int,default=4)
+    parser.add_argument('--revision', help='Pinned source commit for a tree exported with git archive')
     args=parser.parse_args()
     args.out.mkdir(parents=True,exist_ok=True)
     binaries={name:sha(args.build/name) for name in ('twins','twins-rdma','twins-ai')}
+    revision=args.revision or subprocess.check_output(
+        ['git','rev-parse','HEAD'],cwd=args.source,text=True).strip()
     save(args.out/'run-provenance.json',dict(binaries=binaries,inventory_sha256=sha(args.inventory),
-        source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=args.source,text=True).strip()))
+                                           source_revision=revision))
     network(args)
     closed(args)
     summary={}
