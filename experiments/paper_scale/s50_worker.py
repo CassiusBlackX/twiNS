@@ -28,12 +28,21 @@ def descendant(pid,ancestor):
     while pid>1:
         if pid==ancestor:return True
         try:pid=int(Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[1])
-        except (OSError,IndexError,ValueError):return False
+        except (OSError,IndexError,ValueError):return None
     return False
 
-def watch(proc,stop,seen):
+def watch(proc,stop,seen,exited):
     while not stop.wait(3):
-        try:seen.update(pid for pid in gpu_pids() if not descendant(pid,proc.pid))
+        try:
+            for pid in gpu_pids():
+                owner = descendant(pid, proc.pid)
+                if owner is False:
+                    seen.add(pid)
+                elif owner is None:
+                    # A short owned CUDA process can leave NVML's sampled PID
+                    # list after it has exited. Keep the observation separate
+                    # from a live competing process with resolved ancestry.
+                    exited.add(pid)
         except (OSError,subprocess.SubprocessError):seen.add('sampler_error')
 
 def main():
@@ -60,15 +69,19 @@ def main():
                             while gpu_pids():time.sleep(15)
                         with subprocess.Popen(job['command'],stdout=log,stderr=subprocess.STDOUT,pass_fds=(shared.fileno(),lock.fileno())) as proc:
                             seen=set()
+                            exited=set()
                             stop=threading.Event()
-                            monitor=threading.Thread(target=watch,args=(proc,stop,seen)) if timed else None
+                            monitor=threading.Thread(target=watch,args=(proc,stop,seen,exited)) if timed else None
                             if monitor:monitor.start()
                             try:rc=proc.wait()
                             finally:
                                 stop.set()
                                 if monitor:monitor.join()
                             if timed:
-                                (current/'isolation.json').write_text(json.dumps(dict(poll_seconds=3,foreign_gpu=list(seen),eligible=not seen)))
+                                (current/'isolation.json').write_text(json.dumps(dict(
+                                    poll_seconds=3, foreign_gpu=list(seen),
+                                    exited_before_attribution=sorted(exited), eligible=not seen,
+                                )))
                                 if seen:rc=125
                 except OSError as exc:
                     print(exc,file=log);rc=126
