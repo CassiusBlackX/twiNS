@@ -35,7 +35,8 @@ def sync(source,dst,*args):
     subprocess.run(['rsync','-aL','--exclude=__pycache__',*args,str(source),'s50:'+work+'/'+dst],check=True)
 def prepare():
     # The old runner writes its final marker just before releasing its flock.
-    connection('flock '+prior+'/exclusive-campaign.lock mkdir -p '+work)
+    # rsync creates the leaf destination, but requires its parent to exist.
+    connection('flock '+prior+'/exclusive-campaign.lock mkdir -p '+work+'/validation')
     for p,dst in [(str(campaign/'dcqcn/inputs')+'/','inputs/'),(str(root/'src')+'/','src/'),(root/'CMakeLists.txt','CMakeLists.txt'),
                   (str(root/'experiments/paper_scale')+'/','scripts/'),(str(root/'validation/extensions')+'/','validation/extensions/'),
                   (str(campaign/'a87-control/live')+'/','live/'),(str(campaign/'diagnostic-runtime')+'/','diagnostic-runtime/'),
@@ -105,14 +106,16 @@ def batch():
     from s50_finalize import finish
     finish(campaign)
     status('finished returning formal trials and diagnostics')
-    remote_bundle='/home/cassius/netsim/twins-paper-scale-20261119'
-    subprocess.run(['ssh','a87','mkdir -p '+remote_bundle+'/s50-bundle/results'],check=True)
-    subprocess.run(['rsync','-a',str(evidence)+'/', 'a87:'+remote_bundle+'/s50-bundle/results/'],check=True)
-    subprocess.run(['rsync','-a',str(root/'experiments/paper_scale')+'/', 'a87:'+remote_bundle+'/s50-bundle/scripts/'],check=True)
-    subprocess.run(['rsync','-a',str(root/'experiments/paper_scale/archive.py'),'a87:'+remote_bundle+'/'],check=True)
-    from archive import publish
-    publish('twins-paper-scale-s50-20261119','s50-bundle',campaign/'archives',root.parent/'materials/paper_data')
-    (evidence/'finished.json').write_text(json.dumps(dict(utc_ns=time.time_ns(),receipts={p.parent.name:json.loads(p.read_text())['rc'] for p in sorted(evidence.glob('*/received.json'))}),indent=2))
+    # collect() already verifies each transfer against the remote archive's SHA-256.
+    # Keep that local evidence as the canonical copy and release the CUDA successor.
+    terminal = evidence/'finished.tmp'
+    terminal.write_text(json.dumps(dict(
+        utc_ns=time.time_ns(),
+        source_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),
+        comparisons='comparisons.json',
+        receipts={p.parent.name:json.loads(p.read_text())['rc'] for p in sorted(evidence.glob('*/received.json'))},
+    ),indent=2)+'\n')
+    terminal.replace(evidence/'finished.json')
 if __name__=='__main__':
     while not (evidence/'finished.json').exists():
         try:

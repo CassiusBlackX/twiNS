@@ -1,15 +1,13 @@
-"""Compute expensive packet interval/report analysis on a87 after the paired s50 trials."""
+"""Compare the returned s50 traces on the same machine that archives them."""
 import json
 from pathlib import Path
 import subprocess
+import sys
 from ai_compare import compare
 
 def finish(campaign):
     evidence=campaign/'s50'
-    remote='/home/cassius/netsim/twins-paper-scale-20261119/s50-analysis'
-    subprocess.run(['ssh','a87','mkdir -p '+remote],check=True)
     script=Path(__file__).with_name('irn_report.py')
-    subprocess.run(['rsync','-a',script,'a87:'+remote+'/'],check=True)
     report={}
     for mode,h in [('incast',256),('spread',1024),('incast',1024)]:
         name=f'irn-{mode}-{h}'
@@ -20,11 +18,9 @@ def finish(campaign):
         raw=[dirs[0]/x for x in leaves[:3]]+[dirs[1]/leaves[3]]
         if not all(p.is_file() for p in raw):
             report[name]={'accepted':False,'reason':'incomplete trace'};continue
-        subprocess.run(['ssh','a87','mkdir -p '+remote+'/'+name],check=True)
-        subprocess.run(['rsync','-a',*raw,'a87:'+remote+'/'+name+'/'],check=True)
-        subprocess.run(['ssh','a87',f'cd {remote} && python3 irn_report.py {name} {name} {name}/report.json'],check=True)
-        subprocess.run(['rsync','-a','a87:'+remote+'/'+name+'/report.json',str(dirs[0])+'/'],check=True)
-        report[name]=json.loads((dirs[0]/'report.json').read_text())
+        output=dirs[0]/'report.json'
+        subprocess.run([sys.executable,str(script),*map(str,dirs),str(output)],check=True)
+        report[name]=json.loads(output.read_text())
     for case in ('large-buffer','small-buffer'):
         gpu=evidence/'live-ai/ai'/case
         if (gpu/'gpu.rc').is_file() and (gpu/'gpu.fct').is_file():
