@@ -43,7 +43,7 @@ def run(prior, review, cuda):
     for seed, kind, inputs, reference in (
         (101, "plain", prior/"inputs", prior/"a87"/"cpu-scale"),
         (101, "ecn", prior/"dcqcn"/"inputs", prior/"dcqcn"/"cpu-scale"),
-        *((103, kind, review/"irn-holdout"/kind/"inputs", review/"irn-holdout"/kind/"cpu-scale")
+        *((103, kind, review/"irn-holdout"/kind/"inputs", review/"a87-final"/"holdout"/kind/"cpu-scale")
           for kind in ("plain", "ecn")),
     ):
         for hosts in (128, 256, 512, 1024):
