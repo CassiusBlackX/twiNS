@@ -104,7 +104,10 @@ fi
 test "${1:-}" = schedule
 test -s "$evidence/staged/revision"
 until [[ -s "$prior/s50/finished.json" ]]; do sleep 30; done
-while systemctl --user is-active --quiet twins-paper-review-cuda.service; do sleep 15; done
+# The predecessor is a retained transient service and can stay active/exited.
+while [[ $(systemctl --user show twins-paper-review-cuda.service -p MainPID --value || true) =~ ^[1-9][0-9]*$ ]]; do
+    sleep 15
+done
 python3 - "$review" "$evidence/staged/gates.json" <<'PY'
 from pathlib import Path
 import json

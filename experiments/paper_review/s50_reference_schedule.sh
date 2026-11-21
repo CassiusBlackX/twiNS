@@ -3,7 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 root=$(pwd -P)
 ssh_cmd=(ssh -F /home/cassius/.ssh/config -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=20 s50)
-while systemctl --user is-active --quiet twins-paper-review-cuda.service twins-paper-review-followthrough.service twins-paper-gpu-pair.service; do
+while systemctl --user show twins-paper-review-cuda.service twins-paper-review-followthrough.service twins-paper-gpu-pair.service \
+        -p MainPID --value | rg -q '^[1-9][0-9]*$'; do
     sleep 30
 done
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
