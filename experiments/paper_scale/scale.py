@@ -72,7 +72,7 @@ def main():
     p=argparse.ArgumentParser()
     for arg in ('inputs','out','build','tcp_ref','irn_tree'):p.add_argument(arg,type=Path)
     p.add_argument('--hosts',type=int,required=True);p.add_argument('--mode',choices=['heterogeneous','uniform','incast','spread'],required=True)
-    p.add_argument('--trials',type=int,default=4);p.add_argument('--core',type=int);p.add_argument('--timeout',type=int,default=3600);p.add_argument('--image');p.add_argument('--irn-reference',type=Path);p.add_argument('--compat-libs',type=Path)
+    p.add_argument('--trials',type=int,default=4);p.add_argument('--core',type=int);p.add_argument('--timeout',type=int,default=3600);p.add_argument('--image');p.add_argument('--irn-reference',type=Path);p.add_argument('--compat-libs',type=Path);p.add_argument('--gpu-option',action='append',default=[])
     a=p.parse_args()
     a.out=a.out.resolve(); a.out.mkdir(parents=True,exist_ok=True)
     src=a.inputs.resolve()/str(a.hosts);tcp=a.mode in ('heterogeneous','uniform'); inputs=src/('tcp' if tcp else a.mode)
@@ -95,7 +95,7 @@ def main():
             rc=[oracle,'config']
             if a.image:
                 rc=['docker','run','--rm','--network=none','--user',f'{os.getuid()}:{os.getgid()}','-v',f'{tree}:/src:ro','-v',f'{a.out}:/cases','-w',f'/cases/{d.name}','-e','LD_LIBRARY_PATH=/src/build',a.image,'/src/build/scratch/network-load-balance','config'];env={}
-            cmds={'reference':rc,'gpu':[tx,'config',f'--topo={src}/uniform.graph',f'--flows={flows}','--out=gpu.fct','IRN_BDP=156000']}
+            cmds={'reference':rc,'gpu':[tx,'config',f'--topo={src}/uniform.graph',f'--flows={flows}','--out=gpu.fct','IRN_BDP=156000',*a.gpu_option]}
         try:
             for name in (('reference','gpu') if i%2==0 else ('gpu','reference')):
                 v=run(cmds[name],d,name,env if name=='reference' else {},a.timeout,a.core if name=='reference' else None)

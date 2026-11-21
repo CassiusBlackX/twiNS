@@ -29,6 +29,17 @@ constexpr bool GENERAL = TWINS_GENERAL;
 #define TWINS_COLD inline
 #endif
 
+#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS == 31
+// Keep the wide frames in their owning rings and inline the two queue
+// boundaries. This avoids the gfx1200 fault on the optimized path with
+// private wide frame copies without inlining the entire TCP model.
+#define TWINS_WIDE_HIP_FIFO 1
+#define TWINS_SWITCH_FIFO_INLINE __forceinline__
+#else
+#define TWINS_WIDE_HIP_FIFO 0
+#define TWINS_SWITCH_FIFO_INLINE inline
+#endif
+
 __device__ inline void frame_copy(Frame *d, const Frame *s)
 {
     const uint4 *a = reinterpret_cast<const uint4 *>(s);
@@ -104,12 +115,30 @@ struct Fifo
             int64_t duration = (int64_t)f.len * PS_PER_BYTE;
 #endif
             int64_t end = start + duration;
+#if TWINS_WIDE_HIP_FIFO
+            // The arrival is in a later slot, and this link owns its bucket
+            // until publication. Extend the outgoing frame in that bucket.
+            int64_t lead = duration + s->delay_ps[id];
+            int64_t arrival_slot = (start + lead) / s->slot_ps;
+            int n = msg_count(*s, arrival_slot, id);
+            if (n >= s->max_tx)
+            {
+                atomicAdd(&s->ev[19], 1ull);
+                return;
+            }
+            Frame &o = s->msg[size_t(mi(*s, arrival_slot, id)) * s->max_tx + n];
+            o = f;
+#else
             Frame o = f;
+#endif
             // the event that starts this transmission: the frame's own enqueue on an idle link
             // (o.chain is already the enqueue event's chain), else the TransmitComplete of the
             // previous frame, scheduled when that one started
             if (f.ts <= link_free && link_free > last_start) // (a link that never sent is idle)
             {
+#if TWINS_WIDE_HIP_FIFO
+                chain_push(o.chain, chain_lead(link_free - last_start), last_chain);
+#else
                 ChainWord prev[CHAIN];
                 for (int i = 0; i < CHAIN; i++)
                     prev[i] = last_chain[i];
@@ -117,6 +146,7 @@ struct Fifo
                 chain_push(o.chain, chain_lead(link_free - last_start), prev);
 #else
                 chain_push(o.chain, chain_tc((int)((link_free - last_start) / PS_PER_BYTE)), prev);
+#endif
 #endif
             }
             else
@@ -127,6 +157,10 @@ struct Fifo
                 last_chain[i] = o.chain[i];
             last_start = start;
 #ifdef TWINS_LINK_TIMING
+#if TWINS_WIDE_HIP_FIFO
+            o.arrival_lead = lead;
+            o.ts = start + lead;
+#else
             o.arrival_lead = duration + s->delay_ps[id];
             o.ts = start + o.arrival_lead;
             int64_t arrival_slot = o.ts / s->slot_ps;
@@ -137,6 +171,7 @@ struct Fifo
                 return;
             }
             frame_copy(s->msg + size_t(mi(*s, arrival_slot, id)) * s->max_tx + n, &o);
+#endif
             msg_set(*s, arrival_slot, id, n + 1);
             atomicMax(s->last_arrival_slot, (unsigned long long)arrival_slot);
 #else
@@ -168,7 +203,11 @@ struct Fifo
     // when a packet leaves it, i.e. after every event already pending at that instant: an
     // arrival at the instant a transmission starts sees the device queue empty, and an
     // arrival at the instant one ends runs before TransmitComplete and sees it full.
+#if TWINS_WIDE_HIP_FIFO
+    __device__ TWINS_SWITCH_FIFO_INLINE bool enqueue(const Frame &f, int64_t now, bool from_link = false)
+#else
     __device__ bool enqueue(const Frame &f, int64_t now)
+#endif
     {
         advance(now);
         // A ScheduleNow'd event (woke == now) runs after the Wakes of starts at idle links in
@@ -176,13 +215,16 @@ struct Fifo
         // (TransmitComplete runs after the arrivals that scheduled such events).
         bool refilled = last_start < now || (woke == now && idle_start == now);
         int nq = (size > 0 && link_free > now && refilled) ? size - 1 : size;
+#if !TWINS_WIDE_HIP_FIFO
         Frame g = f;
         g.ts = now;
+#endif
+        uint8_t flags = f.flags;
         if ((MUT(7) ? nq > red_k : nq >= red_k) && nq > 1)
         {
-            if (g.flags & F_ECT)
+            if (flags & F_ECT)
             {
-                g.flags |= F_CE;
+                flags |= F_CE;
                 atomicAdd(&s->ev[1], 1ull);
             }
             else
@@ -205,12 +247,12 @@ struct Fifo
                 r.ts = now;
                 r.node = id < s->H ? id : s->H + (id - s->H) / s->k;
                 r.dev = id < s->H ? 1 : (id - s->H) % s->k + 1;
-                r.src = g.to_sender ? s->fl.dst[g.flow] : s->fl.src[g.flow];
-                r.dst = g.to_sender ? s->fl.src[g.flow] : s->fl.dst[g.flow];
-                r.sa = g.sa;
-                r.len = g.len;
+                r.src = f.to_sender ? s->fl.dst[f.flow] : s->fl.src[f.flow];
+                r.dst = f.to_sender ? s->fl.src[f.flow] : s->fl.dst[f.flow];
+                r.sa = f.sa;
+                r.len = f.len;
                 r.qlen = (uint16_t)(nq + 1);
-                r.flags = g.flags;
+                r.flags = flags;
             }
         }
         if (size >= s->ring)
@@ -218,7 +260,19 @@ struct Fifo
             atomicAdd(&s->ev[19], 1ull); // cannot happen when ring > qcap + 1
             return false;
         }
+#if TWINS_WIDE_HIP_FIFO
+        // Arrival and queue rings are disjoint. Keep the queued history in
+        // the queue entry, then publish the entry by increasing size.
+        Frame &g = ring[(head + size) % s->ring];
+        g = f;
+        g.ts = now;
+        g.flags = flags;
+        if (from_link)
+            chain_push(g.chain, arrival_code(f), f.chain);
+#else
+        g.flags = flags;
         frame_copy(&ring[(head + size) % s->ring], &g);
+#endif
         size++;
 #ifdef NS_TRACE
         {
@@ -2774,7 +2828,7 @@ __device__ TWINS_COLD void spray_draws(const Sim &s, const SwScratch &sc, int sw
 }
 
 // One slot of switch sw, port q (all ports of the switch call it together).
-__device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool active, SwScratch sc)
+__device__ TWINS_SWITCH_FIFO_INLINE int switch_step(const Sim &s, int sw, int q, int64_t t, bool active, SwScratch sc)
 {
     const int k = s.k;
     const int64_t S0 = t * slot_width(s), E0 = S0 + slot_width(s);
@@ -2900,12 +2954,17 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
     eg.s = &s;
     for (int i = 0; i < n; i++)
     {
+#if TWINS_WIDE_HIP_FIFO
+        const Frame &p = frame_at(ref[i]);
+        eg.enqueue(p, p.ts, true);
+#else
         Frame p = frame_at(ref[i]);
         ChainWord up[CHAIN];
         for (int i = 0; i < CHAIN; i++)
             up[i] = p.chain[i];
         chain_push(p.chain, arrival_code(p), up); // queued: the arrival event's chain
         eg.enqueue(p, p.ts);
+#endif
     }
     eg.advance(E0 - 1);
 #ifndef TWINS_LINK_TIMING
@@ -2921,3 +2980,5 @@ __device__ inline int switch_step(const Sim &s, int sw, int q, int64_t t, bool a
 } // namespace TWINS_NS
 
 #undef TWINS_COLD
+#undef TWINS_SWITCH_FIFO_INLINE
+#undef TWINS_WIDE_HIP_FIFO
