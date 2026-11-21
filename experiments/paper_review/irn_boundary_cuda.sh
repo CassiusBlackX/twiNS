@@ -29,7 +29,7 @@ for kmin in 1 2; do
   )
  done
 done
-find . -type f -name 'cuda-*' -print0 | sort -z | xargs -0 sha256sum > cuda-files.sha256
+find . -type f -name 'cuda-*' ! -name cuda-files.sha256 -print0 | sort -z | xargs -0 sha256sum > cuda-files.sha256
 REMOTE
 rsync -a --include='*/' --include=cuda-\* --exclude='*' -e "$rsh" "s50:$host/" "$evidence/"
 (cd "$evidence" && sha256sum --quiet -c cuda-files.sha256)
