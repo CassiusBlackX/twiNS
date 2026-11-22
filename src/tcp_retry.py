@@ -8,6 +8,28 @@ import time
 from pathlib import Path
 
 
+def initial_history_level(args):
+    options = dict(arg[2:].split("=", 1) for arg in args if arg.startswith("--") and "=" in arg)
+    if options.get("topo") != "graph" or options.get("tcp", "dctcp") != "dctcp":
+        return 0
+    if "worlds" in options or "topofile" not in options:
+        return 0
+    hosts = 0
+    general_timing = False
+    try:
+        for line in Path(options["topofile"]).read_text().splitlines():
+            fields = line.split("#", 1)[0].split()
+            if fields and fields[0] == "hosts":
+                hosts = int(fields[1])
+            elif fields and fields[0] == "link" and len(fields) > 3:
+                general_timing |= tuple(map(int, fields[3:])) != (100000000000, 1000000)
+    except (OSError, ValueError, IndexError):
+        return 0
+    if not 128 <= hosts <= 1024:
+        return 0
+    return 3 if general_timing else 2
+
+
 def run(binary, args):
     start = time.monotonic()
     sim = 0.0
@@ -28,10 +50,13 @@ def run(binary, args):
             raise ValueError("--start-history accepts 64, 128, 256 or 512")
         level = profiles.index(value)
         args = [v for v in args if v != initial]
+    elif lines is None:
+        level = initial_history_level(args)
     initial_level = level
+    auto_oom_retried = False
     with tempfile.TemporaryDirectory() as tmp:
         def attempt(ids, level, expanded):
-            nonlocal sim, total_flows
+            nonlocal sim, total_flows, auto_oom_retried
             cmd = [str(binary if level == 0 else binary.with_name(f"twins{sizes[level]}")),
                    "--single-pass", *args]
             if expanded:
@@ -44,6 +69,9 @@ def run(binary, args):
             result = subprocess.run(cmd, capture_output=True, text=True)
             log = result.stdout
             if result.returncode:
+                if initial is None and not auto_oom_retried and level == initial_level and level > 0 and "out of memory" in result.stderr.lower():
+                    auto_oom_retried = True
+                    return attempt(ids, 0, expanded)
                 if len(ids) > 1 and "out of memory" in result.stderr.lower():
                     middle = len(ids) // 2
                     return attempt(ids[:middle], level, expanded) and attempt(ids[middle:], level, expanded)

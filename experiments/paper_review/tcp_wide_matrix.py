@@ -11,10 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'paper_scale'))
 from scale import run, sha, verify
 
 
-def memory_samples(stop, samples):
+def memory_samples(stop, samples, backend):
     local_vram = next(iter(sorted(Path('/sys/class/drm').glob('card*/device/mem_info_vram_used'))), None)
     while not stop.is_set():
-        if local_vram is not None:
+        if backend == 'hip' or backend is None and local_vram is not None:
             samples.append(int(local_vram.read_text()))
         else:
             used = subprocess.check_output(
@@ -22,7 +22,7 @@ def memory_samples(stop, samples):
                 text=True, timeout=3,
             )
             samples.append(int(used.splitlines()[0]) * 2**20)
-        stop.wait(0.2)
+        stop.wait(0.02)
 
 
 def main():
@@ -30,9 +30,15 @@ def main():
     for name in ('inputs', 'reference', 'holdout_reference', 'build', 'output'):
         parser.add_argument(name, type=lambda value: Path(value).resolve())
     parser.add_argument('--process-timing', action='store_true')
+    parser.add_argument('--all-scales', action='store_true',
+                        help='time builds at every frozen scale as well as the largest case')
+    parser.add_argument('--memory-backend', choices=('cuda', 'hip'),
+                        help='select the measured GPU when an integrated GPU is also present')
     parser.add_argument('--core', type=int)
     parser.add_argument('--cpu-reference-bin', type=lambda value: Path(value).resolve())
     args = parser.parse_args()
+    if args.all_scales and not args.process_timing:
+        parser.error('--all-scales requires --process-timing')
     args.output.mkdir(parents=True, exist_ok=False)
     sources = (
         (101, 'tcp', args.reference),
@@ -47,7 +53,7 @@ def main():
     cases = []
     cpu_cases = []
     for seed, traffic_name, reference_root in sources:
-        for hosts in ([1024] if args.process_timing else settings):
+        for hosts in ([1024] if args.process_timing and not args.all_scales else settings):
             inputs = args.inputs / str(hosts)
             flow_path = inputs / traffic_name / 'flows.csv'
             for fabric in ('uniform', 'heterogeneous'):
@@ -92,7 +98,7 @@ def main():
                         stop = threading.Event()
                         usage = []
                         # The warm-up collects peak VRAM apart from formal timing trials.
-                        monitor = threading.Thread(target=memory_samples, args=(stop, usage)) if args.process_timing and not repeat else None
+                        monitor = threading.Thread(target=memory_samples, args=(stop, usage, args.memory_backend)) if args.process_timing and not repeat else None
                         if monitor:
                             monitor.start()
                         try:
