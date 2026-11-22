@@ -10,12 +10,33 @@ ROOT=Path(__file__).resolve().parents[2]
 EVIDENCE=ROOT/'out/followup-20261123'
 REPORT=ROOT.parent/'materials/experiment_followup_20261123.md'
 
+def collect_dags(epoch):
+    target=epoch/'measurements'
+    index=target/'dag-files.sha256'
+    if not (epoch/'remote.rc').exists() or index.exists():
+        return
+    remote=f'/home/cassius/Videos/twins-paper-followup-20261123/gpu_suite/{epoch.name}/results/measurements'
+    subprocess.run(['rsync','-a','--prune-empty-dirs','--include=*/','--include=*.dag','--exclude=*',
+                    '-e','ssh -F /home/cassius/.ssh/config -o BatchMode=yes -o ConnectTimeout=8',
+                    f's50:{remote}/',str(target)+'/'],check=True)
+    command=f"cd '{remote}' && find . -type f -name '*.dag' -print0 | sort -z | xargs -0 -r sha256sum"
+    temporary=index.with_suffix('.tmp')
+    with temporary.open('wb') as out:
+        subprocess.run(['ssh','-F','/home/cassius/.ssh/config','-o','BatchMode=yes',
+                        '-o','ConnectTimeout=8','s50',command],stdout=out,check=True)
+    if temporary.stat().st_size:
+        subprocess.run(['sha256sum','--quiet','-c',temporary.name],cwd=target,check=True)
+    temporary.replace(index)
+
 def update():
     subprocess.run([sys.executable,str(Path(__file__).with_name('summarize.py')),str(EVIDENCE)],
                    stdout=subprocess.DEVNULL,check=True)
     data=json.loads((EVIDENCE/'returned-summary.json').read_text())
+    for epoch in (EVIDENCE/'gpu_suite').glob('20*'):
+        if (epoch/'measurements').exists():
+            collect_dags(epoch)
     jobs=[]
-    for role in ('k32_cpu','gpu_suite'):
+    for role in ('k32_cpu','gpu_suite','graph_entry'):
         dirs=sorted((EVIDENCE/role).glob('20*'))
         if not dirs:
             jobs.append((role,'等待部署',None))
@@ -47,6 +68,18 @@ def update():
         med='待取得' if row['median_s'] is None else f'{row["median_s"]:.6f}'
         bounds='待取得' if row['range_s'] is None else f'{row["range_s"][0]:.6f}–{row["range_s"][1]:.6f}'
         lines.append(f'| {key} | {row["trials"]} | {row["accepted"]} | {med} | {bounds} |')
+    horizon=data.get('callback_horizon',{})
+    if all(horizon.get(arm,{}).get('summary',{}).get('accepted')==3 for arm in ('safe','one-slot')):
+        safe=horizon['safe']
+        short=horizon['one-slot']
+        lines+=['','## 协调器同步视界结果','',
+            f'正常视界的墙钟中位数为 {safe["summary"]["median_s"]:.6f} s，'
+            f'单槽视界为 {short["summary"]["median_s"]:.6f} s，'
+            f'相对比值为 {short["summary"]["median_s"]/safe["summary"]["median_s"]:.3f}。'
+            f'正常跨度为 {safe["horizon_slots"][0][0]} 个基础槽，单槽跨度为 1，'
+            f'往返轮数分别为 {safe["round_trips"]} 和 {short["round_trips"]}，'
+            f'回调次数分别为 {safe["callbacks"]} 和 {short["callbacks"]}。'
+            '六次消息和规范化动作均匹配相同的顺序参照。']
     lines+=['','## 验收器与来源核对','',
         '八份已有的扩容日志使用末遍计数重新核对后，两后端网络通过数均为 972/985，'
         '原清单的 968/985 保留。新增真实固定 fcap=256 末遍 TX 溢出对照仍被拒绝。'

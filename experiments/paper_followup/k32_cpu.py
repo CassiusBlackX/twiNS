@@ -1,5 +1,4 @@
 """Repeat the five frozen 8192-host RDMA references with bounded shared admission."""
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -22,15 +21,16 @@ def save(path,value):
     tmp.write_text(json.dumps(value,indent=2)+'\n')
     tmp.replace(path)
 
-def measure(output,index):
+def measure(output):
     core=4
     rows=[]
     for repeat in range(3):
-        for pos,(traffic,cc) in enumerate(CASES):
+        for traffic,cc in CASES:
             name=f'k32_{traffic}_cc{cc}'
+            container=f'twins-k32-{output.parent.name}-{name}-r{repeat}'
             work=output/f'{name}/trial-{repeat}'
             work.mkdir(parents=True)
-            command=['docker','run','--rm','--network=none','--ulimit','core=0',
+            command=['docker','run','--rm','--name',container,'--network=none','--ulimit','core=0',
                 '--label','twins.evidence.campaign=paper-followup-20261123',
                 '--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(core),
                 '--memory=70g','--memory-swap=70g','-v',f'{MODEL}:/hpcc:ro',
@@ -50,6 +50,8 @@ def measure(output,index):
                 try:
                     rc=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,timeout=3600).returncode
                 except subprocess.TimeoutExpired:
+                    subprocess.run(['docker','stop','-t','5',container],
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                     rc=124
             record.update(rc=rc,wall_ns=time.perf_counter_ns()-start,end_utc_ns=time.time_ns())
             # Comparison is outside the process wall interval, preserving all FCT fields and duplicates.
@@ -73,9 +75,7 @@ def measure(output,index):
 def main():
     output=Path(sys.argv[1]).resolve()
     output.mkdir(parents=True,exist_ok=False)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        futures=[executor.submit(measure,output,0)]
-        rows=[row for future in futures for row in future.result()]
+    rows=measure(output)
     save(output/'summary.json',dict(rows=rows,accepted=sum(r['accepted'] for r in rows)))
     if not all(r['accepted'] for r in rows):
         raise SystemExit(1)

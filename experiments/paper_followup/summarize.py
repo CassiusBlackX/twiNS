@@ -45,7 +45,21 @@ def main():
                                     speedup=cpu['median_s']/gpu['median_s'])
     result=dict(tables=tables,rdma_speedups=speedups,
                 timing_scope='Process launch to exit, excluding output parsing, validation, and sorting. Resource epochs retained in per-run receipts.')
+    horizon={}
+    for arm in ('safe','one-slot'):
+        rows=[row for row in groups['callback-horizon/'+arm] if row.get('accepted')]
+        if rows:
+            horizon[arm]=dict(summary=summarize(rows),
+                horizon_slots=[row['horizon_slots'] for row in rows],
+                round_trips=[int(row['coordination']['round_trips']) for row in rows],
+                callbacks=[int(row['coordination']['callbacks']) for row in rows])
+    result['callback_horizon']=horizon
     out=root/'returned-summary.json'
+    for matrix in (root/'graph_entry').glob('20*/measurements/matrix/summary.json'):
+        data=json.loads(matrix.read_text())
+        for case in data['cases']:
+            key='/'.join(['graph-entry',str(case['seed']),str(case['hosts']),case['fabric'],case['policy']])
+            tables[key]=summarize(case['trials'][1:])
     tmp=out.with_suffix('.tmp')
     tmp.write_text(json.dumps(result,indent=2)+'\n')
     tmp.replace(out)
