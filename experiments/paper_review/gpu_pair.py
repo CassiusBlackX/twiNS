@@ -114,7 +114,7 @@ def run(args):
                 dest.mkdir(parents=True)
                 command={
                     'twins':[str(args.twins),f'--k={k}','--tcp=newreno','--queue=200','--ecnK=200',
-                             '--max-slots=10000',f'--flows={case}/twins.csv','--out=fct.csv'],
+                             '--max_slots=10000',f'--flows={case}/twins.csv','--out=fct.csv'],
                     'gedes':[str(args.gedes),f'--ft_k={k}',f'--flow_file={case}/gedes.csv',
                              '--max_slots=10000','--output=fct.csv'],
                     'days':[str(args.days),str(case/'days.toml'),'--engine','cuda'],

@@ -36,7 +36,8 @@ def write_once(path,before,after):
 
 
 def clone(source,dest):
-    ignore=shutil.ignore_patterns('.git','cmake-*','build','build-*','trial-build','docs','aicb','vidur-alibabacloud')
+    ignore=shutil.ignore_patterns('.git','cmake-cache','cmake-mtp','build','build-mtp',
+                                  'trial-cmake','trial-build','docs','aicb','vidur-alibabacloud')
     shutil.copytree(source,dest,ignore=ignore,symlinks=True)
 
 
