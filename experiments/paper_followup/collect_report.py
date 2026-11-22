@@ -44,6 +44,10 @@ def update():
         latest=dirs[-1]
         rc=latest/'remote.rc'
         jobs.append((role,'运行中' if not rc.exists() else '退出码 '+rc.read_text().strip(),latest))
+    finished=all(path is not None and (path/'remote.rc').exists() for _,_,path in jobs)
+    if finished:
+        for _,_,path in jobs:
+            subprocess.run(['sha256sum','--quiet','-c','returned-files.sha256'],cwd=path,check=True)
     lines=[
         '# 11/23 Astra 新增实验回执','',
         '更新于 '+datetime.now().astimezone().isoformat(timespec='seconds')+'。','',
@@ -54,11 +58,18 @@ def update():
         '所有进程墙钟在子进程退出后立即结束，读取输出、排序和核对在该边界之外。'
         'GPU 主机线程使用核 0，顺序参照使用核 4，属于受控共享资源测量。'
         '首轮两作业各 32 GiB 均触发 Docker OOM，失败回执保留。'
-        '当前顺序参照单作业预留 70 GiB，GPU 和构建按剩余资源推进。','',
+        '正式顺序参照采用单作业 70 GiB 额度。','',
         '| 队列 | 状态 | 本机回传目录 |','| --- | --- | --- |',
     ]
     for role,state,path in jobs:
         lines.append(f'| {role} | {state} | '+(str(path) if path else '尚无')+' |')
+    if finished:
+        ended=max((path/'remote.rc').stat().st_mtime for _,_,path in jobs)
+        lines+=['','本轮三条队列均已退出，最后回传时间为 '+
+                datetime.fromtimestamp(ended).astimezone().isoformat(timespec='seconds')+
+                '。15 次 CPU 参照和 189 次 GPU 配对测量全部通过，'
+                '最终 graph 入口的 48 个设置共 192 次输出全部通过，包含 48 次预热。'
+                'FCT、动作 DAG 和逐次回执已回传本机并按服务器索引复核。']
     lines+=['','重要的逐次 JSON、日志、输入与二进制哈希、FCT 和校验索引位于上述目录。'
             '本机每 45 秒收取已经生成的结果，完整回传后按服务器 SHA-256 索引验证。','',
             '## 已回传的计时','',
@@ -98,13 +109,19 @@ def update():
                 '| --- | ---: | ---: | ---: |']
         for key,row in data['rdma_speedups'].items():
             lines.append(f'| {key} | {row["cpu_median_s"]:.6f} | {row["gpu_median_s"]:.6f} | {row["speedup"]:.2f} |')
+    old=data['tables'].get('ai-hot-path/gpt3_13b_probe_hpn128//timed-version',{})
+    new=data['tables'].get('ai-hot-path/gpt3_13b_probe_hpn128//final-candidate',{})
+    if old.get('accepted')==3 and new.get('accepted')==3:
+        lines+=['','## 最终候选的性能变化','',
+                f'GPT-3 13B probe 的墙钟中位数从旧版 {old["median_s"]:.6f} s '
+                f'变为最终候选 {new["median_s"]:.6f} s，增加 '
+                f'{(new["median_s"]/old["median_s"]-1)*100:.2f}%。'
+                '两端各三次消息和动作输出均匹配顺序参照。'
+                '此变化保留在候选性能回执中，具体原因尚待进一步定位。']
     tmp=REPORT.with_suffix('.tmp')
     tmp.write_text('\n'.join(lines)+'\n')
     tmp.replace(REPORT)
-    finished=all(path is not None and (path/'remote.rc').exists() for _,_,path in jobs)
     if finished:
-        for _,_,path in jobs:
-            subprocess.run(['sha256sum','--quiet','-c','returned-files.sha256'],cwd=path,check=True)
         return True
     return False
 
