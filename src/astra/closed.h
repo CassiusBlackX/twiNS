@@ -767,7 +767,9 @@ struct Closed : astra::Network
                 orecs.push_back(r);
             fclose(f);
         }
-        span = span_slots;
+        // Diagnostic arm clamps only CPU callback progress, preserving send latency.
+        span = getenv("TWINS_CL_ONE_SLOT") ? 1 : span_slots;
+        printf("closed loop horizon: %d base slots (safe maximum %d)\n", span, span_slots);
         s.cl_span = span;
         s.cev_mask = (1ull << CEV_LOG) - 1;
         cev_mask = s.cev_mask;

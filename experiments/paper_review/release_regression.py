@@ -60,11 +60,8 @@ def invoke(command,work,cwd):
 
 
 def version_flags(log):
-    # Keep warnings from earlier rollback passes in the log. A last pass only
-    # is eligible for comparison on the as-executed final output.
-    last=re.split(r'^.*running again with[^\n]*\n',log,flags=re.M)[-1]
-    return bool(re.search(r'were undecided|warning:.*(?:ties the chains|not exact)|error:|'
-                          r'undecided.ties [1-9]|overflows:.*(?:tx|queue|ackq|qps|due) [1-9]',last))
+    from release_status import status
+    return status(log)['flagged']
 
 
 def network(args):
