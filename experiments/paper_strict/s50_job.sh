@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Keep a running job independent of edits to this launcher during a long run.
+if [[ ${TWINS_STRICT_LAUNCHER_SNAPSHOT:-0} != 1 ]]; then
+    snapshot_path=$(realpath -- "$0")
+    launcher=$(< "$snapshot_path")
+    exec env TWINS_STRICT_LAUNCHER_SNAPSHOT=1 /bin/bash -c "$launcher" "$snapshot_path" "$@"
+fi
 cd "$(dirname "$0")/../.."
 root=$(pwd -P)
 role=$1
@@ -15,7 +21,7 @@ case "$role" in
     crosspod_inputs|crosspod_paced)
         scp -F /home/cassius/.ssh/config -o BatchMode=yes experiments/paper_review/days_pair_routes.rs "s50:$remote/"
         ;;
-    pfc_reference)
+    pfc_reference|pfc_sustained|pfc_dense)
         scp -F /home/cassius/.ssh/config -o BatchMode=yes ../twiNS/workloads/trace2dag.py "s50:$remote/"
         ;;
 esac

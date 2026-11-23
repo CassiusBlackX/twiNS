@@ -39,15 +39,19 @@ def report():
             continue
         rc=p/'remote.rc'
         digest=p/'returned-files.sha256'
+        recovered=read(p/'recovered-status.json')
         state='等待或运行中'
-        if rc.is_file() and digest.is_file() and digest.stat().st_size:
+        if (rc.is_file() or recovered) and digest.is_file() and digest.stat().st_size:
             key=(str(p),digest.stat().st_mtime_ns)
             if key not in verified:
                 checked=subprocess.run(['sha256sum','--quiet','-c',digest.name],cwd=p,
                                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 if not checked.returncode:
                     verified.add(key)
-            state=f'退出码 {rc.read_text().strip()}，已校验' if key in verified else '回传校验中'
+            if key in verified:
+                state='计算已完成，补收已校验' if recovered else f'退出码 {rc.read_text().strip()}，已校验'
+            else:
+                state='回传校验中'
         rows.append(state)
         lines.append(f'| {role} | {state} | {p} |')
     lines+=['','本机 RX 诊断与同根比较固定输入在 rx-counters/ 和 lineage-control/。'
@@ -135,8 +139,8 @@ def report():
             if count:
                 lines.append(f'| {row["case"]} | {row["arm"]} | {count} | {paused} | {100*paused/count:.3f}% |')
         lines+=['','AllGather、GPT‑3 探针与 64 MiB DCN+ 的消息与已冻结参照一致。'
-            '32 MiB 池的 DCN+ 三档已产生暂停，但统计到的活跃槽暂停占比最高约 3%。'
-            '更强压力在 RX 继续试跑，待确定稳定输入再复核三档覆盖与参考输出。'
+            '32 MiB 池的 DCN+ 三档已产生暂停，统计到的活跃槽暂停占比最高约 3%。'
+            '更强压力的结果另见本页最终回执。'
             '逐交换机计数及同根、异根、指纹命中和回溯直方图见 rx-pfc-history.json。','']
     if (p:=latest('cpu_provenance')) and read(p/'binaries.json'):
         lines+=['','## CPU 实测构建与计时器','',
@@ -151,6 +155,21 @@ def report():
             if row and row['simulator_wall_ns'] is not None:
                 overhead=(row['outer_wall_ns']-row['simulator_wall_ns'])/1e9
                 lines.append(f'- {row["case"]} {row["mode"]} 第 {row["trial"]+1} 轮外部与内部计时差 {overhead:.6f} 秒。')
+    if (final:=read(BASE/'final-recovered-summary.json')):
+        ai=final['ai_candidate']
+        lines+=['','## 本轮最终回执','',
+                '已排程的 s50 与本机实验均已退出。五个 s50 作业在计算写出汇总后，'
+                '本机回传因运行中的启动脚本被改写而中断。最终文件已从原目录补收，'
+                '逐文件 SHA-256 已验证。原作业退出码缺失，各目录的 recovered-status.json 记录补收依据。','',
+                f'最终候选 AI 的 {ai["latency_trials"]} 次延迟和 {ai["batches"]} 个八任务批次均通过。'
+                f'八任务批次 P0/P16 墙钟中位数分别为 {ai["batch_median_s"]["p0"]:.2f} 和 '
+                f'{ai["batch_median_s"]["p16"]:.2f} 秒。'
+                'Fig. 5 补齐 336 个 DCTCP/NewReno CPU 样本，分区模式的六字段差异继续保留。'
+                'HPCC 容器冷/热启动计时 12 次均复现冻结输出。','',
+                '三档 DCN+ 输入的 24 次 safe/serial CUDA 输出均匹配独立 SimAI 的 1,920 条消息和 '
+                '6,080 条规范化动作。RX 强压力试跑的 16/8 MiB 池两点超时，'
+                '4 MiB 点复现滞留。持续暂停且完整完成的对照仍缺数据。'
+                '验收计数和比对依据见本机 final-recovered-summary.json。','']
     tmp=REPORT.with_suffix('.tmp')
     tmp.write_text('\n'.join(lines)+'\n')
     tmp.replace(REPORT)

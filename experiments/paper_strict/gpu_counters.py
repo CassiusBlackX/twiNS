@@ -9,6 +9,22 @@ import subprocess
 import sys
 import time
 
+SWITCH_LAYOUT = """#pragma once
+#include <cstddef>
+
+template <std::size_t max_ports>
+struct StrictSwitchLayout {
+    static constexpr std::size_t groups = 16;
+    static constexpr std::size_t fields = 2;
+    static constexpr std::size_t stride = groups * (max_ports + 1) * fields;
+
+    static constexpr __host__ __device__ std::size_t index(
+            std::size_t sw, std::size_t group, std::size_t active_ports) {
+        return sw * stride + (group * (max_ports + 1) + active_ports) * fields;
+    }
+};
+"""
+
 def patch(path, old, new):
     source=path.read_text()
     if source.count(old)!=1:
@@ -26,7 +42,16 @@ def build(output,source,backend):
     kernel=tree/'src/rdma/rstep.cuh'
     driver=tree/'src/rdma/rmain.cu'
     header=tree/'src/rdma/rdma.h'
-    patch(header,'    unsigned long long *irn_counts;', '    unsigned long long *strict_switch_counts;\n    unsigned long long *irn_counts;')
+    layout=tree/'src/rdma/strict_switch_layout.h'
+    layout.write_text(SWITCH_LAYOUT)
+    patch(header,'    unsigned long long *irn_counts;',
+          '    unsigned long long *strict_switch_counts;\n'
+          '    unsigned long long *strict_pause_streaks;\n    unsigned long long *irn_counts;')
+    patch(kernel,'#include "ns3hash.h"','#include "ns3hash.h"\n#include "strict_switch_layout.h"')
+    token='constexpr int KMAX = 256;  // ports of a switch (a lane each in rdma_slot_big)'
+    patch(kernel,token,token+'\nusing StrictHistogram = StrictSwitchLayout<KMAX>;\n'
+        'static_assert(StrictHistogram::index(0, 0, KMAX) + 2 == StrictHistogram::index(0, 1, 0));\n'
+        'static_assert(StrictHistogram::index(0, 15, KMAX) + 2 == StrictHistogram::index(1, 0, 0));')
     patch(kernel,'namespace rdma\n{',
           'namespace rdma\n{\n__device__ unsigned long long g_strict_history[2][37];')
     patch(kernel,'    int ord = 0;\n    RunCursor A, B;',
@@ -79,7 +104,12 @@ def build(output,source,backend):
             other |= used >= threshold || (abytes[p] > s.pc[s.pbase[x]+p].hdrm_cap && used+abytes[p] > threshold);
         }
         const int group = (safe ? 1 : 0) | (paused ? 2 : 0) | (other ? 4 : 0) | (incoming_pause ? 8 : 0);
-        strict_stats = s.strict_switch_counts + ((size_t)x*16 + group)*258 + active_ports*2;
+        auto *streak = s.strict_pause_streaks + (size_t)x*3;
+        const bool active_pause = paused && active_ports;
+        streak[1] = active_pause ? (streak[0] == (unsigned long long)slot ? streak[1]+1 : 1) : 0;
+        streak[0] = (unsigned long long)slot+1;
+        if (streak[1] > streak[2]) streak[2] = streak[1];
+        strict_stats = s.strict_switch_counts + StrictHistogram::index(x, group, active_ports);
         atomicAdd(strict_stats, 1ull);
         strict_begin = clock64();
     }
@@ -89,19 +119,25 @@ def build(output,source,backend):
           '    if (strict_stats) atomicAdd(strict_stats + 1, clock64() - strict_begin);\n'
           '    return act ? 1 : 0;\n}\n\n// ------------------------------------------------------------------ the slot kernel')
     patch(driver,'    s.qp = dev_alloc<SndQP>(F);',
-          '    s.strict_switch_counts = dev_alloc<unsigned long long>((size_t)s.S * 16 * 258);\n    s.qp = dev_alloc<SndQP>(F);')
+          '    s.strict_switch_counts = dev_alloc<unsigned long long>((size_t)s.S * StrictHistogram::stride);\n'
+          '    s.strict_pause_streaks = dev_alloc<unsigned long long>((size_t)s.S * 3);\n    s.qp = dev_alloc<SndQP>(F);')
     patch(driver,'    if (s.irn_counts)\n    {',
           '''    {
-        vector<unsigned long long> counts((size_t)s.S * 16 * 258);
+        vector<unsigned long long> counts((size_t)s.S * StrictHistogram::stride);
         CK(cudaMemcpy(counts.data(), s.strict_switch_counts, counts.size()*sizeof(counts[0]), cudaMemcpyDeviceToHost));
         for (int x=0; x<s.S; ++x)
-            for (int group=0; group<16; ++group)
-                for (int ports=0; ports<=128; ++ports)
+            for (std::size_t group=0; group<StrictHistogram::groups; ++group)
+                for (int ports=0; ports<=KMAX; ++ports)
                 {
-                    auto index = ((size_t)x*16 + group)*258 + ports*2;
+                    auto index = StrictHistogram::index(x,group,ports);
                     if (counts[index])
-                        printf("pfc_switch %d %d %d %llu %llu\\n", x,group,ports,counts[index],counts[index+1]);
+                        printf("pfc_switch %d %zu %d %llu %llu\\n", x,group,ports,counts[index],counts[index+1]);
                 }
+        vector<unsigned long long> streaks((size_t)s.S*3);
+        CK(cudaMemcpy(streaks.data(), s.strict_pause_streaks, streaks.size()*sizeof(streaks[0]), cudaMemcpyDeviceToHost));
+        for (int x=0; x<s.S; ++x)
+            if (streaks[(size_t)x*3+2])
+                printf("pfc_pause_streak %d %llu base_slots\\n",x,streaks[(size_t)x*3+2]);
         unsigned long long history[2][37];
         CK(hipMemcpyFromSymbol(history,HIP_SYMBOL(g_strict_history),sizeof(history)));
         for (int root=0; root<2; ++root)
@@ -110,7 +146,7 @@ def build(output,source,backend):
     }
     if (s.irn_counts)
     {'''.replace('llu\n"',r'llu\n"'))
-    for name in ('rdma.h','rstep.cuh','rmain.cu'):
+    for name in ('rdma.h','rstep.cuh','rmain.cu','strict_switch_layout.h'):
         path=tree/'src/rdma'/name
         (output/(name+'.sha256.log')).write_text(hashlib.sha256(path.read_bytes()).hexdigest()+'\n')
     ninja=output/'compiled'
