@@ -95,13 +95,7 @@ foreach(T IN LISTS tcp_targets)
         set(CMAKE_HIP_FLAGS_RELEASE "-O3")
         target_compile_definitions(${T} PRIVATE TWINS_USE_HIP)
         if(T MATCHES "-links$" AND CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 22 AND CMAKE_HIP_COMPILER_VERSION VERSION_LESS 23)
-            if(BASE STREQUAL "twins2048-split-links")
-                # gfx1200 with Clang 22 faults in the optimized wide kernel at
-                # full scale. The unoptimized split companion passes the same trace.
-                target_compile_options(${T} PRIVATE -O0 -fno-inline-functions)
-            else()
-                target_compile_options(${T} PRIVATE -O2 -fno-inline-functions)
-            endif()
+            target_compile_options(${T} PRIVATE -O2 -fno-inline-functions)
         endif()
         target_compile_options(${T} PRIVATE -ffp-contract=off -Wno-unused-value)
         # promote-alloca moves private arrays into LDS, which caps occupancy

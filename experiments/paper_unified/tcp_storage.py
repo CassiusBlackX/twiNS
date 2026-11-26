@@ -12,12 +12,18 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("backend", choices=["hip","cuda"])
 for name in ("binary","inputs","out"):
     p.add_argument(name,type=lambda s:Path(s).resolve())
+p.add_argument("--case", action="append", choices=("default", "forced-auto", "forced-fixed", "preset", "wide"))
+p.add_argument("--skip-batch", action="store_true")
 a=p.parse_args()
 a.out.mkdir()
 cases = {"default":[], "forced-auto":["--arrival-layout=split"],
          "forced-fixed":["--arrival-tail-cap=1"], "preset":["--arrival-tail-cap=8192"]}
 if a.backend == "cuda":
     cases["wide"] = ["--arrival-layout=wide","--start-history=2048"]
+if a.case:
+    if any(label not in cases for label in a.case):
+        p.error("selected case is unavailable for this backend")
+    cases = {label: extra for label, extra in cases.items() if label in a.case}
 summary = {}
 
 
@@ -84,7 +90,7 @@ for label, extra in cases.items():
     print(label,rc,receipt["peak_kib"],flush=True)
 (a.out/"summary.json").write_text(json.dumps({k:{x:y for x,y in r.items() if x!="samples"} for k,r in summary.items()},indent=2)+"\n")
 # Share the initial kernel launch between an options world and a double-off world.
-for label in ("off","mixed"):
+for label in (() if a.skip_batch else ("off", "mixed")):
     d=a.out/label
     d.mkdir()
     common=[str(a.binary),"--tcp=dctcp","--queue=200","--topo=graph",f"--topofile={a.inputs/'128.graph'}","--graph_k=16"]

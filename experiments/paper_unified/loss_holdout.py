@@ -8,7 +8,11 @@ for line in (a.inputs/'sealed.sha256').read_text().splitlines():
  digest,name=line.split();assert hashlib.sha256((a.inputs/name).read_bytes()).hexdigest()==digest
 if a.backend=='native':
  cfg=(a.inputs/'config').read_text()
- cfg=re.sub(r'(?m)^TOPOLOGY_FILE .*',f'TOPOLOGY_FILE {a.inputs}/native.topology',cfg)
+ # The stock author's driver sets IRN BDP by matching a topology basename.
+ # Give the exact frozen bytes their original alias so the BDP is 104000.
+ topo=a.out/'leaf_spine_128_100G_OS2.txt'
+ topo.write_bytes((a.inputs/'native.topology').read_bytes())
+ cfg=re.sub(r'(?m)^TOPOLOGY_FILE .*',f'TOPOLOGY_FILE {topo}',cfg)
  flowfile=a.inputs/'ref.flows'
  if a.native_order:
   # The author streams the next input after scheduling the preceding one;

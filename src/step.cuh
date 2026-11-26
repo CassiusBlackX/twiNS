@@ -2881,12 +2881,15 @@ __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due
 }
 
 // a timer and a frame arrival at the same instant: ns-3 runs the one scheduled first
-__device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p, int h)
+__device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, const Due &d, const Frame &p,
+                                                int h, ChainWord *arrival_chain)
 {
-    ChainWord arr[CHAIN];
-    chain_push(arr, arrival_code(p), p.chain);
+    // The host is selecting an event and no longer needs the previous
+    // event's chain. Reuse its scratch rather than reserving another full
+    // history in the device call stack. The selected event overwrites it.
+    chain_push(arrival_chain, arrival_code(p), p.chain);
     int why;
-    int r = chain_cmp(due_chain(s, d, h), arr, &why);
+    int r = chain_cmp(due_chain(s, d, h), arrival_chain, &why);
     if (r == 0)
     {
         atomicAdd(&s.ev[25], 1ull);
@@ -3056,7 +3059,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
         }
-        else if (selected == td && (selected != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h)))
+        else if (selected == td && (selected != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h, c.echain)))
         {
             Due d = due[id++];
 #ifdef TWINS_TCP_TRACE_TIMERS

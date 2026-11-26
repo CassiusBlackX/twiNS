@@ -1643,6 +1643,7 @@ int main(int argc, char **argv)
     vector<SwInfo> si(S);
     vector<FlowInfo> fi(F);
     vector<Chain> root_chain(F);
+    vector<int64_t> packet_root_start(F);
     vector<int> start_list(F), start_off(H + 1, 0), h_world(H), s_world(S);
     size_t sl_base = 0; // the next world's first entry in start_list
     vector<Params> Pw(W);
@@ -1697,6 +1698,8 @@ int main(int argc, char **argv)
             {
                 x.start_chain.root += fbase[wi]; // roots over all worlds (the order within one is kept)
                 root_chain[x.start_chain.root - 1] = x.start_chain;
+                if (!w.dag)
+                    packet_root_start[x.start_chain.root - 1] = x.start;
             }
             x.src += hbase[wi];
             x.dst += hbase[wi];
@@ -1958,30 +1961,65 @@ int main(int argc, char **argv)
                     v.push_back(c.r[i].code >> CODE_ORD_BITS);
             return v;
         };
-        vector<vector<uint32_t>> L(F);
-        vector<int> idx;
-        for (int i = 0; i < F; i++)
-            if (root_chain[i].root)
-            {
-                L[i] = leads(root_chain[i]);
-                idx.push_back(i);
-            }
-        std::sort(idx.begin(), idx.end(), [&](int a, int b) {
-            const vector<uint32_t> &x = L[a], &y = L[b];
-            for (size_t i = 0; i < x.size() && i < y.size(); i++)
-            {
-                if (x[i] != y[i])
-                    return x[i] > y[i];
-                if (lead_lossy(x[i]))
-                    g_rank_lossy++; // (two start chains with equal lossy leads: their order is a guess)
-            }
-            if (x.size() != y.size())
-                return x.size() < y.size();
-            return root_chain[a].root < root_chain[b].root;
-        });
         vector<uint32_t> rank(F, 0);
-        for (size_t i = 0; i < idx.size(); i++)
-            rank[idx[i]] = i;
+        const bool trace_roots = getenv("TWINS_RDMA_ROOT_TRACE") != nullptr;
+        for (int wi = 0; wi < W; ++wi)
+        {
+            // Roots from disjoint worlds never compete. In a packet world,
+            // each start has two zero-delay application events above
+            // ScheduleFlowInputs. Its exact lead is the difference between
+            // consecutive *distinct* start times (the first is from time 0).
+            // Compute the rank before compression discards any bits. Equal
+            // exact leads are resolved by the existing stable root order.
+            const int base = fbase[wi], count = worlds[wi].fi.size();
+            vector<int> idx;
+            idx.reserve(count);
+            if (!worlds[wi].dag)
+            {
+                vector<int64_t> exact(count);
+                int64_t previous = 0, delay = 0;
+                for (int j = 0; j < count; ++j)
+                {
+                    const int64_t at = packet_root_start[base + j];
+                    if (j == 0 || at != previous)
+                    {
+                        delay = at - previous;
+                        previous = at;
+                    }
+                    exact[j] = delay;
+                    idx.push_back(j);
+                    if (trace_roots)
+                        printf("RDMA packet root %d %d %lld %lld %u\n", wi, j + 1,
+                               (long long)at, (long long)delay, lead_code(delay));
+                }
+                std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return exact[a] > exact[b]; });
+            }
+            else
+            {
+                vector<vector<uint32_t>> encoded(count);
+                for (int j = 0; j < count; ++j)
+                    if (root_chain[base + j].root)
+                    {
+                        encoded[j] = leads(root_chain[base + j]);
+                        idx.push_back(j);
+                    }
+                std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+                    const auto &x = encoded[a], &y = encoded[b];
+                    for (size_t i = 0; i < x.size() && i < y.size(); i++)
+                    {
+                        if (x[i] != y[i])
+                            return x[i] > y[i];
+                        if (lead_lossy(x[i]))
+                            g_rank_lossy++; // DAG roots still contain encoded leads
+                    }
+                    if (x.size() != y.size())
+                        return x.size() < y.size();
+                    return a < b;
+                });
+            }
+            for (size_t i = 0; i < idx.size(); ++i)
+                rank[base + idx[i]] = base + i;
+        }
         s.root_rank = dev_copy(rank);
     }
     // DAG worlds: children, dependencies, host pairs; messages wait send_lat (SEND_LAT_NS, as
