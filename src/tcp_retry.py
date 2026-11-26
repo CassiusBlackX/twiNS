@@ -133,29 +133,29 @@ def run(binary, args):
             if any(count(f) for f in ("ooo-ovf", "rtt-ovf", "ring-ovf")):
                 sys.stderr.write(log + result.stderr)
                 return False
-            if fragment:
-                if fragment_cap > (1 << 29):
-                    sys.stderr.write(log + result.stderr)
-                    return False
-                return attempt(ids, level, expanded, fragment_cap * 2)
-            if not active and not ties:
+            if not active and not ties and not fragment:
                 sys.stdout.write(log.replace(duration[0] + "\n", ""))
                 sys.stderr.write(result.stderr)
                 return complete[1] == complete[2]
-            if (active and expanded) or (ties and level + 1 >= len(sizes) + bool(extended(ties))):
+            if ((active and expanded) or (ties and level + 1 >= len(sizes) + bool(extended(ties)))
+                    or (fragment and fragment_cap > (1 << 29))):
                 sys.stderr.write(log + result.stderr)
                 return False
             # Worlds with no retry keep their first-pass outputs. A separate
             # stalled world must still make the batch fail.
-            for world in set(ids) - active - ties:
+            for world in set(ids) - active - ties - fragment:
                 path = dict(item.split("=", 1) for item in lines[world].split(","))["out"]
                 with open(path, newline="") as stream:
                     if any(int(row["completed_ns"]) < 0 for row in csv.DictReader(stream)):
                         sys.stderr.write(f"world {world} has incomplete flows\n")
                         return False
-            for group in (active - ties, ties - active, active & ties):
-                if group and not attempt(sorted(group), level + int(bool(group & ties)),
-                                         expanded or bool(group & active), fragment_cap):
+            groups = {}
+            for world in sorted(active | ties | fragment):
+                key = (level + int(world in ties), expanded or world in active,
+                       fragment_cap * (2 if world in fragment else 1))
+                groups.setdefault(key, []).append(world)
+            for (next_level, next_expanded, next_fragments), group in groups.items():
+                if not attempt(group, next_level, next_expanded, next_fragments):
                     return False
             return True
         ok = attempt(list(range(len(lines))) if lines is not None else [0], level, False)
