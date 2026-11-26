@@ -215,6 +215,7 @@ int main(int argc, char **argv)
     int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0, spray = 0;
     int tcp_sack = 0, tcp_timestamps = 0;
     int fragment_timer_cap = 256;
+    int fragment_pair_scale = 4;
     bool drop_first_fragment_tail = false;
     auto option_value = [](const std::string &v) { return v == "0" ? 0 : v == "1" ? 1 : -1; };
     long long rng_seed = 1, rng_run = 1;
@@ -236,6 +237,11 @@ int main(int argc, char **argv)
         {
             fragment_timer_cap = std::stoi(val("--fragment-timers="));
             if (fragment_timer_cap <= 0) { fprintf(stderr, "fragment timer capacity must be positive\n"); return 1; }
+        }
+        else if (a.rfind("--fragment-pair-scale=", 0) == 0)
+        {
+            fragment_pair_scale = std::stoi(val("--fragment-pair-scale="));
+            if (fragment_pair_scale < 1 || fragment_pair_scale > 65536) return 1;
         }
         else if (a.rfind("--k=", 0) == 0)
             k = std::stoi(val("--k="));
@@ -355,7 +361,13 @@ int main(int argc, char **argv)
     bool bad_topo = is_graph ? (g_hosts < 1 || g_switches < 1)
                     : ls  ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > BLOCK || leaves * hpl > 65535)
                           : (topo != "fattree" || k < 4 || k > 32 || (k & (k - 1)));
-    if ((flow_file.empty() && worlds_file.empty()) || bad_topo || (tcp != "dctcp" && tcp != "newreno" && tcp != "cubic"))
+    const auto cc_of = [](const std::string &t) -> int {
+#define TWINS_POLICY_LOOKUP(key, id, name) if (t == name) return CC_##key;
+        TWINS_IMPORTED_POLICIES(TWINS_POLICY_LOOKUP)
+#undef TWINS_POLICY_LOOKUP
+        return t == "dctcp" ? CC_DCTCP : t == "newreno" ? CC_NEWRENO : t == "cubic" ? CC_CUBIC : -1;
+    };
+    if ((flow_file.empty() && worlds_file.empty()) || bad_topo || cc_of(tcp) < 0)
     {
         fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N | --topo=graph --topofile=F)\n"
                         "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--fin=0|1]\n"
@@ -363,11 +375,29 @@ int main(int argc, char **argv)
                         "          [--tcp-sack=0|1] [--tcp-timestamps=0|1]\n"
                         "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,tcp-sack=..,tcp-timestamps=..,ecmp_from=..,out=..\n"
                         "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
+#define TWINS_POLICY_HELP(key, id, name) fprintf(stderr, "  imported --tcp=%s\n", name);
+        TWINS_IMPORTED_POLICIES(TWINS_POLICY_HELP)
+#undef TWINS_POLICY_HELP
         return 1;
     }
     Sim s;
     memset(&s, 0, sizeof(s));
     s.drain = drain;
+#ifdef TWINS_TCP_CLOSE_PROBE
+    if (const char *probe = getenv("TWINS_CLOSE_DROP"))
+    {
+        s.close_drop_kind = std::string(probe) == "reply" ? 2 : std::string(probe) == "data" ? 1 : 0;
+        if (!s.close_drop_kind) return 1;
+        s.close_drop_done = dalloc<unsigned int>(1);
+    }
+#endif
+#ifdef TWINS_TCP_TRACE_TIMERS
+    s.trace_timers = getenv("TWINS_TCP_TRACE_TIMERS") != nullptr;
+#if !defined(TWINS_USE_HIP)
+    if (s.trace_timers)
+        CHECK(cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 32u << 20));
+#endif
+#endif
     // ---- worlds: independent simulations run side by side as disjoint copies of the topology
     struct World
     {
@@ -377,7 +407,6 @@ int main(int argc, char **argv)
         int fin = 0;
         int sack = 0, timestamps = 0;
     };
-    auto cc_of = [](const std::string &t) -> int { return t == "dctcp" ? CC_DCTCP : t == "newreno" ? CC_NEWRENO : t == "cubic" ? CC_CUBIC : -1; };
     std::vector<World> worlds;
     if (worlds_file.empty())
         worlds.push_back({flow_file, ecmp_from, output, (uint8_t)cc_of(tcp), ecn_k, queue_pkts, fin, tcp_sack, tcp_timestamps});
@@ -404,8 +433,16 @@ int main(int argc, char **argv)
                 std::string key = kv.substr(0, e), v = e == std::string::npos ? "" : kv.substr(e + 1);
                 if (key == "flows")
                     w.flows = v;
-                else if (key == "tcp" && cc_of(v) >= 0)
-                    w.cc = (uint8_t)cc_of(v);
+                else if (key == "tcp")
+                {
+                    const int selected = cc_of(v);
+                    if (selected < 0)
+                    {
+                        fprintf(stderr, "%s: unknown TCP policy %s\n", worlds_file.c_str(), v.c_str());
+                        return 1;
+                    }
+                    w.cc = (uint8_t)selected;
+                }
                 else if (key == "ecnK")
                     w.red_k = std::stoi(v);
                 else if (key == "queue")
@@ -1006,7 +1043,10 @@ int main(int argc, char **argv)
                 uint32_t cap = 1;
                 if (expected[i])
                 {
-                    uint64_t want = exact_active ? 65536 : std::min<uint64_t>(65536, 4 * expected[i]);
+                    // Active socket/timer slots and IPv4 byte-stream inventories
+                    // are different resources. Sizing one must not inflate all
+                    // active address pairs to the full 16-bit ID space.
+                    uint64_t want = std::min<uint64_t>(65536, uint64_t(fragment_pair_scale) * expected[i]);
                     cap = 64;
                     while (cap < want)
                         cap *= 2;
@@ -1019,6 +1059,8 @@ int main(int argc, char **argv)
             s.fl.fragment_hash = dupload(fragment_hash);
             s.fl.icmp_hash = dupload(icmp_hash);
             s.fl.fragments = dalloc<FragmentEntry>(entries);
+            s.fragment_store_ovf_w = dalloc<unsigned long long>(W);
+            printf("IPv4 fragment store: %zu slots, scale=%d\n", entries, fragment_pair_scale);
         }
     }
 #endif
@@ -1283,6 +1325,31 @@ int main(int argc, char **argv)
     s.arrival_offset = dupload(offsets);
     s.arrival_banks = dupload(link_banks);
     s.arrival_cap = dupload(link_cap);
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+    std::vector<uint64_t> decode_offsets(s.L);
+    size_t decode_entries = 0;
+    for (int link = 0; link < s.L; ++link)
+    {
+        decode_offsets[link] = decode_entries;
+        decode_entries += link_cap[link];
+    }
+    s.decode_offset = dupload(decode_offsets);
+    const char *tail_setting = getenv("TWINS_TCP_ARRIVAL_TAIL_CAP");
+    const unsigned long long tail_cap = tail_setting ? std::strtoull(tail_setting, nullptr, 10) : 4096;
+    if (!tail_cap || tail_cap > UINT32_MAX || tail_cap > SIZE_MAX / banks / ARRIVAL_TAIL / sizeof(ChainWord))
+    {
+        fprintf(stderr, "invalid per-slot arrival tail capacity\n");
+        return 1;
+    }
+    s.arrival_tail_cap = (unsigned int)tail_cap;
+    s.arrival_tail_next = dalloc<unsigned int>(banks);
+    s.arrival_tail = dalloc<ChainWord>((size_t)banks * s.arrival_tail_cap * ARRIVAL_TAIL);
+    s.msg = dalloc<Frame>(decode_entries);
+    s.packed_msg = dalloc<PackedArrival>(arrival_entries);
+    printf("TCP split arrival allocation: compact_bytes=%zu decode_bytes=%zu tail_bytes=%zu tail_cap=%u\n",
+           arrival_entries * sizeof(PackedArrival), decode_entries * sizeof(Frame),
+           (size_t)banks * s.arrival_tail_cap * ARRIVAL_TAIL * sizeof(ChainWord), s.arrival_tail_cap);
+#endif
 #endif
     printf("TCP heterogeneous slot %lld ps, %d banks, %d frames/slot, %zu-byte frame, %d history runs\n",
            (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
@@ -1314,9 +1381,17 @@ int main(int argc, char **argv)
     }
 #endif
     if (!arrival_entries) arrival_entries = (size_t)banks * s.L * tx_capacity;
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+    const size_t arrival_frame_bytes = sizeof(PackedArrival);
+#else
+    const size_t arrival_frame_bytes = sizeof(Frame);
+#endif
     printf("TCP arrival ring links=%d banks=%d frames_per_link_bucket=%d frame_bytes=%zu allocation_bytes=%zu\n",
-           s.L, banks, tx_capacity, sizeof(Frame), arrival_entries * sizeof(Frame) + (size_t)banks * s.L * sizeof(long long));
+           s.L, banks, tx_capacity, arrival_frame_bytes,
+           arrival_entries * arrival_frame_bytes + (size_t)banks * s.L * sizeof(long long));
+#ifndef TWINS_TCP_SPLIT_ARRIVALS
     s.msg = dalloc<Frame>(arrival_entries);
+#endif
     s.msg_cnt = dalloc<long long>((size_t)banks * s.L);
     {
         std::vector<long long> init((size_t)banks * s.L, -(1ll << 16)); // no slot
@@ -1336,6 +1411,16 @@ int main(int argc, char **argv)
     s.finished = dalloc<int>(1);
     s.error = dalloc<int>(1);
     s.ev = dalloc<unsigned long long>(40);
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+    s.activity_audit = dalloc<unsigned long long>(8);
+#endif
+#ifdef TWINS_TCP_RESIDENCY
+    const char *arrival_file = getenv("TWINS_TCP_RESIDENCY_FILE");
+    constexpr unsigned long long sample_cap = 6000000;
+    s.arrival_samples = arrival_file ? dalloc<ArrivalSample>(sample_cap) : nullptr;
+    s.arrival_samples_n = arrival_file ? dalloc<unsigned long long>(1) : nullptr;
+    s.arrival_samples_cap = sample_cap;
+#endif
     s.active_ovf_w = dalloc<unsigned long long>(W);
     s.due_ovf_w = dalloc<unsigned long long>(W);
     s.ties_w = dalloc<unsigned long long>(W);
@@ -1397,28 +1482,80 @@ int main(int argc, char **argv)
     memory_phase("before-capture");
     CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (int i = 0; i < graph_k; i++)
+    {
         if (basic)
             kbasic::ns_slot<<<grid, BLOCK, 0, stream>>>(reinterpret_cast<kbasic::Due *>(due), sw_ts, sw_ref, sw_up);
         else
             kfull::ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
+    }
     CHECK(cudaStreamEndCapture(stream, &graph));
     memory_phase("after-capture");
     CHECK(cudaGraphInstantiate(&exec, graph, 0));
     memory_phase("after-instantiate");
     CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::high_resolution_clock::now();
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+    double first_ms_s = -1;
+#endif
     while (!*(volatile int *)h_finished)
     {
         CHECK(cudaGraphLaunch(exec, stream));
         CHECK(cudaStreamSynchronize(stream));
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+        int64_t trace_slot;
+        CHECK(cudaMemcpy(&trace_slot, s.slot, sizeof(trace_slot), cudaMemcpyDeviceToHost));
+        if (first_ms_s < 0 && trace_slot * slot_width(s) >= 46000000000ll)
+            first_ms_s = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+#endif
     }
     memory_phase("after-run");
     double sec = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+    const auto activity = ddown(s.activity_audit, 8);
+    for (int phase = 0; phase < 2; ++phase)
+    {
+        const auto *a = activity.data() + phase * 4;
+        const double first = first_ms_s < 0 ? sec : first_ms_s;
+        printf("TCP activity phase=%s slots=%llu nonempty=%llu host_slots=%llu port_slots=%llu sampled_loop_s=%.6f\n",
+               phase ? "from-46ms" : "before-46ms", a[0], a[1], a[2], a[3], phase ? sec - first : first);
+    }
+#endif
     int64_t slots;
     CHECK(cudaMemcpy(&slots, s.slot, 8, cudaMemcpyDeviceToHost));
     unsigned int fd;
     CHECK(cudaMemcpy(&fd, s.flows_done, 4, cudaMemcpyDeviceToHost));
     std::vector<unsigned long long> ev = ddown(s.ev, 40);
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+    printf("TCP arrival tails: high-water %llu per slot, overflow %llu\n", ev[23], ev[22]);
+    if (ev[22])
+    {
+        printf("Simulation Duration: %.6fs\n", sec);
+        return 3;
+    }
+#endif
+#ifdef TWINS_TCP_RESIDENCY
+    if (arrival_file)
+    {
+        const auto count = ddown(s.arrival_samples_n, 1)[0];
+        if (count > s.arrival_samples_cap)
+        {
+            fprintf(stderr, "Arrival audit overflow: %llu samples\n", count);
+            return 3;
+        }
+        const auto samples = ddown(s.arrival_samples, count);
+        FILE *output = fopen(arrival_file, "wb");
+        if (!output)
+        {
+            perror("opening arrival audit");
+            return 1;
+        }
+        const auto written = fwrite(samples.data(), sizeof(ArrivalSample), count, output);
+        if (fclose(output) || written != count)
+            return 1;
+        printf("Arrival audit: %llu samples, record_bytes=%zu frame_bytes=%zu slot_ps=%lld\n",
+               count, sizeof(ArrivalSample), sizeof(Frame), (long long)s.slot_ps);
+    }
+#endif
 #ifdef NS_PROF
     {
         int khz = 0;
@@ -1484,6 +1621,7 @@ int main(int argc, char **argv)
     {
         unsigned long long n;
         CHECK(cudaMemcpy(&n, s.qtrace_cnt, 8, cudaMemcpyDeviceToHost));
+        printf("qtrace requested %llu capacity %llu\n", n, (unsigned long long)s.qtrace_n);
         if (n > s.qtrace_n)
         {
             fprintf(stderr, "queue trace exceeded capacity: %llu records, cap %llu\n", n, s.qtrace_n);
@@ -1621,6 +1759,14 @@ int main(int argc, char **argv)
             printf("\n");
         }
 #ifdef TWINS_TCP_OPTIONS
+        if (ev[34])
+        {
+            auto counts = ddown(s.fragment_store_ovf_w, W);
+            printf("fragment-ovf by world:");
+            for (int w = 0; w < W; ++w)
+                if (counts[w]) printf(" %d", w);
+            printf("\n");
+        }
         if (ev[36])
         {
             auto counts = ddown(s.fragment_timer_ovf_w, W);

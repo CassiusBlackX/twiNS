@@ -2,12 +2,16 @@
 namespace TWINS_NS
 {
 
+
 __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t *sw_up)
 {
     const Sim &s = c_sim;
     if (*s.finished)
         return;
     int64_t t = *s.slot;
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+    auto *audit = s.activity_audit + (t * slot_width(s) >= 46000000000ll ? 4 : 0);
+#endif
     __shared__ int rows[BLOCK * 33];
     __shared__ int base[BLOCK], cnt[BLOCK];
     __shared__ int in_win[BLOCK * 3];
@@ -35,9 +39,17 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         int h = blockIdx.x * s.host_lanes + threadIdx.x;
         if (threadIdx.x < s.host_lanes && h < s.H)
         {
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+            decode_arrivals(s, t, s.host_in_link[h]);
+#endif
             int64_t w = INT64_MAX;
             if (host_step(s, h, t, due_buf + s.due_offset[h], &w))
+            {
                 blk_act = 1;
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+                atomicAdd(&audit[2], 1ull);
+#endif
+            }
             atomicMin(&blk_wake, (unsigned long long)w);
         }
     }
@@ -47,6 +59,11 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         int local = threadIdx.x / s.k, q = threadIdx.x % s.k;
         int sw = b * s.sw_per_block + local;
         bool active = local < s.sw_per_block && sw < s.S;
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+        if (active)
+            decode_arrivals(s, t, s.sw_in_link[sw * s.k + q]);
+        __syncthreads();
+#endif
         int l = active ? local : 0;
         size_t per_sw = (size_t)s.k * 2 * tx_capacity(s);
         SwScratch sc;
@@ -59,7 +76,12 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         sc.ts = sw_ts + (size_t)(active ? sw : 0) * per_sw;
         sc.ref = sw_ref + (size_t)(active ? sw : 0) * per_sw;
         if (switch_step(s, sw, q, t, active, sc))
+        {
             blk_act = 1;
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+            atomicAdd(&audit[3], 1ull);
+#endif
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0)
@@ -86,6 +108,10 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
             // exact idle skip: nothing sent in this or the previous slot (so nothing arrives in
             // the next) and no queued frames: run next at the earliest host timer or flow start
             unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+            ++audit[0];
+            if (cur) ++audit[1];
+#endif
             unsigned long long nw = atomicAdd(s.next_wake, 0ull);
             int64_t next = t + 1;
 #ifdef TWINS_LINK_TIMING
@@ -95,7 +121,14 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
 #endif
             unsigned int fd = atomicAdd(s.flows_done, 0u);
             bool drained = flight_empty && cur == 0 && prev == 0 && nw == ~0ull;
-            if ((fd >= (unsigned int)s.M && (!s.drain || drained)) || t + 1 >= s.max_slots)
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+            // Future transmissions can only publish to other banks during this slot.
+            s.arrival_tail_next[t % s.banks] = 0;
+            const bool tail_full = s.ev[22] != 0;
+#else
+            constexpr bool tail_full = false;
+#endif
+            if (tail_full || (fd >= (unsigned int)s.M && (!s.drain || drained)) || t + 1 >= s.max_slots)
             {
                 *s.finished = 1;
                 *s.finished_host = 1;

@@ -76,6 +76,36 @@ class DropFirstFragmentTail : public ErrorModel
     void DoReset() override { dropped = false; }
 };
 
+// Differential control used only by the directed close experiment.
+class DropFirstCloseFrame : public ErrorModel
+{
+  public:
+    void SetReply(bool reply) { m_reply = reply; }
+  private:
+    bool m_seen = false;
+    bool m_reply = false;
+    bool DoCorrupt(Ptr<Packet> p) override
+    {
+        if (m_seen) return false;
+        auto packet = p->Copy();
+        PppHeader ppp;
+        packet->RemoveHeader(ppp);
+        if (ppp.GetProtocol() != 0x0021) return false;
+        Ipv4Header ip;
+        packet->RemoveHeader(ip);
+        if (ip.GetProtocol() != 6 || ip.GetFragmentOffset()) return false;
+        TcpHeader tcp;
+        packet->RemoveHeader(tcp);
+        if (!(tcp.GetFlags() & TcpHeader::FIN) || bool(packet->GetSize()) == m_reply)
+            return false;
+        m_seen = true;
+        std::cout << "CLOSE_DROP " << Simulator::Now().GetPicoSeconds() << ' ' << unsigned(tcp.GetFlags())
+                  << ' ' << (packet->GetSize() != 0) << '\n';
+        return true;
+    }
+    void DoReset() override { m_seen = false; }
+};
+
 // On a point-to-point device PhyTxBegin observes each actual PPP frame,
 // including any IP fragments. The first 82 bytes cover PPP, IPv4 and a
 // maximal TCP header for the scenario's IPv4 headers without IP options.
@@ -619,6 +649,17 @@ int main(int argc, char *argv[])
             if (dropFirstTail && (*it)->GetId() < H)
                 if (auto point = DynamicCast<PointToPointNetDevice>(device))
                     point->SetReceiveErrorModel(CreateObject<DropFirstFragmentTail>());
+            if (const char *probe = getenv("TWINS_CLOSE_DROP"))
+            {
+                const bool reply = std::string(probe) == "reply";
+                if ((reply || std::string(probe) == "data") && (*it)->GetId() == unsigned(reply ? 0 : 1))
+                    if (auto point = DynamicCast<PointToPointNetDevice>(device))
+                    {
+                        auto error = CreateObject<DropFirstCloseFrame>();
+                        error->SetReply(reply);
+                        point->SetReceiveErrorModel(error);
+                    }
+            }
             if (g_wire.is_open() && DynamicCast<PointToPointNetDevice>(device))
                 device->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&TraceWire, (*it)->GetId(), d));
             Ptr<QueueDisc> q = tc ? tc->GetRootQueueDiscOnDevice(device) : nullptr;

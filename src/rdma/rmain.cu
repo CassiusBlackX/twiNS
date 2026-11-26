@@ -1,7 +1,7 @@
 // twins-rdma: runs TwiNS's RDMA model (see rdma.h) on a topology file and a flow file, with the
 // parameters of an HPCC config file, like validation/hpcc/rdma-ref.cc:
 //
-//   twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns]
+//   twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns --txtrace-cap=N]
 //              [--rate=100Gbps --delay=1000] [--q3cap=N] [--tail=log2] [--serial] [KEY=VALUE ...]
 //   twins-rdma CONFIG --batch=JOBFILE --outdir=DIR [--path=DIR:DIR...] [options] [KEY=VALUE ...]
 //
@@ -11,6 +11,11 @@
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
 // --q3-overrides=FILE: node, one-based device, and capacity per line for exceptional ports
 // --queue-capacity-report=FILE: each port/class's first overflow and its occupancy
+// --q3-stop-grace-ns=N: after storage overflow collect hotspots for N ns; -1 runs to the usual end
+// --drain: continue after the last FCT until quiescence or the simulation horizon
+// --stop-ns=N: drain with an exclusive absolute cutoff (observation --until is separate)
+// --due-cap=N: bounded timer storage; the default expands on verified scratch overflow
+// --due-report=FILE: actual per-host peak and first overflowing slot
 // --win: the most slots a block runs in one launch (default 1: one slot per launch; windows rarely
 // run in busy networks, and checking for them cost more than they saved)
 // --gwin=N: global windows: every launch runs up to N slots for all entities, as many as no frame
@@ -50,11 +55,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <sstream>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 #include <random>
@@ -247,8 +255,78 @@ struct World
     };
     vector<Pre> pre;
     vector<Chain> troot;
-    double stop_ns = 0;     // SIMULATOR_STOP_TIME
+    int64_t stop_ns = 0;    // SIMULATOR_STOP_TIME, exclusive
 };
+
+// Retry executes this same binary to discard all mutable simulation and GPU state.
+// The sealed descriptor carries only the prepared packet-level input across exec.
+struct WorldSnapshot
+{
+    FILE *file;
+    bool load;
+    size_t left;
+
+    template <class T> bool data(T *p, size_t n)
+    {
+        static_assert(std::is_trivially_copyable<T>::value);
+        if (!load)
+            return !n || fwrite(p, sizeof(T), n, file) == n;
+        if (n > left / sizeof(T))
+            return false;
+        left -= n * sizeof(T);
+        return !n || fread(p, sizeof(T), n, file) == n;
+    }
+
+    template <class T> bool items(vector<T> &v)
+    {
+        size_t n = v.size();
+        if (!data(&n, 1))
+            return false;
+        if (load)
+        {
+            if (n > left / sizeof(T) || n > v.max_size())
+                return false;
+            v.resize(n);
+        }
+        return data(v.data(), n);
+    }
+
+    bool transfer(World &w)
+    {
+        const uint64_t signature = 0x5457494e53574432ull;
+        const pid_t pid = getpid();
+        uint64_t magic = signature;
+        pid_t owner = pid;
+        return data(&magic, 1) && magic == signature && data(&owner, 1) && owner == pid &&
+               data(&w.P, 1) && data(&w.H, 1) && data(&w.S, 1) && data(&w.N, 1) &&
+               data(&w.L, 1) && data(&w.K, 1) && data(&w.stop_ns, 1) &&
+               items(w.deg) && items(w.out_link) && items(w.in_link) &&
+               items(w.link_dst) && items(w.link_dport) && items(w.rt) && items(w.rtp) &&
+               items(w.fi) && items(w.start_list) && items(w.start_off) &&
+               items(w.lbps) && items(w.ldelay) && items(w.pcfg) && items(w.nvs) &&
+               (!load || left == 0);
+    }
+};
+
+static bool transfer_world(int fd, bool load, World &w)
+{
+    constexpr int seals = F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    struct stat st = {};
+    if (load && (fcntl(fd, F_GET_SEALS) != seals || fstat(fd, &st) || st.st_size <= 0))
+        return false;
+    const int copy = dup(fd);
+    if (copy < 0)
+        return false;
+    FILE *file = fdopen(copy, load ? "rb" : "wb");
+    if (!file)
+    {
+        close(copy);
+        return false;
+    }
+    WorldSnapshot snapshot{file, load, (size_t)st.st_size};
+    const bool ok = fseek(file, 0, SEEK_SET) == 0 && snapshot.transfer(w);
+    return fclose(file) == 0 && ok && (load || fcntl(fd, F_ADD_SEALS, seals) == 0);
+}
 
 static int g_argc;
 static char **g_argv;
@@ -559,8 +637,22 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         fprintf(stderr, "%s: GLOBAL_T 0 is modelled for SimAI topologies only\n", w.name.c_str());
         return false;
     }
-    // SimAI.conf stops at 4e13 s: clamp (in double, before the conversion overflows)
-    w.stop_ns = cfg.num("SIMULATOR_STOP_TIME", P.simai ? 3.01 : 10.0) * 1e9;
+    // Read the decimal cutoff before rounding to ns. A subtraction/truncation in
+    // double can otherwise move an integer nanosecond to the preceding one.
+    long double seconds = P.simai ? 3.01L : 10.0L;
+    if (cfg.has("SIMULATOR_STOP_TIME"))
+    {
+        const auto &value = cfg.c.at("SIMULATOR_STOP_TIME")[0];
+        char *end;
+        seconds = strtold(value.c_str(), &end);
+        if (end == value.c_str() || *end || !std::isfinite(seconds) || seconds < 0)
+        {
+            fprintf(stderr, "%s: invalid SIMULATOR_STOP_TIME\n", w.name.c_str());
+            return false;
+        }
+    }
+    // SimAI.conf can use a sentinel as large as 4e13 s.
+    w.stop_ns = (int64_t)std::min(std::round(seconds * 1e9L), (long double)(INT64_MAX / 2));
     int N = w.N = H + S, L = w.L = 2 * (int)links.size();
     vector<int> &deg = w.deg;
     deg.assign(N, 0);
@@ -859,6 +951,12 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
         if (g_cl)
             g_cl->world(w, (int64_t)cfg.num("SEND_LAT_NS", 3000));
 #endif
+        if (w.troot.size() > w.fi.size())
+        {
+            fprintf(stderr, "%s: %zu setup roots exceed the %zu-flow root capacity\n",
+                    w.name.c_str(), w.troot.size(), w.fi.size());
+            return false;
+        }
 #ifdef TWINS_ISLAND
         island_world(w);
 #endif
@@ -1088,13 +1186,22 @@ int main(int argc, char **argv)
         return 1;
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
+    unsigned long long tx_limit = 0;
+    int64_t stop_ns = INT64_MAX;
+    bool drain = false, due_fixed = false;
+    int due_cap = MAX_DUE;
+    string due_report;
     string q3_overrides, queue_report;
     bool q3_auto = false;
+    int64_t queue_grace = -2;
+    bool reuse_topology = false;
+    int topology_fd = -1;
     vector<std::array<int, 3>> q3_retry;
     const auto clock_ns = [] { return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count(); };
     int64_t first_attempt = clock_ns();
     vector<int> batch_select, batch_source_ids;
+    bool batch_carried_incomplete = false;
     int64_t retry_slot = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
@@ -1126,12 +1233,35 @@ int main(int argc, char **argv)
             data_dirs = v;
         else if (k == "--txtrace")
             tx_file = v;
+        else if (k == "--txtrace-cap")
+        {
+            size_t used = 0;
+            tx_limit = std::stoull(v, &used);
+            if (used != v.size() || !tx_limit || tx_limit > UINT32_MAX)
+                return 1;
+        }
         else if (k == "--sent")
             sent_file = v;
         else if (k == "--from")
             tx_from = atoll(v.c_str());
         else if (k == "--until")
             tx_until = atoll(v.c_str());
+        else if (k == "--drain")
+            drain = true;
+        else if (k == "--stop-ns")
+        {
+            stop_ns = std::stoll(v);
+            if (stop_ns <= 0 || stop_ns >= INT64_MAX / 2) return 1;
+            drain = true;
+        }
+        else if (k == "--due-cap" || k == "--due-cap-auto")
+        {
+            due_cap = std::stoi(v);
+            if (due_cap < 1 || due_cap > (1 << 20)) return 1;
+            due_fixed = k == "--due-cap";
+        }
+        else if (k == "--due-report")
+            due_report = v;
         else if (k == "--rate")
             rate_s = v;
         else if (k == "--delay")
@@ -1142,6 +1272,18 @@ int main(int argc, char **argv)
             q3_overrides = v;
         else if (k == "--q3-auto")
             q3_auto = true;
+        else if (k == "--q3-stop-grace-ns")
+        {
+            queue_grace = std::stoll(v);
+            if (queue_grace < -1) return 1;
+        }
+        else if (k == "--reuse-topology")
+            reuse_topology = true;
+        else if (k == "--topology-fd")
+        {
+            topology_fd = std::stoi(v);
+            if (topology_fd < 3) return 1;
+        }
         else if (k == "--retry-start-ns")
             first_attempt = std::stoll(v);
         else if (k == "--q3-retry-port")
@@ -1162,6 +1304,8 @@ int main(int argc, char **argv)
         }
         else if (k == "--batch-retry-slot-ns")
             retry_slot = std::stoll(v);
+        else if (k == "--batch-carried-incomplete")
+            batch_carried_incomplete = true;
         else if (k == "--tail")
         {
             tail_log2 = atoi(v.c_str());
@@ -1291,6 +1435,15 @@ int main(int argc, char **argv)
     // ---- the worlds: one, or a job file's lines "name topo flows [KEY=VALUE ...]" (the files
     // looked up in the --path directories, colon separated, and as given)
     vector<World> worlds;
+    if ((reuse_topology && (!q3_auto || !batch_file.empty()
+#ifdef TWINS_ASTRA_HOST
+                           || !astra_wl.empty()
+#endif
+                           )) || (topology_fd >= 0 && !reuse_topology))
+    {
+        fprintf(stderr, "--reuse-topology requires --q3-auto and one packet-level world\n");
+        return 1;
+    }
     auto find_file = [&](const string &f) {
         size_t b = 0;
         while (b <= data_dirs.size() && !data_dirs.empty())
@@ -1306,6 +1459,7 @@ int main(int argc, char **argv)
         }
         return f;
     };
+    const int64_t world_start = clock_ns();
     if (batch_file.empty())
     {
         int inventory_fd = -1;
@@ -1321,18 +1475,24 @@ int main(int argc, char **argv)
         simai_link0(topo_file, &bps, &delay); // a SimAI topology gives the rate and delay
         worlds.emplace_back();
         worlds[0].name = "run";
-        const bool loaded = build_world(worlds[0], base, topo_file, flow_file, bps, delay, inventory_fd >= 0);
+        const bool loaded = topology_fd >= 0 ? transfer_world(topology_fd, true, worlds[0]) :
+            build_world(worlds[0], base, topo_file, flow_file, bps, delay, inventory_fd >= 0);
         if (inventory_fd >= 0) close(inventory_fd);
         if (!loaded)
+        {
+            if (topology_fd >= 0) fprintf(stderr, "cannot restore prepared RDMA topology\n");
             return 1;
+        }
+        if (reuse_topology && (worlds[0].dag || worlds[0].traced))
+        {
+            fprintf(stderr, "--reuse-topology requires packet flows without a DAG\n");
+            return 1;
+        }
+        if (topology_fd >= 0)
+            printf("RDMA topology restored from the previous attempt\n");
     }
     else
     {
-        if (!tx_file.empty())
-        {
-            fprintf(stderr, "--txtrace traces one world (no --batch)\n");
-            return 1;
-        }
         std::ifstream f(batch_file);
         if (!f)
         {
@@ -1380,7 +1540,11 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    const int64_t world_done = clock_ns();
     const int W = worlds.size();
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl && drain) { fprintf(stderr, "--drain/--stop-ns requires packet-level RDMA\n"); return 1; }
+#endif
     // A slot cannot span another firing of a periodic host timer.
     // Link propagation stays in w.ldelay and is independent of this bound.
     int64_t D = INT64_MAX;
@@ -1423,6 +1587,17 @@ int main(int argc, char **argv)
 #endif
     }
     delay = D;
+    vector<int64_t> deadlines;
+    deadlines.reserve(W);
+    for (const auto &w : worlds)
+        deadlines.push_back(stop_ns == INT64_MAX ? w.stop_ns : stop_ns);
+    const auto extremes = std::minmax_element(deadlines.begin(), deadlines.end());
+    const int64_t earliest = *extremes.first, latest = *extremes.second;
+    if (earliest != latest || latest % D)
+    {
+        kw = 1;
+        gwin = 0;
+    }
 
     // ---- the worlds side by side: hosts of all worlds, then switches; links and flows in turn
     int H = 0, S = 0, L = 0, F = 0, K = 1;
@@ -1445,12 +1620,11 @@ int main(int argc, char **argv)
     vector<int> start_list(F), start_off(H + 1, 0), h_world(H), s_world(S);
     size_t sl_base = 0; // the next world's first entry in start_list
     vector<Params> Pw(W);
-    int64_t max_slots = 0;
+    const int64_t max_slots = latest / D + (latest % D != 0);
     for (int wi = 0; wi < W; wi++)
     {
         World &w = worlds[wi];
         Pw[wi] = w.P;
-        max_slots = std::max(max_slots, (int64_t)std::min(w.stop_ns / (double)D, 1e15));
         for (int n = 0; n < w.N; n++)
         {
             int g = gnode(wi, n);
@@ -1992,6 +2166,28 @@ int main(int argc, char **argv)
         s.qps_cap = std::max(1, *std::max_element(per.begin(), per.end()));
     }
     s.qps = dev_alloc<int>((size_t)NICS * s.qps_cap);
+    s.due_cap = due_cap;
+    if (due_cap > MAX_DUE)
+    {
+        vector<uint64_t> offsets(H + 1);
+        for (const auto &x : fi) offsets[x.src + 1] += 4;
+        uint64_t total = 0;
+        for (int h = 1; h <= H; ++h)
+        {
+            if (offsets[h] > MAX_DUE) total += std::min(offsets[h], uint64_t(due_cap));
+            offsets[h] = total;
+        }
+        if (total)
+        {
+            s.due_offsets = dev_copy(offsets);
+            s.due_scratch = dev_alloc<Due>(total);
+        }
+    }
+    if (!due_report.empty())
+    {
+        s.due_peaks = dev_alloc<int>(H);
+        s.due_first = dev_alloc<int64_t>(H);
+    }
     {
         vector<Switch> sw(S);
         vector<Port> ps(nports);
@@ -2079,7 +2275,22 @@ int main(int argc, char **argv)
     }
     printf("RDMA queue storage: data slots %zu, bytes %zu\n", q3_entries, q3_entries * sizeof(Pkt));
     s.q3 = dev_alloc<Pkt>(q3_entries);
-    if (!queue_report.empty() || q3_auto) s.queue_overflow_at = dev_alloc<int64_t>(2 * nports);
+    const bool adaptive_queue_stop = queue_grace == -2;
+    if (adaptive_queue_stop) queue_grace = q3_auto && W == 1 && !s.dag ? 100000 : -1;
+    if (W > 1 && queue_grace >= 0)
+    {
+        fprintf(stderr, "--q3-stop-grace-ns requires one world\n");
+        return 1;
+    }
+#ifdef TWINS_ASTRA_HOST
+    if (g_cl) queue_grace = -1;
+#endif
+    s.queue_stop_grace_ns = queue_grace;
+    if (!queue_report.empty() || q3_auto || queue_grace >= 0)
+    {
+        s.queue_overflow_at = dev_alloc<int64_t>(2 * nports);
+        s.queue_first_ns = dev_copy(vector<unsigned long long>{~0ull});
+    }
     // links: rate classes (tx tables), and the rings of arrival slots. A frame starting in slot k
     // arrives by (k + 1) D - 1 + its tx time + the delay, so at most 1 + (txmax + delay - 1) / D
     // slots later; a slot's bucket holds the frames that can arrive in D at one per shortest frame
@@ -2178,6 +2389,17 @@ int main(int argc, char **argv)
     }
     s.finished = dev_alloc<int>(1);
     s.max_slots = max_slots;
+    s.stop_ns = latest;
+    if (earliest != latest) s.world_stop_ns = dev_copy(deadlines);
+    s.drain = drain;
+    if (W > 1 && !drain && !s.dag)
+    {
+        vector<int> sizes(W);
+        for (int wi = 0; wi < W; ++wi) sizes[wi] = worlds[wi].fi.size();
+        s.world_flows = dev_copy(sizes);
+        s.world_done = dev_alloc<unsigned int>(W);
+        s.world_last_slot = dev_alloc<unsigned long long>(W);
+    }
     {
         vector<int64_t> fct(F, -1);
         s.fct = dev_copy(fct);
@@ -2206,8 +2428,10 @@ int main(int argc, char **argv)
             s.tx_ports = dev_copy(mask);
             s.tx_cap = 4ull << 20;
         }
+        if (tx_limit) s.tx_cap = tx_limit;
         s.tx = dev_alloc<TxRec>(s.tx_cap);
-        if (P.irn) s.irn_wire = dev_alloc<IrnWire>(s.tx_cap);
+        if (std::any_of(Pw.begin(), Pw.end(), [](const Params &p) { return p.irn; }))
+            s.irn_wire = dev_alloc<IrnWire>(s.tx_cap);
         s.tx_cnt = dev_alloc<unsigned long long>(1);
         s.tx_from = tx_from;
         s.tx_until = tx_until;
@@ -2325,6 +2549,7 @@ int main(int argc, char **argv)
     s.host_blocks = H;
 
     auto t_start = std::chrono::steady_clock::now();
+    int64_t loop_start;
     int fin = 0;
     long long launches = 0;
     // a graph of 64 slots (fewer launch costs); a slot's kernels run side by side (forked from sa)
@@ -2444,6 +2669,7 @@ int main(int argc, char **argv)
             printf("persistent: %d blocks, %d per CU fit on %d CUs\n", nb, per_cu, prop.multiProcessorCount);
     }
     const int PS = 4096; // (slots per persistent launch)
+    loop_start = clock_ns();
 #ifdef TWINS_ASTRA_HOST
     if (g_cl)
     {
@@ -2478,10 +2704,16 @@ int main(int argc, char **argv)
         open_ties = ot;
     }
 #else
+    loop_start = clock_ns();
     island_run(s, D);
 #endif
     CK(cudaDeviceSynchronize());
     double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    const auto attempt_done = clock_ns();
+    const auto graph_start = std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count();
+    printf("RDMA attempt phases: world_s=%.6f initialization_s=%.6f graph_s=%.6f execution_s=%.6f\n",
+           (world_done-world_start)*1e-9, (graph_start-world_done)*1e-9,
+           (loop_start-graph_start)*1e-9, (attempt_done-loop_start)*1e-9);
 
     int64_t slot_end;
     unsigned int done;
@@ -2601,19 +2833,26 @@ int main(int argc, char **argv)
     }
     printf("drops %llu marks %llu pauses %llu resumes %llu nacks %llu | undecided ties %llu, on lost tails %llu | overflows: tx %llu queue %llu ackq %llu qps %llu due %llu | acks for done QPs %llu\n",
            ev[0], ev[1], ev[2], ev[3], ev[11], ev[8], ev[9], ev[4], ev[5], ev[6], ev[7], ev[12], ev[10]);
+    bool trace_truncated = false;
     if (s.tx)
     {
         unsigned long long n;
         CK(cudaMemcpy(&n, s.tx_cnt, sizeof(n), cudaMemcpyDeviceToHost));
         if (n > s.tx_cap)
         {
-            fprintf(stderr, "txtrace: %llu records, %llu kept\n", n, s.tx_cap);
+            trace_truncated = true;
+            fprintf(stderr, "txtrace incomplete: %llu records, %llu kept\n", n, s.tx_cap);
             n = s.tx_cap;
         }
+        else
+            printf("txtrace complete: %llu records\n", n);
         vector<TxRec> r(n);
         CK(cudaMemcpy(r.data(), s.tx, n * sizeof(TxRec), cudaMemcpyDeviceToHost));
         std::sort(r.begin(), r.end(), [](const TxRec &a, const TxRec &b) {
-            return a.ts != b.ts ? a.ts < b.ts : a.node != b.node ? a.node < b.node : a.dev < b.dev;
+            if (a.ts != b.ts) return a.ts < b.ts;
+            if (a.node != b.node) return a.node < b.node;
+            if (a.dev != b.dev) return a.dev < b.dev;
+            return a.index < b.index;
         });
         vector<IrnWire> feedback(s.irn_wire ? n : 0);
         if (s.irn_wire)
@@ -2623,16 +2862,25 @@ int main(int argc, char **argv)
         const char kinds[] = "DANPR";
         for (auto &x : r)
         {
-            fprintf(ft, "%lld %d %d %c %u %u %u %u %u %u", (long long)x.ts, x.node, x.dev, kinds[x.kind],
-                    x.a, x.b, x.sport, x.seq, x.size, x.ecn);
-            if (s.irn_wire)
+            const int wi = x.node < H ? h_world[x.node] : s_world[x.node - H];
+            const int node = x.node < H ? x.node - hbase[wi] : x.node - H - sbase[wi] + worlds[wi].H;
+            const unsigned offset = x.kind < K_PAUSE ? hbase[wi] : 0;
+            if (!batch_file.empty()) fprintf(ft, "%s ", worlds[wi].name.c_str());
+            fprintf(ft, "%lld %d %d %c %u %u %u %u %u %u", (long long)x.ts, node, x.dev, kinds[x.kind],
+                    x.a - offset, x.b - offset, x.sport, x.seq, x.size, x.ecn);
+            if (Pw[wi].irn)
             {
                 const auto &f = feedback[x.index];
                 fprintf(ft, " %u %u %u %u", f.dport, f.sack_seq, f.sack_bytes, f.cnp);
             }
             fputc('\n', ft);
         }
-        fclose(ft);
+        const bool write_failed = ferror(ft);
+        if (fclose(ft) || write_failed)
+        {
+            fprintf(stderr, "failed writing txtrace %s\n", tx_file.c_str());
+            return 1;
+        }
     }
 #ifdef RDMA_PROF
     {
@@ -2698,6 +2946,22 @@ int main(int argc, char **argv)
         if (s.irn_parallel) printf("IRN active switch slots: %llu parallel, %llu fallback\n", n[4], n[5]);
     }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
+    if (s.due_peaks)
+    {
+        vector<int> peaks(H);
+        vector<int64_t> first(H);
+        CK(cudaMemcpy(peaks.data(),s.due_peaks,H*sizeof(peaks[0]),cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(first.data(),s.due_first,H*sizeof(first[0]),cudaMemcpyDeviceToHost));
+        std::ofstream report(due_report);
+        if (!report) return 1;
+        report << "host peak_due first_overflow_ns\n";
+        for (int h = 0; h < H; ++h)
+        {
+            if (peaks[h]) report << h << ' ' << peaks[h] << ' ' << (first[h] ? (first[h]-1)*D : -1) << '\n';
+            if (first[h]) printf("RDMA due overflow: host=%d observed=%d first_ns=%lld\n",
+                                 h, peaks[h], (long long)((first[h]-1)*D));
+        }
+    }
 #ifdef TWINS_ASTRA_HOST
     const bool coordinator_failed = g_cl && g_cl->bad;
     bad |= coordinator_failed;
@@ -2722,6 +2986,7 @@ int main(int argc, char **argv)
     string grow_queues;
     unsigned grow_ports = 0;
     bool queue_unrecoverable = false;
+    bool new_hotspot = false;
     if (s.queue_overflow_at)
     {
         vector<int64_t> at(2 * nports);
@@ -2733,22 +2998,34 @@ int main(int argc, char **argv)
             if (!report) { fprintf(stderr, "cannot write queue capacity report\n"); return 1; }
             report << "time_ns node device class occupancy\n";
         }
+        unsigned discovered = 0;
         for (int sw = 0; sw < S; ++sw)
             for (int i = pbase[sw]; i < pbase[sw + 1]; ++i)
                 for (int cls = 0; cls < 2; ++cls)
                     if (at[2 * i + cls])
                     {
+                        ++discovered;
                         const int cap = q3_offsets.empty() ? q3cap : int(q3_offsets[i + 1] - q3_offsets[i]);
                         const int device = i - pbase[sw] + 1;
                         if (report.is_open()) report << at[2 * i + cls] - 1 << ' ' << H + sw << ' ' << device
                                                      << ' ' << (cls ? 3 : 0) << ' ' << (cls ? cap : s.q0_cap) << '\n';
                         if (q3_auto)
                         {
+                            new_hotspot |= !q3_retry.empty() && std::none_of(q3_retry.begin(), q3_retry.end(), [&](const auto &r) {
+                                return r[0] == H + sw && r[1] == device;
+                            });
                             if (!cls || cap >= (1 << 20) || ++grow_ports > 256) queue_unrecoverable = true;
                             else grow_queues += " --q3-retry-port=" + std::to_string(H + sw) + "," +
                                                 std::to_string(device) + "," + std::to_string(std::min(1 << 20, cap * 2));
                         }
                     }
+        if (discovered)
+        {
+            unsigned long long first;
+            CK(cudaMemcpy(&first, s.queue_first_ns, sizeof(first), cudaMemcpyDeviceToHost));
+            printf("RDMA queue failure: first_ns=%llu stopped_ns=%lld port_classes=%u storage_overflows=%llu grace_ns=%lld\n",
+                   first, (long long)(slot_end * D), discovered, ev[5], (long long)queue_grace);
+        }
     }
     if (ev[14] || ev[15] || ev[32] || ev[33])
         fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu, inputs to a window already run %llu\n", ev[14], ev[15], ev[32], ev[33]);
@@ -2798,15 +3075,38 @@ int main(int argc, char **argv)
 #endif
     const bool redo_f = ev[4] && !fcap_set && fcap < 65535; // (a link's frames overflowed a slot: long slots)
     const bool redo_q = ev[5] && !queue_unrecoverable && grow_ports != 0;
-    const bool permanent = coordinator_failed || (ev[5] && !redo_q) || ev[6] || ev[7] || ev[12] || ev[15] || ev[32] || ev[33] || ev[36] ||
+    const bool redo_due = ev[12] && !due_fixed && due_cap < (1 << 20);
+    const bool permanent = coordinator_failed || (ev[5] && !redo_q) || ev[6] || ev[7] || (ev[12] && !redo_due) || ev[15] || ev[32] || ev[33] || ev[36] ||
                            (ev[4] && !redo_f) || (ev[14] && !redo_d) || (ev[9] && !(redo_t || redo_i)) || (ev[8] && !ev[9]);
-    if (!permanent && (redo_d || redo_t || redo_i || redo_f || redo_q))
+    if (!permanent && (redo_d || redo_t || redo_i || redo_f || redo_q || redo_due))
     {
         string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : redo_t ? "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27)) : "";
         if (redo_f)
             more += string(more.empty() ? "" : " ") + "--fcap-auto=" + std::to_string(std::min(65535, 4 * fcap));
         if (redo_q) more += grow_queues;
-        if (redo_f && s.frame_overflow_world && q3_overrides.empty() && queue_report.empty() && !q3_auto && q3_retry.empty() &&
+        if (redo_q && adaptive_queue_stop && queue_grace >= 0 && (grow_ports > 1 || new_hotspot))
+        {
+            more += " --q3-stop-grace-ns=-1";
+            printf("RDMA queue recovery: next attempt collects all hotspots\n");
+        }
+        if (redo_due) more += " --due-cap-auto=" + std::to_string(std::min(1 << 20, 2 * due_cap));
+        if (redo_q && reuse_topology && topology_fd < 0)
+        {
+            const int64_t started = clock_ns();
+            const int fd = memfd_create("twins-rdma-topology", MFD_ALLOW_SEALING);
+            if (fd >= 0 && transfer_world(fd, false, worlds[0]))
+            {
+                more += " --topology-fd=" + std::to_string(fd);
+                printf("RDMA topology snapshot: %.6f s\n", (clock_ns() - started) * 1e-9);
+            }
+            else
+            {
+                if (fd >= 0) close(fd);
+                fprintf(stderr, "RDMA topology snapshot unavailable; next attempt rebuilds it\n");
+            }
+        }
+        if (redo_f && s.frame_overflow_world && tx_file.empty() && q3_overrides.empty() &&
+            queue_report.empty() && !q3_auto && q3_retry.empty() &&
             !(ev[5] || ev[6] || ev[7] || ev[8] || ev[9] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36]))
         {
             vector<unsigned long long> overflow(W);
@@ -2824,9 +3124,11 @@ int main(int argc, char **argv)
                 else
                     complete &= std::all_of(fct.begin() + fbase[i], fct.begin() + fbase[i] + worlds[i].fi.size(),
                                             [](int64_t ns) { return ns >= 0; });
-            if (complete && affected && affected < W)
+            if (affected && affected < W)
             {
                 more += " --batch-retry-select=" + selected + " --batch-retry-slot-ns=" + std::to_string(D);
+                if (!complete && !batch_carried_incomplete)
+                    more += " --batch-carried-incomplete";
                 fprintf(stderr, "RDMA frame retry: %d of %d worlds\n", affected, W);
             }
         }
@@ -2839,7 +3141,7 @@ int main(int argc, char **argv)
             more += string(more.empty() ? "" : " ") + "--nvl-ringlog=" + std::to_string(g_nvl_ringlog + 2);
 #endif
         more += " --retry-start-ns=" + std::to_string(first_attempt);
-        fprintf(stderr, "%s: running again with %s\n", redo_q ? "switch queue storage" : redo_d ? "DAG message overflow" :
+        fprintf(stderr, "%s: running again with %s\n", redo_q ? "switch queue storage" : redo_due ? "host timer scratch" : redo_d ? "DAG message overflow" :
                 redo_t || redo_i ? "lost tails" : "frames overflowed a slot", more.c_str());
         fflush(stdout);
         fflush(stderr);
@@ -2859,6 +3161,7 @@ int main(int argc, char **argv)
         perror("execv");
     }
     printf("RDMA total wall including retries: %.6f s\n", (clock_ns() - first_attempt) * 1e-9);
+    bad |= trace_truncated;
 #ifdef TWINS_ASTRA_HOST
     if (g_cl)
     {
@@ -2870,5 +3173,5 @@ int main(int argc, char **argv)
         _exit(bad ? 3 : complete ? 0 : 2);
     }
 #endif
-    return bad ? 3 : done == (unsigned)F ? 0 : 2; // (2: flows unfinished at the stop time)
+    return bad ? 3 : done == (unsigned)F && !batch_carried_incomplete ? 0 : 2;
 }

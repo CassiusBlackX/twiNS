@@ -16,7 +16,6 @@ jobs=$1
 shift
 ok=0
 n=0
-norm() { grep -v '^#' "$1" | sed 's/^\(on [ft][0-9]* m\).*/\1/' | LC_ALL=C sort; }
 while read -r name topo rest; do
     case "$name" in "" | "#"*) continue ;; esac
     n=$((n + 1))
@@ -32,15 +31,13 @@ while read -r name topo rest; do
         printf "%-30s rc %d: %s\n" "$name" "$rc" "$(grep -am1 'error\|failed\|more than\|overflowed' "$out.log")"
         continue
     fi
-    r=$(LC_ALL=C join <(LC_ALL=C sort -k1,1 "$E2E/$name.ref") <(LC_ALL=C sort -k1,1 "$out") |
-        awk '{ if ($2 == $4 && $3 == $5) s++; else d++ } END { printf "%d %d", s, d + 0 }')
-    set -- $r "$@"
-    same=$1 differ=$2
-    shift 2
-    total=$(wc -l < "$E2E/$name.ref")
-    dl=$(diff <(norm "$E2E/$name.dag") <(norm "$out.dag") | grep -c '^[<>]')
-    rm -f "$out.dag"
-    printf "%-30s %8d messages, %8d identical, %d differ; DAG lines differ %d; %.1f s; %s\n" "$name" "$total" "$same" "$differ" "$dl" "$w" "$(grep -a 'closed loop:' "$out.log" | tail -1 | sed 's/.*lead ties; //')"
-    [ "$same" = "$total" ] && [ "$differ" = 0 ] && [ "$dl" = 0 ] && ok=$((ok + 1))
+    if python3 validation/simai/compare_closed.py "$E2E/$name.ref" "$out" "$E2E/$name.dag" "$out.dag" >"$out.compare.json"; then
+        ok=$((ok + 1))
+        state=identical
+    else
+        state=different
+    fi
+    printf "%-30s %s; %.1f s; %s\n" "$name" "$state" "$w" "$(grep -a 'closed loop:' "$out.log" | tail -1 | sed 's/.*lead ties; //')"
 done < "$jobs"
 echo "$ok of $n runs identical"
+[ "$ok" = "$n" ]

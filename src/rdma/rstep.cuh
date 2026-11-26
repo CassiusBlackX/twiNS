@@ -1541,13 +1541,14 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
     if (i >= s.tx_cap)
         return;
     TxRec &r = s.tx[i];
+    r.index = i;
     r.ts = now;
     r.node = node;
     r.dev = port + 1;
     r.kind = p.kind;
     r.size = p.size;
     r.ecn = p.ecn;
-    if (s.irn_wire)
+    if (s.irn_wire && s.Pw[node < s.H ? s.h_world[node] : s.s_world[node - s.H]].irn)
     {
         bool ack = p.kind == K_NACK || p.kind == K_ACK;
         auto &extra = s.irn_wire[i];
@@ -1555,7 +1556,6 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
         extra.sack_bytes = ack ? p.sack.size : 0;
         extra.cnp = ack ? p.cnp : 0;
         extra.dport = s.fi[p.flow].dport;
-        r.index = i;
     }
     if (p.kind >= K_PAUSE)
     {
@@ -2218,6 +2218,12 @@ __device__ __forceinline__ void h_ack(HCtx<ND> &c, const Pkt &p)
         q.done = 1;
         s.fct[f] = c.now - s.fi[f].start;
         atomicAdd(s.flows_done, 1u);
+        if (s.world_done)
+        {
+            const int wi = s.h_world[c.h];
+            if (atomicAdd(&s.world_done[wi], 1u) + 1 == (unsigned)s.world_flows[wi])
+                atomicExch(&s.world_last_slot[wi], (unsigned long long)(*s.slot + 1));
+        }
         if (s.fi[f].fast)
             atomicSub(&s.srv_fact[s.h_srv[c.h]], 1);
 #ifdef TWINS_ASTRA
@@ -2462,7 +2468,15 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
     const int h = bi.e;
     // nsl > 1: a global window's slots as one step (see host_block); wdev: per device, the slots with
     // arrivals; wdag: those with DAG messages. If they do not fit, hints[0] > HPOOL and nothing changed.
-    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + nsl * D;
+    const int64_t D = s.P.delay, t0 = slot * D, end = t0 + nsl * D;
+    const int64_t stop = s.world_stop_ns ? s.world_stop_ns[s.h_world[h]] : s.stop_ns;
+    const int64_t t1 = end < stop ? end : stop;
+    int due_cap = s.due_cap < MAX_DUE ? s.due_cap : MAX_DUE;
+    if (s.due_offsets)
+    {
+        const uint64_t off = s.due_offsets[h], count = s.due_offsets[h + 1] - off;
+        if (count) { due = s.due_scratch + off; due_cap = int(count); }
+    }
     const Params &WP = s.Pw[s.h_world[h]];
     const int nd = ND == 1 ? 1 : bi.deg;
     (void)t0;
@@ -2490,7 +2504,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                 {
                     // (the timers due in the window must fit in the list)
                     const Host &st = s.hs[bi.base + d];
-                    if (st.due_min < t1 && st.qp_n * (3 + int(WP.irn)) > MAX_DUE)
+                    if (st.due_min < t1 && st.qp_n * (3 + int(WP.irn)) > due_cap)
                         total = HPOOL + 1;
                 }
             }
@@ -2502,6 +2516,8 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             {
                 uint32_t base;
                 int n = bucket(s, d == 0 ? bi.link0 : s.in_link[(size_t)h * s.K + d], slot, &base);
+                if (t1 < end)
+                    while (n > 0 && s.msg[base + n - 1].ts >= t1) --n;
                 hints[1 + 2 * d] = (int)base;
                 hints[2 + 2 * d] = n;
                 total += n;
@@ -2594,8 +2610,8 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
     hsel(c, 0);
     hq_ok = 0;
     // the DCQCN timers due in this slot (their intervals are at least a slot, so none is added)
-    // (due: in LDS, not scratch; MAX_DUE of them)
     int ndue = 0;
+    int actual_due = 0;
     if (WP.cc == 1)
         for (int d = 0; d < nd; d++)
         {
@@ -2612,9 +2628,11 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                 for (int k = 0; k < 4; k++)
                     if (t[k] >= 0 && t[k] < t1)
                     {
-                        if (ndue == MAX_DUE)
+                        ++actual_due;
+                        if (ndue == due_cap)
                         {
                             atomicAdd(&s.ev[12], 1ull);
+                            if (s.due_first && !s.due_first[h]) s.due_first[h] = slot + 1;
                             continue;
                         }
                         Due x = {t[k], list[i], k};
@@ -2629,6 +2647,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             }
             c.stv[d].due_min = mn;
         }
+    if (s.due_peaks && actual_due > s.due_peaks[h]) s.due_peaks[h] = actual_due;
     int di = 0;
     uint32_t acode[ND];
     int64_t ats[ND], sf_t = INT64_MAX;
@@ -2721,7 +2740,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
         };
         auto ctime = [&](int k, int d) -> int64_t {
             if (k == 0)
-                return af[d] ? ats[d] : INT64_MAX;
+                return af[d] && ats[d] < t1 ? ats[d] : INT64_MAX;
             if (k == 1)
                 return c.stv[d].tc_at >= 0 && c.stv[d].tc_at < t1 ? c.stv[d].tc_at : INT64_MAX;
             if (k == 2)
@@ -3104,7 +3123,10 @@ __device__ __forceinline__ void s_queue_overflow(SCtx &c, size_t pi, int cls)
     const Sim &s = *c.s;
     atomicAdd(&s.ev[5], 1ull);
     if (s.queue_overflow_at && !s.queue_overflow_at[2 * pi + cls])
+    {
         s.queue_overflow_at[2 * pi + cls] = c.now + 1;
+        if (s.queue_first_ns) atomicMin(s.queue_first_ns, (unsigned long long)c.now);
+    }
 }
 
 __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p)
@@ -3510,7 +3532,9 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
 {
     const int x = bi.e;
     Chain *tcs = s.p_tc + bi.base;
-    const int64_t D = s.P.delay, t0 = slot * D, t1 = t0 + nsl * D;
+    const int64_t D = s.P.delay, t0 = slot * D, end = t0 + nsl * D;
+    const int64_t stop = s.world_stop_ns ? s.world_stop_ns[s.s_world[x]] : s.stop_ns;
+    const int64_t t1 = end < stop ? end : stop;
     const int node = s.H + x, deg = bi.deg;
 #ifdef TWINS_IRN_PROFILE
     SlotSample *profile = lane==0 ? sample(s,slot,node) : nullptr;
@@ -3550,6 +3574,8 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
             long long v = s.msg_cnt[ps.in_coff + b];
             q.abase = ps.in_moff + (uint32_t)b * ps.in_cap;
             q.an = (v >> 16) == slot ? (int)(v & 0xFFFF) : 0;
+            if (t1 < end)
+                while (q.an > 0 && s.msg[q.abase + q.an - 1].ts >= t1) --q.an;
         }
         else
         {
@@ -4519,7 +4545,10 @@ __device__ __forceinline__ void slot_end(const Sim &s, int64_t slot, int blk_act
     if (slot + nsl >= s.max_slots)
         *s.finished = 1;
 #else
-    if (fd >= (unsigned int)s.F || slot + nsl >= s.max_slots)
+    const unsigned long long window_end = (slot + nsl) * s.P.delay;
+    const bool stop_after_overflow = s.queue_first_ns && s.queue_stop_grace_ns >= 0 && s.ev[5] &&
+        *s.queue_first_ns <= window_end && window_end - *s.queue_first_ns >= (unsigned long long)s.queue_stop_grace_ns;
+    if ((!s.drain && fd >= (unsigned int)s.F) || slot + nsl >= s.max_slots || s.ev[12] || stop_after_overflow)
         *s.finished = 1;
 #endif
     // idle skip: nothing sent and nothing queued in this slot: go on at the slot of the earliest
@@ -4662,10 +4691,26 @@ __device__ __forceinline__ int entity_window(const Sim &s, int e, int64_t slot)
 
 // The most slots a window's mask of slots with arrivals covers (longer windows step every slot).
 constexpr int WIN_MASK = 32;
+
+__device__ __forceinline__ bool inactive_world(const Sim &s, int wi, int64_t slot)
+{
+    if (s.world_stop_ns && slot * s.P.delay >= s.world_stop_ns[wi])
+        return true;
+    if (!s.world_flows)
+        return false;
+    const auto last = s.world_last_slot[wi];
+    return s.world_flows[wi] == 0 || (last != 0 && (unsigned long long)slot >= last);
+}
+
 template <int ND>
 __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int gk)
 {
     const int h = bi.e;
+    if ((s.world_stop_ns || s.world_flows) && inactive_world(s, s.h_world[h], slot))
+    {
+        if (threadIdx.x == 0) slot_end(s, slot, 0, ~0ull, gk);
+        return;
+    }
     int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();
@@ -4733,7 +4778,8 @@ __device__ __forceinline__ void host_block(const Sim &s, const BlockInfo &bi, in
     {
         const Params &WPw = s.Pw[s.h_world[h]];
         const int64_t wlen = k * s.P.delay;
-        if (WPw.cc != 1 || (wlen <= WPw.alpha_int && wlen <= WPw.dec_int && wlen <= WPw.rp_int))
+        if (WPw.cc != 1 || (wlen <= WPw.alpha_int && wlen <= WPw.dec_int && wlen <= WPw.rp_int &&
+                            (!WPw.irn || wlen <= WPw.irn_rto_low)))
             nsl = k;
     }
     for (int j = 0; j < k; j++)
@@ -4807,6 +4853,11 @@ template <bool WIDE, bool GW = false>
 __device__ __forceinline__ void switch_block(const Sim &s, const BlockInfo &bi, int64_t slot, char *smem, int kl, int gk)
 {
     const int x = bi.e;
+    if ((s.world_stop_ns || s.world_flows) && inactive_world(s, s.s_world[x], slot))
+    {
+        if (threadIdx.x == 0) slot_end(s, slot, 0, ~0ull, gk);
+        return;
+    }
     int lane = threadIdx.x, lanes = blockDim.x;
 #ifdef RDMA_PROF
     long long p0 = clock64();

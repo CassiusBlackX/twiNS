@@ -181,6 +181,19 @@ static_assert(sizeof(Frame) == 24 + 2 * CHAIN, "compact frame layout");
 #endif
 static_assert(sizeof(Frame) % 16 == 0, "vector copy alignment");
 
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+static_assert(CHAIN_RUNS > 31);
+constexpr int ARRIVAL_PREFIX = 2 * 31;
+constexpr int ARRIVAL_TAIL = CHAIN - ARRIVAL_PREFIX - 2;
+struct alignas(16) PackedArrival
+{
+    uint8_t header[offsetof(Frame, chain)];
+    ChainWord prefix[ARRIVAL_PREFIX];
+    ChainWord root[2];
+    uint32_t tail;
+};
+#endif
+
 enum : uint8_t
 {
     S_IDLE = 0,
@@ -216,7 +229,15 @@ enum : uint8_t
     X(uint32_t, hash_ack, 0)
 
 // the sending side (and the application)
+#ifdef TWINS_IMPORTED_TCP
+#include "twins_imported_policies.h"
+#else
+#define TWINS_IMPORTED_FIELDS(X)
+#define TWINS_IMPORTED_POLICIES(X)
+#endif
+
 #define NS_SND_FIELDS(X) \
+    TWINS_IMPORTED_FIELDS(X) \
     X(uint8_t, simple, 0)                /* one message: the sent list in compact form */ \
     X(uint32_t, c_lost, 0)               /* compact: lost items [0, c_lost) */ \
     X(uint32_t, c_rtx, 0)                /* compact: retransmitted [0, c_rtx), the head only if c_headrx */ \
@@ -448,7 +469,10 @@ enum : uint8_t
 {
     CC_NEWRENO = 0,
     CC_DCTCP = 1,
-    CC_CUBIC = 2
+    CC_CUBIC = 2,
+#define TWINS_POLICY_ENUM(key, id, name) CC_##key = id,
+    TWINS_IMPORTED_POLICIES(TWINS_POLICY_ENUM)
+#undef TWINS_POLICY_ENUM
 };
 
 enum : int
@@ -457,6 +481,15 @@ enum : int
     TOPO_LEAFSPINE = 1,
     TOPO_GRAPH = 2 // a topology file: routes from tables
 };
+
+#ifdef TWINS_TCP_RESIDENCY
+struct ArrivalSample
+{
+    int64_t start, arrival;
+    uint64_t tail_a, tail_b;
+    int link, long_chain;
+};
+#endif
 
 struct Sim
 {
@@ -487,13 +520,24 @@ struct Sim
     int host_blocks, host_lanes, sw_per_block; // host_lanes: hosts per block (one per lane)
     // TCP of a host (its world): CC_NEWRENO, CC_DCTCP (ECN), CC_CUBIC
     int ring; // egress FIFO capacity: the largest queue limit + the device queue + 1
+#ifdef TWINS_TCP_ACTIVITY_AUDIT
+    unsigned long long *activity_audit; // two phases: slots, nonempty slots, hosts, switch ports
+#endif
     bool drain; // trace through the final transmissions and timers after flow completion
+#ifdef TWINS_TCP_CLOSE_PROBE
+    int close_drop_kind; // 1: terminal DATA+FIN at host 1; 2: FIN+ACK at host 0
+    unsigned int *close_drop_done;
+#endif
+#ifdef TWINS_TCP_TRACE_TIMERS
+    bool trace_timers;
+#endif
     FlowSoA fl;
 #ifdef TWINS_TCP_OPTIONS
     int fragment_timer_cap;
     FragmentTimer *fragment_timers;
     uint64_t *fragment_head, *fragment_tail;
     unsigned long long *fragment_timer_ovf_w;
+    unsigned long long *fragment_store_ovf_w;
     uint8_t *fragment_drop_tail; // optional deterministic receive-error experiment
 #endif
     MsgSoA mg;
@@ -505,6 +549,18 @@ struct Sim
     int *host_in_link; // [H]
     int *sw_in_link;   // [S*k]
     Frame *msg;        // [NB][L][MAX_TX]
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+    PackedArrival *packed_msg;
+    uint64_t *decode_offset;
+    ChainWord *arrival_tail;
+    unsigned int *arrival_tail_next; // [banks], reset after consuming its arrival slot
+    unsigned int arrival_tail_cap;
+#endif
+#ifdef TWINS_TCP_RESIDENCY
+    ArrivalSample *arrival_samples;
+    unsigned long long *arrival_samples_n;
+    unsigned long long arrival_samples_cap;
+#endif
 #ifdef TWINS_TCP_PACKED_BUCKETS
     uint64_t *arrival_offset;
     int *arrival_banks, *arrival_cap;
@@ -574,12 +630,21 @@ __device__ inline int arrival_capacity(const Sim &s, int link)
 #endif
 }
 
-__device__ inline Frame *arrival_bucket(const Sim &s, int64_t slot, int link)
+__device__ inline size_t arrival_index(const Sim &s, int64_t slot, int link)
 {
 #ifdef TWINS_TCP_PACKED_BUCKETS
-    return s.msg + s.arrival_offset[link] + size_t(slot % s.arrival_banks[link]) * s.arrival_cap[link];
+    return s.arrival_offset[link] + size_t(slot % s.arrival_banks[link]) * s.arrival_cap[link];
 #else
-    return s.msg + size_t(mi(s, slot, link)) * s.max_tx;
+    return size_t(mi(s, slot, link)) * s.max_tx;
+#endif
+}
+
+__device__ inline Frame *arrival_bucket(const Sim &s, int64_t slot, int link)
+{
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+    return s.msg + s.decode_offset[link];
+#else
+    return s.msg + arrival_index(s, slot, link);
 #endif
 }
 #endif
@@ -595,6 +660,67 @@ __host__ __device__ inline void msg_set(const Sim &s, int64_t slot, int link, in
 {
     s.msg_cnt[mi(s, slot, link)] = (long long)slot << 16 | n;
 }
+
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+__device__ inline bool store_arrival(const Sim &s, int64_t slot, int link, int index, const Frame &f)
+{
+    auto &packed = s.packed_msg[arrival_index(s, slot, link) + index];
+    packed.tail = UINT32_MAX;
+    if (f.chain[ARRIVAL_PREFIX])
+    {
+        const int bank = slot % s.banks;
+        const unsigned int tail = atomicAdd(&s.arrival_tail_next[bank], 1u);
+        atomicMax(&s.ev[23], (unsigned long long)tail + 1);
+        if (tail >= s.arrival_tail_cap)
+        {
+            atomicAdd(&s.ev[22], 1ull);
+            atomicAdd(&s.ev[19], 1ull);
+            return false;
+        }
+        packed.tail = tail;
+        ChainWord *dst = s.arrival_tail + (size_t(bank) * s.arrival_tail_cap + tail) * ARRIVAL_TAIL;
+        for (int j = 0; j < ARRIVAL_TAIL; ++j)
+            dst[j] = f.chain[ARRIVAL_PREFIX + j];
+    }
+    __builtin_memcpy(packed.header, &f, sizeof(packed.header));
+    for (int j = 0; j < ARRIVAL_PREFIX; ++j)
+        packed.prefix[j] = f.chain[j];
+    packed.root[0] = f.chain[CHAIN - 2];
+    packed.root[1] = f.chain[CHAIN - 1];
+    return true;
+}
+
+__device__ inline void decode_arrivals(const Sim &s, int64_t slot, int link)
+{
+    if (link < 0)
+        return;
+    const int n = msg_count(s, slot, link);
+    if (!n)
+        return;
+    const PackedArrival *input = s.packed_msg + arrival_index(s, slot, link);
+    Frame *output = arrival_bucket(s, slot, link);
+    for (int i = 0; i < n; ++i)
+    {
+        const auto &packed = input[i];
+        Frame &f = output[i];
+        __builtin_memcpy(&f, packed.header, sizeof(packed.header));
+        for (int j = 0; j < ARRIVAL_PREFIX; ++j)
+            f.chain[j] = packed.prefix[j];
+        if (packed.tail != UINT32_MAX)
+        {
+            const size_t base = size_t(slot % s.banks) * s.arrival_tail_cap + packed.tail;
+            const ChainWord *tail = s.arrival_tail + base * ARRIVAL_TAIL;
+            for (int j = 0; j < ARRIVAL_TAIL; ++j)
+                f.chain[ARRIVAL_PREFIX + j] = tail[j];
+        }
+        else
+            for (int j = 0; j < ARRIVAL_TAIL; ++j)
+                f.chain[ARRIVAL_PREFIX + j] = 0;
+        f.chain[CHAIN - 2] = packed.root[0];
+        f.chain[CHAIN - 1] = packed.root[1];
+    }
+}
+#endif
 
 } // namespace nsm
 

@@ -493,6 +493,11 @@ struct Sim
     int ackq_cap;
     int *qps;           // [NICs][qps_cap] RdmaQueuePairGroup::m_qps
     int qps_cap;
+    int due_cap;
+    struct Due *due_scratch;
+    const uint64_t *due_offsets; // [H+1], no global scratch for hosts fitting LDS
+    int *due_peaks;
+    int64_t *due_first;           // first overflowing slot plus one, per host
     // switches
     Switch *sw;
     const PortCfg *pc;  // [ports]
@@ -509,6 +514,8 @@ struct Sim
     int q0_cap, q3_cap;
     const uint64_t *q3_offsets; // optional packed per-port queue boundaries
     int64_t *queue_overflow_at; // optional first failed enqueue per port and queue class, plus 1
+    unsigned long long *queue_first_ns; // minimum event time among failed enqueues
+    int64_t queue_stop_grace_ns;
 #ifdef RDMA_PFC_AUDIT
     unsigned long long *pfc_profile;
 #endif
@@ -529,6 +536,12 @@ struct Sim
     unsigned long long *next_wake;
     int *finished;
     int64_t max_slots;
+    int64_t stop_ns; // common or latest exclusive cutoff
+    const int64_t *world_stop_ns;
+    const int *world_flows;
+    unsigned int *world_done;
+    unsigned long long *world_last_slot; // outer slot of the last completion, plus one
+    bool drain;
     int host_blocks, spread; // spread: lanes per entity (see rdma_slot)
     int serial;              // switches run every slot's events on one lane (no safe slots)
     int irn_parallel;        // opt-in Broadcom admission proof for a single slot
@@ -700,7 +713,7 @@ struct TxRec
     uint32_t a, b, sport, seq; // src/dst host (PFC: queue, 0)
     uint16_t size;
     uint8_t kind, ecn;
-    uint32_t index; // original offset of the optional IRN feedback fields
+    uint32_t index; // capture order and offset of the optional IRN feedback fields
 };
 
 // a link's frames arriving in a slot: their count, and the index of the first in s.msg

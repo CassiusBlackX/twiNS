@@ -868,6 +868,28 @@ struct Closed : astra::Network
     void run(Sim &s, hipStream_t st, int64_t D_, F launch)
     {
         D = D_;
+        std::ofstream execution;
+        std::ofstream horizons;
+        if (const char *path = getenv("TWINS_CLOSED_HORIZON_TRACE"))
+        {
+            horizons.open(path);
+            if (!horizons)
+            {
+                fprintf(stderr, "cannot write closed callback horizon trace %s\n", path);
+                bad = true;
+                return;
+            }
+        }
+        if (const char *path = getenv("TWINS_CLOSED_CALLBACK_TRACE"))
+        {
+            execution.open(path);
+            if (!execution)
+            {
+                fprintf(stderr, "cannot write closed callback execution trace %s\n", path);
+                bad = true;
+                return;
+            }
+        }
         auto now = [] { return std::chrono::steady_clock::now(); };
         auto sec = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
         unsigned long long seen = 0;
@@ -962,6 +984,7 @@ struct Closed : astra::Network
             seen = ctl.head;
             // the due ones in order
             const int64_t reach = S * D;
+            if (horizons.is_open()) horizons << "H " << reach << '\n';
             rec_reach = reach;
             if (isl.n)
             {
@@ -1070,6 +1093,8 @@ struct Closed : astra::Network
                     fe->now = fe->next_timer();
                     parent = DACT_TIMER | (uint32_t)tslot[id];
                     base = 0;
+                    if (execution.is_open()) execution << "C t " << id << ' ' << fe->now << '\n';
+                    if (horizons.is_open()) horizons << "C t " << id << ' ' << fe->now << ' ' << reach << '\n';
                     fe->run_timer();
                     tfree_later.push_back(tslot[id]);
                 }
@@ -1080,6 +1105,10 @@ struct Closed : astra::Network
                     fe->now = p.t;
                     parent = p.j;
                     base = p.h.base;
+                    if (execution.is_open())
+                        execution << "C " << (p.h.kind == 0 ? 'r' : 's') << ' ' << gfe(p.h.flow) << ' ' << fe->now << '\n';
+                    if (horizons.is_open())
+                        horizons << "C " << (p.h.kind == 0 ? 'r' : 's') << ' ' << gfe(p.h.flow) << ' ' << fe->now << ' ' << reach << '\n';
                     if (p.h.kind == 0)
                         fe->qp_finish(gfe(p.h.flow));
                     else
@@ -1431,7 +1460,7 @@ struct Closed : astra::Network
             fprintf(f, "timer %zu %lld\n", i, (long long)fe->timers[i].delay);
         auto on = [&](const char *c, size_t i, const astra::Cause &k, uint32_t ord) {
             if (k.kind == 'm')
-                fprintf(f, "on %s%zu m\n", c, i); // (ns-3's uids: only their order counts)
+                fprintf(f, "on %s%zu m %u\n", c, i, ord); // relative to other setup actions
             else
                 fprintf(f, "on %s%zu %c%lld %u\n", c, i, k.kind, (long long)k.id, ord);
         };

@@ -91,6 +91,7 @@ __device__ inline uint32_t payload_of(const Frame &p)
 // Frames waiting for the link (not yet started); the link is a point-to-point device with
 // a one-packet device queue under a RED queue disc (ns-3's structure). Transmissions that
 // start in the current slot are written to the link's message for this slot.
+
 struct Fifo
 {
     Frame *ring;
@@ -126,7 +127,9 @@ struct Fifo
             if (f.fragment == IP_ICMP)
                 printf("WIRE %lld %u\n", (long long)start, unsigned(f.len));
 #endif
-#if TWINS_WIDE_HIP_FIFO
+#if defined(TWINS_TCP_SPLIT_ARRIVALS)
+            Frame &o = f;
+#elif TWINS_WIDE_HIP_FIFO
             // The arrival is in a later slot, and this link owns its bucket
             // until publication. Extend the outgoing frame in that bucket.
             int64_t lead = duration + s->delay_ps[id];
@@ -147,7 +150,7 @@ struct Fifo
             // previous frame, scheduled when that one started
             if (f.ts <= link_free && link_free > last_start) // (a link that never sent is idle)
             {
-#if TWINS_WIDE_HIP_FIFO
+#if TWINS_WIDE_HIP_FIFO || defined(TWINS_TCP_SPLIT_ARRIVALS)
                 chain_push(o.chain, chain_lead(link_free - last_start), last_chain);
 #else
                 ChainWord prev[CHAIN];
@@ -168,7 +171,7 @@ struct Fifo
                 last_chain[i] = o.chain[i];
             last_start = start;
 #ifdef TWINS_LINK_TIMING
-#if TWINS_WIDE_HIP_FIFO
+#if TWINS_WIDE_HIP_FIFO && !defined(TWINS_TCP_SPLIT_ARRIVALS)
             o.arrival_lead = lead;
             o.ts = start + lead;
 #else
@@ -181,9 +184,34 @@ struct Fifo
                 atomicAdd(&s->ev[19], 1ull);
                 return;
             }
+#ifdef TWINS_TCP_SPLIT_ARRIVALS
+            if (!store_arrival(*s, arrival_slot, id, n, o))
+                return;
+#else
             frame_copy(arrival_bucket(*s, arrival_slot, id) + n, &o);
 #endif
+#endif
             msg_set(*s, arrival_slot, id, n + 1);
+#ifdef TWINS_TCP_RESIDENCY
+            if (s->arrival_samples)
+            {
+                const auto i = atomicAdd(s->arrival_samples_n, 1ull);
+                if (i < s->arrival_samples_cap)
+                {
+                    constexpr int prefix = 62; // 31 code/count pairs
+                    const bool deep = o.chain[prefix] != 0;
+                    uint64_t h1 = 14695981039346656037ull, h2 = 95284532167486511ull;
+                    if (deep)
+                        for (int j = prefix; j < CHAIN - 2; ++j) // roots stay in the prefix record
+                        {
+                            const uint64_t word = o.chain[j];
+                            h1 = (h1 ^ word) * 1099511628211ull;
+                            h2 = (h2 + word + 0x9e3779b97f4a7c15ull) * 0xd6e8feb86659fd93ull;
+                        }
+                    s->arrival_samples[i] = {start,o.ts,h1,h2,id,int(deep)};
+                }
+            }
+#endif
 #ifdef TWINS_TCP_BUCKET_AUDIT
             atomicAdd(&s->ev[39], 1ull);
             if (!n) atomicAdd(&s->ev[35], 1ull);
@@ -1314,6 +1342,21 @@ __device__ TWINS_COLD uint32_t cub_ssthresh(const FlowSoA &F, int f);
 __device__ inline uint32_t ssthresh_for(HostCtx &c, int f, uint32_t bytes_in_flight)
 {
     const FlowSoA &F = c.s->fl;
+#ifdef TWINS_IMPORTED_TCP
+    switch (c.s->hs.cc[c.h])
+    {
+#define TWINS_POLICY_THRESHOLD(key, id, name) \
+    case CC_##key: { \
+        twins_policy::Socket socket{F.cwnd[f], F.ssthresh[f], MSS}; \
+        auto state = load_policy_##key(F, f); \
+        const uint32_t value = state.GetSsThresh(&socket, bytes_in_flight); \
+        store_policy_##key(F, f, state); \
+        return value; \
+    }
+        TWINS_IMPORTED_POLICIES(TWINS_POLICY_THRESHOLD)
+#undef TWINS_POLICY_THRESHOLD
+    }
+#endif
     if (c.cubic)
         return cub_ssthresh(F, f);
     if (c.dctcp)
@@ -1654,6 +1697,23 @@ __device__ inline void pkts_acked(HostCtx &c, int f, uint32_t segs, uint32_t ack
 __device__ inline void increase_window(HostCtx &c, int f, uint32_t segs, uint32_t ack, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
+#ifdef TWINS_IMPORTED_TCP
+    switch (c.s->hs.cc[c.h])
+    {
+#define TWINS_POLICY_WINDOW(key, id, name) \
+    case CC_##key: { \
+        twins_policy::Socket socket{F.cwnd[f], F.ssthresh[f], MSS}; \
+        auto state = load_policy_##key(F, f); \
+        state.IncreaseWindow(&socket, segs); \
+        F.cwnd[f] = socket.m_cWnd; \
+        F.ssthresh[f] = socket.m_ssThresh; \
+        store_policy_##key(F, f, state); \
+        return; \
+    }
+        TWINS_IMPORTED_POLICIES(TWINS_POLICY_WINDOW)
+#undef TWINS_POLICY_WINDOW
+    }
+#endif
     if (c.cubic)
     {
         cub_increase(F, f, segs, ack, now);
@@ -2684,8 +2744,7 @@ __device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
     if (entry.mask && entry.id != p.ip_id)
     {
         atomicAdd(&s.ev[34], 1ull);
-        atomicAdd(&s.ev[5], 1ull);
-        atomicAdd(&s.active_ovf_w[c.h / s.H1], 1ull);
+        atomicAdd(&s.fragment_store_ovf_w[c.h / s.H1], 1ull);
         return;
     }
     if (!entry.mask)
@@ -2749,6 +2808,18 @@ __device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
 
 __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
 {
+#ifdef TWINS_TCP_CLOSE_PROBE
+    if (c.s->close_drop_kind && (p.flags & F_FIN))
+    {
+        const bool data = c.s->close_drop_kind == 1 && c.h == 1 && !p.to_sender && (p.flags & F_DATA);
+        const bool reply = c.s->close_drop_kind == 2 && c.h == 0 && p.to_sender && !(p.flags & F_DATA);
+        if ((data || reply) && !atomicCAS(c.s->close_drop_done, 0u, 1u))
+        {
+            printf("CLOSE_DROP %lld %u %d\n", (long long)now, unsigned(p.flags), int(data));
+            return;
+        }
+    }
+#endif
 #ifdef TWINS_TCP_OPTIONS
     if (p.fragment == IP_ICMP) return; // TcpSocketBase's default ICMP notification has no state effect
     if (p.fragment == IP_TAIL && c.s->fragment_drop_tail && c.s->fragment_drop_tail[c.h])
@@ -2988,6 +3059,10 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         else if (selected == td && (selected != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h)))
         {
             Due d = due[id++];
+#ifdef TWINS_TCP_TRACE_TIMERS
+            if (s.trace_timers)
+                printf("TCP_TIMER %d %lld %d %d %d\n", h, (long long)now, d.kind, d.flow, (int)due_current(c, d));
+#endif
             const ChainWord *tc = due_chain(s, d, h);
             for (int i = 0; i < CHAIN; i++)
                 c.echain[i] = tc[i];
