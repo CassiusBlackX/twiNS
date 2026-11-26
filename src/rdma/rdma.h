@@ -439,10 +439,13 @@ struct Sim
 {
     IrnSender *irn_sender;
     IrnMap *irn_receiver;
-    RxLifetime *rx_lifetime; // HPCC and IRN receiver deletion on sender completion
+    RxLifetime *rx_lifetime; // receiver deletion on sender completion
 #ifdef RDMA_LIFETIME_PROBE
     int64_t duplicate_at;
     bool duplicate_after_close;
+    int duplicate_flow, duplicate_host;
+    uint32_t duplicate_seq;
+    Chain *duplicate_chain;
     Pkt *duplicate_packet;
     int *duplicate_processed;
 #endif

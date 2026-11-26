@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "astra/frontend.h"
+#include "astra/flow_cache.h"
 
 static int send_lat_slots(int64_t send_lat, int64_t D) { return (int)((send_lat - 1) / D); }
 // --nvl-record=F writes every completion of a flow between GPUs of one server (FlowInfo::fast) with
@@ -27,6 +28,7 @@ static int send_lat_slots(int64_t send_lat, int64_t D) { return (int)((send_lat 
 static string g_nvl_record, g_nvl_oracle;
 static int g_nvl_islands = 0;
 static int g_nvl_ringlog = 24; // --nvl-ringlog: an island's tail ring holds 2^this nodes
+static int g_closed_action_cap = 1 << 20;
 static unsigned long long g_isl_ev[40]; // the islands' counters, summed (added to the GPU's in the report)
 struct NvlPre
 {
@@ -634,7 +636,6 @@ struct Closed : astra::Network
 {
     static constexpr int TCAP = 1 << 18;     // timers alive at once
     static constexpr int CEV_LOG = 20;       // completions recorded and not done with
-    static constexpr int ACT_CAP = 1 << 20;  // actions of a sync
     string topo, wl, dag_out;
     astra::Frontend *fe = nullptr;
     // the flows, from the stub's run: by what the system layer asks for
@@ -654,7 +655,7 @@ struct Closed : astra::Network
     uint32_t parent = 0, base = 0;
     unsigned long long lead_ties = 0, syncs = 0, sort_runs = 0, sorted = 0;
     double t_cpu = 0, t_gpu = 0, t_sync = 0;
-    bool in_main = true, bad = false, stop_d = false, stop_t = false;
+    bool in_main = true, bad = false, at_horizon = false;
     int span = 0;
 
     int slot_alloc()
@@ -810,8 +811,8 @@ struct Closed : astra::Network
         cev_mask = s.cev_mask;
         s.cev_h = dev_h = dev_alloc<CEvH>(1ull << CEV_LOG);
         s.cev_c = dev_alloc<Chain>(1ull << CEV_LOG);
-        s.cact = dev_act = dev_alloc<CAct>(ACT_CAP);
-        s.cs = dev_cs = dev_alloc<CSort>(ACT_CAP);
+        s.cact = dev_act = dev_alloc<CAct>(g_closed_action_cap);
+        s.cs = dev_cs = dev_alloc<CSort>(g_closed_action_cap);
         ClCtl c = {};
         c.limit = span;
         c.cap = next_cap();
@@ -905,22 +906,27 @@ struct Closed : astra::Network
                 fprintf(stderr, "stopped after %lld rounds (TWINS_STOP_SYNCS)\n", stop_syncs);
                 break;
             }
-            // a run that will start again with more room (see main) stops here
-            if (syncs % 1024 == 0 && (stop_d || stop_t))
+            if (syncs == 1 || syncs % 32 == 0 || S >= s.max_slots)
             {
-                unsigned long long e[2];
-                CK(hipMemcpyAsync(&e[0], s.ev + 9, sizeof(e[0]), hipMemcpyDeviceToHost, st));
-                CK(hipMemcpyAsync(&e[1], s.ev + 14, sizeof(e[1]), hipMemcpyDeviceToHost, st));
-                CK(hipStreamSynchronize(st));
-                if ((stop_t && e[0]) || (stop_d && e[1]))
+                unsigned long long e[40];
+                CK(cudaMemcpy(e, s.ev, sizeof(e), cudaMemcpyDeviceToHost));
+                const char *reason = e[5] ? "switch-queue" : e[4] ? "arrival-bucket" : e[6] ? "feedback-queue" :
+                    e[7] ? "active-qp" : e[12] ? "due-list" : e[14] ? "dag-bucket" : e[15] ? "ready-flow" :
+                    e[32] || e[33] ? "late-event" : e[36] ? "persistent-launch" : e[9] ? "lost-history" : nullptr;
+                if (reason)
+                {
+                    fprintf(stderr, "closed failure: %s slot=%lld rounds=%llu unread=%llu pending=%zu ready=%zu timer=%d\n",
+                            reason, (long long)S, syncs, ctl.head - seen, pool.size(), ready.size(), int(fe->has_timer()));
                     return;
+                }
             }
             if (progress && syncs % 2000 == 0)
                 fprintf(stderr, "sync %llu slot %lld k %d completions %llu acts %zu gpu %.1f s cpu %.1f s sync %.1f s; idle %d cap %lld limit %lld timer %d pool %zu ready %zu; islands wait %.1f s move %.1f s live %lld nodes %zu\n", syncs, (long long)S, ctl.k, ctl.head, acts.size(), t_gpu, t_cpu, t_sync, ctl.idle, (long long)ctl.cap, (long long)ctl.limit, (int)fe->has_timer(), pool.size(), ready.size(), isl.t_wait, isl.t_xfer, isl.live, isl.gnodes.size());
             // the completions recorded, as a contiguous range of the ring
             if (ctl.head - seen > (unsigned long long)cev_mask)
             {
-                fprintf(stderr, "completions overflowed their ring\n");
+                fprintf(stderr, "closed failure: completion-ring slot=%lld unread=%llu pending=%zu\n",
+                        (long long)S, ctl.head - seen, pool.size());
                 bad = true;
                 return;
             }
@@ -1079,9 +1085,10 @@ struct Closed : astra::Network
                     else
                         fe->send_finish(gfe(p.h.flow));
                 }
-                if ((int)acts.size() > ACT_CAP)
+                if (acts.size() > unsigned(g_closed_action_cap))
                 {
-                    fprintf(stderr, "more than %d actions in a sync\n", ACT_CAP);
+                    fprintf(stderr, "closed failure: action-capacity slot=%lld actions=%zu limit=%d pending=%zu ready=%zu\n",
+                            (long long)S, acts.size(), g_closed_action_cap, pool.size(), ready.size());
                     bad = true;
                     return;
                 }
@@ -1090,6 +1097,13 @@ struct Closed : astra::Network
             t_cpu += sec(d, e);
             if (fe->finished)
                 return;
+            if (S >= s.max_slots)
+            {
+                at_horizon = true;
+                fprintf(stderr, "closed cutoff: slot=%lld pending=%zu ready=%zu timer=%d\n",
+                        (long long)S, pool.size(), ready.size(), int(fe->has_timer()));
+                return;
+            }
             // nothing more to come
             if (ctl.idle && acts.empty() && pool.empty() && ready.empty() && !fe->has_timer() && onext == orecs.size() && isl.live == 0)
                 return;
@@ -1432,68 +1446,87 @@ static Closed *g_cl = nullptr;
 
 // the flows from a child running the system layer on a stub network, as a DAG's flow lines; then
 // the system layer here, up to its first actions
-static bool closed_prepare(const string &topo, const string &wl, const string &flow_file, const string &dag_out, bool cache)
+static bool closed_prepare(const string &topo, const string &wl, string &flow_file, const string &dag_out,
+                           bool cache, int &input_fd)
 {
-    char *atopo = realpath(topo.c_str(), nullptr), *awl = realpath(wl.c_str(), nullptr);
-    char *aout = realpath(".", nullptr);
+    std::unique_ptr<char, decltype(&free)> atopo(realpath(topo.c_str(), nullptr), &free);
+    std::unique_ptr<char, decltype(&free)> awl(realpath(wl.c_str(), nullptr), &free);
     if (!atopo || !awl)
     {
         fprintf(stderr, "cannot find %s or %s\n", topo.c_str(), wl.c_str());
         return false;
     }
-    const string path = flow_file[0] == '/' ? flow_file : string(aout) + "/" + flow_file;
-    fflush(stdout);
-    auto t0 = std::chrono::steady_clock::now();
-    const bool have = cache && std::ifstream(path);
-    pid_t pid = have ? 1 : fork();
-    if (pid == 0)
-    {
-        // (its stdout, and its SimAI csv files, are not ours)
-        if (!freopen("/dev/null", "w", stdout))
-            _exit(1);
-        vector<astra::Flow> flows;
-        const auto stub_start = std::chrono::steady_clock::now();
-        auto st = astra::stub_run(atopo, awl, 400, &flows);
-        const auto stub_done = std::chrono::steady_clock::now();
-        FILE *f = fopen(path.c_str(), "w");
-        if (!f || !st.finished)
-            _exit(1);
-        for (size_t i = 0; i < flows.size(); i++)
-            fprintf(f, "flow %zu %d %d %llu\n", i, flows[i].src, flows[i].dst, (unsigned long long)flows[i].size);
-        fclose(f);
-        if (getenv("TWINS_STUB_PROFILE"))
-            fprintf(stderr, "stub phases: frontend %.6f s callbacks %.6f s record copy/teardown %.6f s serialization %.6f s\n",
-                    st.init_s, st.run_s, std::chrono::duration<double>(stub_done - stub_start).count() - st.init_s - st.run_s,
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - stub_done).count());
-        _exit(0);
-    }
-    int stc = 0;
-    if (!have)
-        waitpid(pid, &stc, 0);
-    if (!WIFEXITED(stc) || WEXITSTATUS(stc) != 0)
-    {
-        fprintf(stderr, "the system layer's run on a stub network failed\n");
+    uint64_t topo_hash, wl_hash, exe_hash;
+    if (!flow_cache_file_hash(atopo.get(), &topo_hash) || !flow_cache_file_hash(awl.get(), &wl_hash) ||
+        !flow_cache_file_hash("/proc/self/exe", &exe_hash))
         return false;
-    }
-    Closed *c = g_cl = new Closed;
-    c->topo = atopo;
-    c->wl = awl;
-    c->dag_out = dag_out;
-    std::ifstream in(path);
-    string w;
-    int n = 0;
-    while (in >> w)
+    const string header = "# twins-flow-cache-v1 " + std::to_string(topo_hash) + " " +
+                          std::to_string(wl_hash) + " " + std::to_string(exe_hash);
+    auto c = std::make_unique<Closed>();
+    int count = 0;
+    auto load = [&]() {
+        c->ids.clear();
+        return flow_cache_read("/proc/self/fd/" + std::to_string(input_fd), header,
+            [&](int id, int a, int b, uint64_t size) { c->ids[{a,b,size}].push_back(id); }, count);
+    };
+    auto start = std::chrono::steady_clock::now();
+    input_fd = cache ? open(flow_file.c_str(), O_RDONLY | O_CLOEXEC) : -1;
+    const bool reused = input_fd >= 0 && load();
+    if (!reused)
     {
-        unsigned id, a, b;
-        unsigned long long sz;
-        in >> id >> a >> b >> sz;
-        c->ids[std::make_tuple((int)a, (int)b, (uint64_t)sz)].push_back(n++);
+        if (input_fd >= 0) close(input_fd);
+        string temporary = flow_file + ".tmp.XXXXXX";
+        input_fd = mkstemp(temporary.data());
+        if (input_fd < 0) { perror(flow_file.c_str()); return false; }
+        fcntl(input_fd, F_SETFD, FD_CLOEXEC);
+        fflush(stdout);
+        const pid_t child = fork();
+        if (child == 0)
+        {
+            if (!freopen("/dev/null", "w", stdout)) _exit(1);
+            vector<astra::Flow> flows;
+            const auto stub_start = std::chrono::steady_clock::now();
+            auto st = astra::stub_run(atopo.get(), awl.get(), 400, &flows);
+            const auto stub_done = std::chrono::steady_clock::now();
+            FILE *f = fdopen(input_fd, "w");
+            if (!f || !st.finished || !flow_cache_write(f, header, flows) ||
+                fflush(f) || fsync(fileno(f)) || fclose(f))
+                _exit(1);
+            if (getenv("TWINS_STUB_PROFILE"))
+                fprintf(stderr, "stub phases: frontend %.6f s callbacks %.6f s record copy/teardown %.6f s serialization %.6f s\n",
+                        st.init_s, st.run_s, std::chrono::duration<double>(stub_done - stub_start).count() - st.init_s - st.run_s,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - stub_done).count());
+            _exit(0);
+        }
+        int status = 0;
+        pid_t result = -1;
+        if (child > 0)
+            do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
+        uint64_t latest_topo, latest_wl;
+        bool valid = result == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                     flow_cache_file_hash(atopo.get(), &latest_topo) && latest_topo == topo_hash &&
+                     flow_cache_file_hash(awl.get(), &latest_wl) && latest_wl == wl_hash && load();
+        if (valid && cache) valid = rename(temporary.c_str(), flow_file.c_str()) == 0;
+        if (!cache || !valid) unlink(temporary.c_str());
+        if (!valid)
+        {
+            fprintf(stderr, "cannot generate complete closed-loop flow inventory: %s\n", flow_file.c_str());
+            close(input_fd);
+            return false;
+        }
     }
-    c->fe_of.assign(n, -1);
-    for (int t = Closed::TCAP - 1; t >= 0; t--)
+    flow_file = "/proc/self/fd/" + std::to_string(input_fd);
+    c->topo = atopo.get();
+    c->wl = awl.get();
+    c->dag_out = dag_out;
+    c->fe_of.assign(count, -1);
+    for (int t = Closed::TCAP - 1; t >= 0; --t)
         c->tfree.push_back(t);
-    c->fe = new astra::Frontend(atopo, awl, c);
+    c->fe = new astra::Frontend(c->topo, c->wl, c.get());
     c->fe->fire();
-    printf("the system layer's flows: %d (%.3f s%s)\n", n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), have ? ", kept" : " on a stub network");
+    printf("the system layer's flows: %d (%.3f s%s)\n", count,
+           std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+           reused ? ", kept" : " on a stub network");
+    g_cl = c.release();
     return true;
 }

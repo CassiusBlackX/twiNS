@@ -57,9 +57,20 @@ namespace kbasic = kfull;
 #endif
 using kfull::Due;
 
-#ifdef TWINS_TCP_BUCKET_AUDIT
 static size_t explicit_device_bytes = 0;
-#endif
+static bool memory_phases = false;
+
+static void memory_phase(const char *phase)
+{
+    if (!memory_phases) return;
+    size_t free_bytes = 0, total_bytes = 0;
+    CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    auto tick = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    printf("TCP memory pid=%ld phase=%s monotonic_ns=%lld explicit_bytes=%zu device_free=%zu device_total=%zu\n",
+           (long)getpid(), phase, (long long)tick, explicit_device_bytes, free_bytes, total_bytes);
+    fflush(stdout);
+}
 
 template <typename T>
 static T *dalloc(size_t n)
@@ -67,9 +78,7 @@ static T *dalloc(size_t n)
     T *p;
     CHECK(cudaMalloc(&p, sizeof(T) * std::max<size_t>(n, 1)));
     CHECK(cudaMemset(p, 0, sizeof(T) * std::max<size_t>(n, 1)));
-#ifdef TWINS_TCP_BUCKET_AUDIT
     explicit_device_bytes += sizeof(T) * std::max<size_t>(n, 1);
-#endif
 #ifdef TWINS_EVIDENCE
     twins_evidence::allocated += sizeof(T)*std::max<size_t>(n,1);
     if constexpr (std::is_same<T,Frame>::value) twins_evidence::inline_allocated += sizeof(T)*std::max<size_t>(n,1) * sizeof(Frame::chain)/sizeof(Frame);
@@ -165,6 +174,7 @@ int h_mut = 0; // (model.h)
 
 int main(int argc, char **argv)
 {
+    memory_phases = getenv("TWINS_CUDA_MEMORY_PHASES") != nullptr;
 #ifdef TWINS_RETRY_DRIVER
     if (argc < 2 || std::string(argv[1]) != "--single-pass")
     {
@@ -1384,6 +1394,7 @@ int main(int argc, char **argv)
     CHECK(cudaStreamCreate(&stream));
     cudaGraph_t graph;
     cudaGraphExec_t exec;
+    memory_phase("before-capture");
     CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (int i = 0; i < graph_k; i++)
         if (basic)
@@ -1391,7 +1402,9 @@ int main(int argc, char **argv)
         else
             kfull::ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
     CHECK(cudaStreamEndCapture(stream, &graph));
+    memory_phase("after-capture");
     CHECK(cudaGraphInstantiate(&exec, graph, 0));
+    memory_phase("after-instantiate");
     CHECK(cudaDeviceSynchronize());
     auto t0 = std::chrono::high_resolution_clock::now();
     while (!*(volatile int *)h_finished)
@@ -1399,6 +1412,7 @@ int main(int argc, char **argv)
         CHECK(cudaGraphLaunch(exec, stream));
         CHECK(cudaStreamSynchronize(stream));
     }
+    memory_phase("after-run");
     double sec = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
     int64_t slots;
     CHECK(cudaMemcpy(&slots, s.slot, 8, cudaMemcpyDeviceToHost));

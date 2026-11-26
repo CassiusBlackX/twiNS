@@ -128,7 +128,7 @@ def run(binary, args):
                   f"loop_s={duration[1]} wall_s={time.monotonic()-t:.6f}", flush=True)
             if active or ties:
                 for line in log.splitlines():
-                    if line.startswith(("TCP arrival ring", "TCP compared runs", "TCP heterogeneous")):
+                    if line.startswith(("TCP arrival ring", "TCP compared runs", "TCP heterogeneous", "TCP memory ")):
                         print(line, flush=True)
             if any(count(f) for f in ("tx-cap", "ooo-ovf", "rtt-ovf", "ring-ovf")):
                 sys.stderr.write(log + result.stderr)

@@ -2253,8 +2253,13 @@ __device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
 #ifdef RDMA_LIFETIME_PROBE
-    if (s.duplicate_packet && p.flow == 0 && p.seq == 1000 && c.now < s.duplicate_at)
+    if (s.duplicate_packet && int(p.flow) == s.duplicate_flow && p.seq == s.duplicate_seq &&
+        c.now < s.duplicate_at && !s.duplicate_packet->size)
+    {
         *s.duplicate_packet = p;
+        if (c.P->simai && !s.duplicate_after_close)
+            cpush(s.duplicate_chain, ccode(s.duplicate_at - c.now, c.ord++), c.cur);
+    }
 #endif
     uint32_t payload = p.size - data_hdr(*c.P);
     // HPCC deletes the receive QP in the sender's completion event. The final
@@ -2795,23 +2800,26 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                     }
                 }
 #ifdef RDMA_LIFETIME_PROBE
-        if (h == 1 && s.duplicate_packet && s.duplicate_packet->size && !*s.duplicate_processed &&
+        if (h == s.duplicate_host && s.duplicate_packet && s.duplicate_packet->size && !*s.duplicate_processed &&
             s.duplicate_at >= t0 && s.duplicate_at < t1 && s.duplicate_at <= bt)
         {
             c.now = s.duplicate_at;
             c.ord = 0;
-            const auto &life = s.rx_lifetime[0];
+            const int probe = s.duplicate_flow;
+            const auto &life = s.rx_lifetime[probe];
             if (s.duplicate_after_close)
                 cpush(&c.cur, ccode(0, 0), life.close_chain);
+            else if (WP.simai)
+                c.cur = *s.duplicate_chain;
             else
             {
                 Chain setup{};
-                setup.root = s.fi[0].start_chain.root;
+                setup.root = s.fi[probe].start_chain.root;
                 chash_reset(setup);
                 cpush(&c.cur, ccode(s.duplicate_at, 0), setup);
             }
-            printf("RXQP duplicate %lld expected %u close %llu\n", (long long)c.now, s.rx[0].expected, life.close_at);
-            hsel(c, s.fi[0].rnic);
+            printf("RXQP duplicate %lld expected %u close %llu\n", (long long)c.now, s.rx[probe].expected, life.close_at);
+            hsel(c, s.fi[probe].rnic);
             h_data(c, *s.duplicate_packet);
             *s.duplicate_processed = 1;
             continue;
@@ -2948,7 +2956,7 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
         s.hs[c.nic0 + d] = st;
     }
 #ifdef RDMA_LIFETIME_PROBE
-    if (h == 1 && s.duplicate_packet && !*s.duplicate_processed && s.duplicate_at < w)
+    if (h == s.duplicate_host && s.duplicate_packet && !*s.duplicate_processed && s.duplicate_at < w)
         w = s.duplicate_at;
 #endif
     s.hs[c.nic0].wake = w; // (with its TransmitCompletes: when it must run again without input)
