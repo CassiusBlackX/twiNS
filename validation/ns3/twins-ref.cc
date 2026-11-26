@@ -22,6 +22,8 @@
 #include "ns3/point-to-point-module.h"
 #include "ns3/traffic-control-module.h"
 #include "ns3/hash.h"
+#include "ns3/tcp-option-sack.h"
+#include "ns3/tcp-option-ts.h"
 #ifdef NS3_MTP
 #include "ns3/mtp-module.h"
 #endif
@@ -51,6 +53,31 @@ static std::vector<FlowRec> g_flows;
 static bool g_fin = false;
 static std::atomic<uint64_t> g_drops{0}, g_marks{0}, g_retx{0};
 static std::atomic<uint64_t> g_retx_state[5], g_rto{0}; // retransmissions by TcpCongState_t; RTOs
+
+// On a point-to-point device PhyTxBegin observes each actual PPP frame,
+// including any IP fragments. The first 82 bytes cover PPP, IPv4 and a
+// maximal TCP header for the scenario's IPv4 headers without IP options.
+static std::ofstream g_wire;
+static int64_t g_wire_until = INT64_MAX;
+static int g_wire_node = -1;
+
+static void TraceWire(uint32_t node, uint32_t dev, Ptr<const Packet> packet)
+{
+    const auto stamp = Simulator::Now().GetPicoSeconds();
+    if (stamp >= g_wire_until || (g_wire_node >= 0 && node != uint32_t(g_wire_node)))
+        return;
+    constexpr char digits[] = "0123456789abcdef";
+    uint8_t bytes[82];
+    uint32_t count = packet->CopyData(bytes, sizeof(bytes));
+    char header[2 * sizeof(bytes) + 1];
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        header[2 * i] = digits[bytes[i] >> 4];
+        header[2 * i + 1] = digits[bytes[i] & 15];
+    }
+    header[2 * count] = '\0';
+    g_wire << stamp << ' ' << node << ' ' << dev << ' ' << packet->GetSize() << ' ' << header << '\n';
+}
 
 // Sends a connection's flows (messages) and records when each is handed to the socket and when
 // its last byte is acknowledged.
@@ -233,6 +260,8 @@ int main(int argc, char *argv[])
     uint32_t ecnK = 30;
     uint32_t queuePkts = 200;
     bool perFlowEcmp = false;
+    bool sack = false, timestamps = false;
+    std::string wirePath;
     double stopSec = 1.0;
     uint32_t dupThresh = 3;
     std::string hostQ = "default"; // host egress: default (pfifo_fast 1000p), red (like switches), big (no local drops)
@@ -258,11 +287,22 @@ int main(int argc, char *argv[])
     cmd.AddValue("ecnK", "ECN marking threshold (packets)", ecnK);
     cmd.AddValue("queue", "switch egress queue (packets)", queuePkts);
     cmd.AddValue("flowEcmp", "per-flow instead of per-packet ECMP", perFlowEcmp);
+    cmd.AddValue("tcp-sack", "Enable TCP selective acknowledgements", sack);
+    cmd.AddValue("tcp-timestamps", "Enable TCP timestamps", timestamps);
+    cmd.AddValue("traceWire", "PPP transmission header output (sequential)", wirePath);
+    cmd.AddValue("traceWireUntil", "Exclusive end of wire tracing in picoseconds", g_wire_until);
+    cmd.AddValue("traceWireNode", "Restrict wire tracing to this node ID", g_wire_node);
     cmd.AddValue("stop", "simulation stop time (s)", stopSec);
     cmd.AddValue("dupthresh", "duplicate ACKs that trigger fast retransmit", dupThresh);
     cmd.AddValue("hostq", "host egress queue: default, red, big", hostQ);
     cmd.AddValue("fin", "1: senders close their connections after the last flow (FIN)", g_fin);
     cmd.Parse(argc, argv);
+    if (!wirePath.empty())
+    {
+        NS_ABORT_MSG_IF(threads, "wire tracing requires sequential execution");
+        g_wire.open(wirePath);
+        NS_ABORT_MSG_IF(!g_wire, "cannot open " << wirePath);
+    }
 
 #ifdef NS3_MTP
     if (threads)
@@ -299,8 +339,8 @@ int main(int argc, char *argv[])
     Config::SetDefault("ns3::TcpSocket::ConnTimeout", TimeValue(MilliSeconds(10)));
     Config::SetDefault("ns3::TcpSocketBase::MinRto", TimeValue(MilliSeconds(1)));
     Config::SetDefault("ns3::TcpSocketBase::ClockGranularity", TimeValue(MicroSeconds(1)));
-    Config::SetDefault("ns3::TcpSocketBase::Timestamp", BooleanValue(false));
-    Config::SetDefault("ns3::TcpSocketBase::Sack", BooleanValue(false));
+    Config::SetDefault("ns3::TcpSocketBase::Timestamp", BooleanValue(timestamps));
+    Config::SetDefault("ns3::TcpSocketBase::Sack", BooleanValue(sack));
     Config::SetDefault("ns3::RttEstimator::InitialEstimation", TimeValue(MicroSeconds(100)));
     Config::SetDefault("ns3::TcpSocketBase::ReTxThreshold", UintegerValue(dupThresh));
     // reference model: classic NewReno recovery, no limited transmit (TwiNS implements these)
@@ -543,7 +583,10 @@ int main(int argc, char *argv[])
         Ptr<TrafficControlLayer> tc = (*it)->GetObject<TrafficControlLayer>();
         for (uint32_t d = 0; d < (*it)->GetNDevices(); d++)
         {
-            Ptr<QueueDisc> q = tc ? tc->GetRootQueueDiscOnDevice((*it)->GetDevice(d)) : nullptr;
+            Ptr<NetDevice> device = (*it)->GetDevice(d);
+            if (g_wire.is_open() && DynamicCast<PointToPointNetDevice>(device))
+                device->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&TraceWire, (*it)->GetId(), d));
+            Ptr<QueueDisc> q = tc ? tc->GetRootQueueDiscOnDevice(device) : nullptr;
             if (!q || !DynamicCast<RedQueueDisc>(q))
                 continue;
             q->TraceConnectWithoutContext("Drop", MakeBoundCallback(+[](int, Ptr<const QueueDiscItem>) { g_drops++; }, 0));
@@ -565,19 +608,38 @@ int main(int argc, char *argv[])
                         auto ip = DynamicCast<const Ipv4QueueDiscItem>(item);
                         if (!ip)
                             return;
+                        const char *kind = "F";
+                        uint32_t sa = ip->GetHeader().GetIdentification();
+                        uint32_t payload = 0;
                         TcpHeader th;
-                        item->GetPacket()->PeekHeader(th);
-                        uint32_t pl = item->GetPacket()->GetSize() - th.GetSerializedSize();
-                        uint8_t fl = th.GetFlags();
-                        const char *kind = pl ? "D" : (fl & TcpHeader::SYN) ? ((fl & TcpHeader::ACK) ? "SA" : "S") : "A";
-                        uint32_t sa = pl ? th.GetSequenceNumber().GetValue() - 1 : th.GetAckNumber().GetValue() - 1;
-                        if (fl & TcpHeader::SYN)
-                            sa = 0;
+                        if (!ip->GetHeader().GetFragmentOffset())
+                        {
+                            item->GetPacket()->PeekHeader(th);
+                            payload = item->GetPacket()->GetSize() - th.GetSerializedSize();
+                            uint8_t fl = th.GetFlags();
+                            kind = payload ? "D" : (fl & TcpHeader::SYN) ? ((fl & TcpHeader::ACK) ? "SA" : "S") : "A";
+                            sa = payload ? th.GetSequenceNumber().GetValue() - 1 : th.GetAckNumber().GetValue() - 1;
+                            if (fl & TcpHeader::SYN)
+                                sa = 0;
+                        }
                         std::cout << "Q " << Simulator::Now().GetPicoSeconds() << " " << node << " " << dev << " "
                                   << hostOf[ip->GetHeader().GetSource().Get()] << " " << hostOf[ip->GetHeader().GetDestination().Get()]
                                   << " " << kind << " " << sa << " " << qq->GetNPackets();
                         if (getenv("TRACE_ECN")) // (TRACE_ECN=1: the IP ECN field after this enqueue, 3: CE)
                             std::cout << " ecn " << (int)ip->GetHeader().GetEcn();
+                        if (getenv("TRACE_QMETA"))
+                        {
+                            auto ts = DynamicCast<const TcpOptionTS>(th.GetOption(TcpOption::TS));
+                            auto sackOption = DynamicCast<const TcpOptionSack>(th.GetOption(TcpOption::SACK));
+                            std::cout << ' ' << (item->GetPacket()->GetSize() + ip->GetHeader().GetSerializedSize() + 2)
+                                      << ' ' << payload << ' ' << (ts ? int64_t(ts->GetTimestamp()) : -1)
+                                      << ' ' << (ts ? int64_t(ts->GetEcho()) : -1)
+                                      << ' ' << th.HasOption(TcpOption::SACKPERMITTED)
+                                      << ' ' << (sackOption ? sackOption->GetSackList().size() : 0);
+                            if (sackOption)
+                                for (auto range : sackOption->GetSackList())
+                                    std::cout << ' ' << range.first.GetValue()-1 << ' ' << range.second.GetValue()-1;
+                        }
                         std::cout << std::endl;
                     }, qq, node, dev));
             }

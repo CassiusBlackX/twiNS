@@ -1,0 +1,9 @@
+# TCP option experiments
+
+`twins --tcp-sack=0|1 --tcp-timestamps=0|1` accepts the switches independently. A `--worlds` entry can override either switch. The ordinary entry point selects an option-capable kernel and carries the settings through width and capacity retries. A run with both options off uses the original frame layout. `--qtrace-options` adds byte lengths and negotiated option fields to an existing `--qtrace`. For a directed trace that includes packets still on the network after the last flow completes, add `--drain`.
+
+The sequential reference uses the paper's optimized Unison libraries with `--threads=0`. `native.py build` relinks the instrumented scenario against those libraries. `--traceWire` records the actual PPP frame length and header prefix and `wire.py` decodes the capture. Set `TRACE_ALLQ` to the exclusive upper picosecond bound and `TRACE_QMETA=1` for option fields. In a queue recording, `F` is a later IPv4 fragment and its sequence field is the IPv4 identification.
+
+Under timestamps a 1,460-byte TCP segment can occupy a 1,502-byte first PPP frame and a 34-byte last frame. IPv4 identification belongs to the address pair, and non-first fragments are separately routed and reassembled at the receiving host. The timestamp option currently requires a simulation horizon shorter than the 30-second IPv4 fragment timeout. The current model has no ICMP timeout traffic beyond that horizon.
+
+Run `campaign.py freeze` on the native evidence for the NewReno packet-ECMP, directed and mixed-link cases. The `matrix` command compares frozen signatures for six-field completion rows and complete ordered queue histories. `timing` records a correctness pilot followed by three timing pairs per eligible arm. `regression.py` extracts the previously accepted double-off cases and reruns them on a candidate. `s50.py` stages a committed candidate, input files and compact acceptance hashes, then verifies the returned evidence locally.

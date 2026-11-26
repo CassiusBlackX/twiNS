@@ -29,7 +29,7 @@ constexpr bool GENERAL = TWINS_GENERAL;
 #define TWINS_COLD inline
 #endif
 
-#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS == 31
+#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
 // Keep the wide frames in their owning rings and inline the two queue
 // boundaries. This avoids the gfx1200 fault on the optimized path with
 // private wide frame copies without inlining the entire TCP model.
@@ -78,7 +78,14 @@ __device__ inline ChainWord arrival_code(const Frame &p)
 #endif
 }
 
-__device__ inline uint32_t payload_of(const Frame &p) { return (p.flags & F_DATA) ? p.len - 42u : 0u; }
+__device__ inline uint32_t payload_of(const Frame &p)
+{
+#ifdef TWINS_TCP_OPTIONS
+    return p.tcp_payload;
+#else
+    return (p.flags & F_DATA) ? p.len - 42u : 0u;
+#endif
+}
 
 // ------------------------------------------------------------------ egress FIFO
 // Frames waiting for the link (not yet started); the link is a point-to-point device with
@@ -250,9 +257,27 @@ struct Fifo
                 r.src = f.to_sender ? s->fl.dst[f.flow] : s->fl.src[f.flow];
                 r.dst = f.to_sender ? s->fl.src[f.flow] : s->fl.dst[f.flow];
                 r.sa = f.sa;
+                r.fragment = 0;
+#ifdef TWINS_TCP_OPTIONS
+                r.fragment = f.fragment;
+                if (f.fragment == IP_TAIL)
+                    r.sa = f.ip_id;
+#endif
                 r.len = f.len;
                 r.qlen = (uint16_t)(nq + 1);
                 r.flags = flags;
+#ifdef TWINS_TCP_OPTIONS
+                if (s->qoptions)
+                {
+                    auto &d = s->qoptions[i];
+                    d.sacks = f.sacks;
+                    d.timestamp = f.timestamp;
+                    d.echo = f.echo;
+                    d.payload = f.fragment == IP_HEAD ? 1448 : f.fragment == IP_TAIL ? 0 : f.tcp_payload;
+                    d.ts = f.fragment != IP_TAIL && (f.tcp_options & TCP_TIMESTAMPS);
+                    d.sack_permitted = (f.flags & F_SYN) && (f.tcp_options & TCP_SACK);
+                }
+#endif
             }
         }
         if (size >= s->ring)
@@ -373,6 +398,42 @@ __device__ inline void timer_chain(HostCtx &c, ChainWord *base, int f, int64_t l
     chain_push(base + (size_t)f * CHAIN, chain_lead(lead), c.echain);
 }
 
+__device__ inline bool tcp_sack_enabled(const FlowSoA &F, int f)
+{
+#ifdef TWINS_TCP_OPTIONS
+    return GENERAL && (F.tcp_options[f] & TCP_SACK);
+#else
+    return false;
+#endif
+}
+
+#ifdef TWINS_TCP_OPTIONS
+__device__ inline uint32_t tcp_ms(int64_t now) { return uint32_t(now / 1000000000ll); }
+
+__device__ inline int64_t tcp_echo_sample(const Frame &p, int64_t now)
+{
+    if (!(p.tcp_options & TCP_TIMESTAMPS))
+        return 0;
+    const uint32_t ms = tcp_ms(now);
+    return ms > p.echo ? int64_t(ms - p.echo) * 1000000000ll : 1000000ll;
+}
+
+__device__ inline void tcp_receive_timestamp(const FlowSoA &F, const Frame &p)
+{
+    if (!(p.tcp_options & TCP_TIMESTAMPS))
+        return;
+    const int f = p.flow;
+    TcpTimestampState &state = F.timestamps[2*f + !p.to_sender];
+    if (state.recent > p.timestamp)
+        return;
+    state.recent = p.timestamp;
+    uint32_t seq = (p.flags & F_SYN) ? 0 : (p.flags & F_DATA) ? p.sa + 1 : 1;
+    uint32_t expected = p.to_sender ? (F.st[f] == S_SYN_SENT ? 0 : 1) : (F.r_up[f] ? F.rcv_nxt[f] + 1 : 0);
+    if (seq == expected && seq <= state.highest_ack)
+        state.echo = p.timestamp;
+}
+#endif
+
 __device__ inline void emit(HostCtx &c, int f, uint8_t flags, uint32_t seq, uint32_t ack, uint16_t payload, uint16_t len,
                             bool to_sender, int64_t now)
 {
@@ -386,8 +447,55 @@ __device__ inline void emit(HostCtx &c, int f, uint8_t flags, uint32_t seq, uint
     fr.flags = flags | (c.dctcp ? F_ECT : 0);
     fr.to_sender = to_sender ? 1 : 0;
     fr.up = (uint16_t)((to_sender ? F.hash_ack[f] : F.hash_data[f]) % (uint32_t)c.s->ecmp_n); // ECMP choice
+#ifdef TWINS_TCP_OPTIONS
+    fr.sacks = {};
+    fr.tcp_options = F.tcp_options[f];
+    fr.tcp_payload = payload;
+    fr.timestamp = fr.echo = fr.ip_id = 0;
+    fr.fragment = IP_WHOLE;
+    const bool sack = tcp_sack_enabled(F, f);
+    const bool ts = fr.tcp_options & TCP_TIMESTAMPS;
+    int options = ts ? 10 : 0;
+    if (flags & F_SYN)
+    {
+        options += sack ? 5 : 3; // window scale and optional SACK-permitted
+        fr.len -= 4; // the original SYN length already included the padded scale
+    }
+    else if (sack && to_sender && flags & F_ACK)
+    {
+        fr.sacks = F.rx_sacks[f];
+        if (ts && fr.sacks.count > 3)
+            fr.sacks.count = 3;
+        if (fr.sacks.count)
+            options += 2 + 8 * fr.sacks.count;
+    }
+    fr.len += (options + 3) & ~3;
+    if (ts)
+    {
+        TcpTimestampState &state = F.timestamps[2*f + to_sender];
+        fr.timestamp = tcp_ms(now);
+        fr.echo = state.echo;
+        if ((flags & (F_ACK | F_DATA)) && ack + 1 > state.highest_ack)
+            state.highest_ack = ack + 1;
+        fr.ip_id = F.pairs[F.ip_pair[2*f + to_sender]].next_id++;
+    }
+#endif
     for (int i = 0; i < CHAIN; i++)
         fr.chain[i] = c.echain[i];
+#ifdef TWINS_TCP_OPTIONS
+    if (fr.len > DATA_FRAME)
+    {
+        // The device MTU is 1,500 including IPv4, excluding PPP. Both pieces
+        // enqueue in this IP send event and subsequently route independently.
+        const uint16_t tail_len = 22 + fr.len - DATA_FRAME;
+        fr.fragment = IP_HEAD;
+        fr.len = DATA_FRAME;
+        c.nic->enqueue(fr, now);
+        fr.fragment = IP_TAIL;
+        fr.len = tail_len;
+        fr.up = F.fragment_hash[f] % uint32_t(c.s->ecmp_n);
+    }
+#endif
     c.nic->enqueue(fr, now);
 }
 
@@ -489,6 +597,49 @@ __device__ inline void it_set(const Tx &t, uint32_t i, uint8_t nf)
     }
     t.fl[k] = nf;
 }
+
+#ifdef TWINS_TCP_OPTIONS
+// The reference only marks whole sent-list items covered by a block.
+__device__ TWINS_COLD uint32_t tb_sack_update(const FlowSoA &F, int f, const SackList &list)
+{
+    Tx tx(F, f);
+    uint32_t delivered = 0;
+    for (int block = 0; block < list.count; ++block)
+    {
+        const auto range = list.block[block];
+        if (range.first > F.high[f])
+            return delivered;
+        for (uint32_t i = 0; i < tx.n && tx.end(i) <= range.last; ++i)
+        {
+            const auto flags = tx.flags(i);
+            if (tx.beg(i) < range.first || flags & IT_SACKED)
+                continue;
+            it_set(tx, i, (flags & ~IT_LOST) | IT_SACKED);
+            delivered += tx.end(i) - tx.beg(i);
+            if (!F.sack_seen[f] || F.hisack[f] <= tx.end(i))
+            {
+                F.sack_seen[f] = 1;
+                F.hisack[f] = tx.beg(i);
+            }
+        }
+    }
+    if (delivered)
+    {
+        uint32_t sacked_above = 0;
+        for (uint32_t i = tx.n; i-- > 0; )
+        {
+            if (tx.beg(i) > F.hisack[f])
+                continue;
+            uint8_t flags = tx.flags(i);
+            if (flags & IT_SACKED)
+                ++sacked_above;
+            else if (sacked_above >= DUPTHRESH)
+                it_set(tx, i, flags | IT_LOST);
+        }
+    }
+    return delivered;
+}
+#endif
 
 // insert an item at index i (start, flags; the byte counters do not change: an item is split,
 // or a new one appended before high moves)
@@ -710,6 +861,12 @@ __device__ TWINS_COLD void tb_all_lost(const FlowSoA &F, int f)
         return;
     }
     Tx t(F, f);
+    if (tcp_sack_enabled(F, f))
+    {
+        for (uint32_t i = 0; i < t.n; ++i)
+            it_set(t, i, (t.flags(i) & IT_SACKED) ? IT_SACKED : IT_LOST);
+        return;
+    }
     for (uint32_t i = 0; i < t.n; i++)
         t.fl[t.at(i)] = IT_LOST;
     F.sack_b[f] = 0;
@@ -747,7 +904,8 @@ __device__ inline uint32_t tb_discard(const FlowSoA &F, int f, uint32_t ack)
             t.head = t.at(1);
             t.n--;
             removed++;
-            delivered += e - b;
+            if (!tcp_sack_enabled(F, f) || !(fl & IT_SACKED))
+                delivered += e - b;
         }
         else
         {
@@ -791,7 +949,7 @@ __device__ inline uint32_t tb_discard(const FlowSoA &F, int f, uint32_t ack)
 
 // TcpTxBuffer::NextSeg without SACK (rules 1 and 2): the first lost item that was neither
 // retransmitted nor sacked, below the highest sack; else new data
-__device__ inline bool tb_next_seg(const FlowSoA &F, int f, uint32_t *seq)
+__device__ inline bool tb_next_seg(const FlowSoA &F, int f, uint32_t *seq, bool allow_rule3 = true)
 {
     if ((!GENERAL || F.simple[f]))
     {
@@ -816,6 +974,34 @@ __device__ inline bool tb_next_seg(const FlowSoA &F, int f, uint32_t *seq)
             return true;
         }
         return false;
+    }
+    if (tcp_sack_enabled(F, f))
+    {
+        Tx tx(F, f);
+        uint32_t rule3 = UINT32_MAX;
+        for (uint32_t i = 0; i < tx.n; ++i)
+        {
+            uint32_t start = tx.beg(i);
+            uint8_t flags = tx.flags(i);
+            if ((flags & (IT_RETX | IT_SACKED)) || (F.sack_seen[f] && start >= F.hisack[f]))
+                continue;
+            if (flags & IT_LOST)
+            {
+                *seq = start;
+                return true;
+            }
+            if (allow_rule3 && rule3 == UINT32_MAX && F.cong[f] == C_RECOVERY)
+                rule3 = start;
+        }
+        if (F.tail[f] > F.high[f])
+        {
+            *seq = F.high[f];
+            return true;
+        }
+        if (rule3 == UINT32_MAX)
+            return false;
+        *seq = rule3;
+        return true;
     }
     if (F.cand_n[f] > 0)
     {
@@ -1057,7 +1243,7 @@ __device__ inline void rtt_history(const Sim &s, int f, uint32_t seq, uint32_t s
 
 // TcpSocketBase::EstimateRtt (data ACKs): a sample from the oldest entry if this ACK covers it
 // and it was not retransmitted; covered entries are removed
-__device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now);
+__device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now, int64_t echo_sample);
 
 
 __device__ TWINS_COLD uint32_t cub_ssthresh(const FlowSoA &F, int f);
@@ -1098,7 +1284,7 @@ __device__ inline void rtt_sample(const FlowSoA &F, int f, int64_t m)
     F.rto[f] = rto > (MUT(4) ? 1200000000ll : MIN_RTO_PS) ? rto : (MUT(4) ? 1200000000ll : MIN_RTO_PS);
 }
 
-__device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now)
+__device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now, int64_t echo_sample)
 {
     const FlowSoA &F = s.fl;
     if (!GENERAL)
@@ -1119,8 +1305,8 @@ __device__ inline void rtt_ack(const Sim &s, int f, uint32_t ack, int64_t now)
         return;
     Hist h(F, f);
     uint32_t k = h.at(0);
-    if (!(h.cnt[k] & 0x80000000u) && ack >= h.seq[k] + h.cnt[k])
-        rtt_sample(F, f, now - h.t[k]);
+    if ((echo_sample || !(h.cnt[k] & 0x80000000u)) && ack >= h.seq[k] + (h.cnt[k] & 0x7FFFFFFFu))
+        rtt_sample(F, f, echo_sample ? echo_sample : now - h.t[k]);
     while (h.n > 0)
     {
         k = h.at(0);
@@ -1213,7 +1399,7 @@ __device__ inline void do_retransmit(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
     uint32_t seq;
-    if (!tb_next_seg(F, f, &seq))
+    if (!tb_next_seg(F, f, &seq, false))
         seq = F.una[f];
     if (F.una[f] >= F.tail[f])
         return; // (an empty buffer: only a FIN could be resent)
@@ -1493,12 +1679,15 @@ __device__ inline void new_ack(HostCtx &c, int f, uint32_t ack, bool reset_rto, 
 __device__ TWINS_COLD void enter_recovery(HostCtx &c, int f, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
-    tb_add_reno_sack(F, f); // one segment has left the network
-    tb_mark_head_lost(F, f);
+    const bool sack = tcp_sack_enabled(F, f);
+    if (!sack)
+        tb_add_reno_sack(F, f); // one segment has left the network
+    if (!sack || !tb_head_lost(F, f))
+        tb_mark_head_lost(F, f);
     F.recover[f] = F.high[f];
     F.recover_active[f] = 1;
     F.cong[f] = C_RECOVERY;
-    F.ssthresh[f] = ssthresh_for(c, f, inflight(F, f) + MSS); // the head still counts without SACK
+    F.ssthresh[f] = ssthresh_for(c, f, inflight(F, f) + (sack ? 0 : MSS));
     F.cwnd[f] = F.ssthresh[f];                                 // TcpClassicRecovery::EnterRecovery
     // the head goes out with SendDataPacket directly: m_nextTxSequence is not moved (unlike
     // DoRetransmit), which matters for DCTCP's observation window
@@ -1524,9 +1713,11 @@ __device__ TWINS_COLD void messages_acked(HostCtx &c, int f, int64_t now)
 }
 
 // TcpSocketBase::ReceivedAck + ProcessAck (no SACK, classic recovery, no limited transmit)
-__device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t now)
+__device__ inline void on_ack(HostCtx &c, int f, const Frame &packet, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
+    const uint32_t ack = packet.sa;
+    const bool ece = packet.flags & F_ECE;
     if (F.st[f] != S_EST)
         return;
 #ifdef NS_TRACE
@@ -1536,13 +1727,23 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
                inflight(F, f), tb_items(F, f));
 #endif
     uint32_t old = F.una[f];
+    const bool sack = tcp_sack_enabled(F, f);
+    uint32_t sacked = 0;
+#ifdef TWINS_TCP_OPTIONS
+    if (sack && packet.sacks.count)
+        sacked = tb_sack_update(F, f, packet.sacks);
+#endif
     if (ack < old)
         return;
-    rtt_ack(*c.s, f, ack, now); // EstimateRtt (DoForwardUp)
+    int64_t echo_sample = 0;
+#ifdef TWINS_TCP_OPTIONS
+    echo_sample = tcp_echo_sample(packet, now);
+#endif
+    rtt_ack(*c.s, f, ack, now, echo_sample); // EstimateRtt (DoForwardUp)
     bool advancing = ack > old;
-    uint32_t delivered = 0;
+    uint32_t delivered = sacked;
     if (advancing)
-        delivered = tb_discard(F, f, ack); // TcpTxBuffer::DiscardUpTo; una = ack
+        delivered += tb_discard(F, f, ack); // TcpTxBuffer::DiscardUpTo; una = ack
     if (F.cong[f] == C_CWR && ack > F.recover[f])
     {
         F.cong[f] = C_OPEN;
@@ -1570,7 +1771,7 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
     }
 
     // ProcessAck
-    bool dupack = ack == old && ack < F.high[f];
+    bool dupack = sack ? sacked > 0 : ack == old && ack < F.high[f];
     uint32_t old_dup = F.dupacks[f];
     if (dupack)
     {
@@ -1582,10 +1783,13 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
             if (cg == C_OPEN)
                 F.cong[f] = cg = C_DISORDER;
             if (cg == C_RECOVERY)
-                tb_add_reno_sack(F, f); // one segment has left the network
+            {
+                if (!sack)
+                    tb_add_reno_sack(F, f); // one segment has left the network
+            }
             else if (cg == C_DISORDER)
             {
-                if (F.dupacks[f] == (MUT(1) ? 4 : DUPTHRESH) && (old >= F.recover[f] || !F.recover_active[f]))
+                if (F.dupacks[f] == (MUT(1) ? 4 : DUPTHRESH) && (F.una[f] >= F.recover[f] || !F.recover_active[f]))
                     enter_recovery(c, f, now);
                 else if (tb_head_lost(F, f))
                     enter_recovery(c, f, now); // IsLost(HighACK)
@@ -1622,7 +1826,8 @@ __device__ inline void on_ack(HostCtx &c, int f, uint32_t ack, bool ece, int64_t
         {
             // partial ACK: the head is lost; retransmit it unless the item that this ACK plus one
             // segment would complete was retransmitted already
-            tb_mark_head_lost(F, f);
+            if (!sack)
+                tb_mark_head_lost(F, f);
             if (!tb_retx_ends_at(F, f, ack + MSS) && !MUT(23))
                 do_retransmit(c, f, now);
             pkts_acked(c, f, 1, ack, now);
@@ -1838,6 +2043,36 @@ __device__ inline void snd_ecn(HostCtx &c, int f, const Frame &p)
     }
 }
 
+#ifdef TWINS_TCP_OPTIONS
+// Keep the four most recently advertised ranges, separate from the receive
+// buffer. An evicted range may still occupy the buffer with no SACK entry.
+__device__ inline void rx_note_sack(SackList &list, SackBlock added)
+{
+    for (int i = 0; i < list.count; )
+    {
+        auto old = list.block[i];
+        if (old.last != added.first && old.first != added.last)
+        {
+            ++i;
+            continue;
+        }
+        if (old.last == added.first)
+            added.first = old.first;
+        else
+            added.last = old.last;
+        --list.count;
+        for (int j = i; j < list.count; ++j)
+            list.block[j] = list.block[j + 1];
+        i = 0;
+    }
+    if (list.count < 4)
+        ++list.count;
+    for (int i = list.count - 1; i > 0; --i)
+        list.block[i] = list.block[i - 1];
+    list.block[0] = added;
+}
+#endif
+
 // TcpRxBuffer::Add for [seq, end): stores the bytes not held yet (false if there are none) and
 // advances rcv_nxt over contiguous data and the FIN. The PacketSink reads in-order data at once,
 // so the stored blocks are the out-of-order data: disjoint, sorted, beyond rcv_nxt.
@@ -1880,6 +2115,19 @@ __device__ inline bool rx_add(const Sim &s, int f, uint32_t seq, uint32_t end)
             ue = be[at(j)];
         j++;
     }
+#ifdef TWINS_TCP_OPTIONS
+    const bool sack = tcp_sack_enabled(F, f);
+    uint32_t stored_head = head, stored_end = end;
+    if (sack)
+        for (uint32_t k = i; k < j; ++k)
+        {
+            const uint32_t first = bs[at(k)], last = be[at(k)];
+            if (first < stored_head && stored_head < last)
+                stored_head = last;
+            if (first < stored_end && stored_end < last)
+                stored_end = first;
+        }
+#endif
     if (j == i)
     {
         if (n >= cap)
@@ -1917,6 +2165,19 @@ __device__ inline bool rx_add(const Sim &s, int f, uint32_t seq, uint32_t end)
     }
     F.ooo_h[f] = n ? h : 0;
     F.ooo_n[f] = n;
+#ifdef TWINS_TCP_OPTIONS
+    if (sack)
+    {
+        auto &reported = F.rx_sacks[f];
+        if (stored_head > F.rcv_nxt[f] && stored_head < stored_end)
+            rx_note_sack(reported, {stored_head, stored_end});
+        int kept = 0;
+        for (int k = 0; k < reported.count; ++k)
+            if (reported.block[k].last > F.rcv_nxt[f])
+                reported.block[kept++] = reported.block[k];
+        reported.count = kept;
+    }
+#endif
     if (F.r_fin[f] >= 0 && F.rcv_nxt[f] == (uint32_t)F.r_fin[f])
         F.rcv_nxt[f]++; // the FIN
     return true;
@@ -2174,11 +2435,16 @@ __device__ TWINS_COLD void app_write(HostCtx &c, int f, int64_t now)
     }
 }
 
-__device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
+__device__ inline void on_tcp_frame(HostCtx &c, const Frame &p, int64_t now)
 {
     const Sim &s = *c.s;
     const FlowSoA &F = s.fl;
     int f = (int)p.flow;
+    int64_t echo_sample = 0;
+#ifdef TWINS_TCP_OPTIONS
+    tcp_receive_timestamp(F, p);
+    echo_sample = tcp_echo_sample(p, now);
+#endif
     if (p.to_sender)
     {
         if (p.flags & F_SYN)
@@ -2191,7 +2457,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
                 // the first RTT sample, from the first SYN even if it was retransmitted: ns-3's
                 // UpdateRttHistory cannot mark the zero-length SYN entry as retransmitted, so a
                 // SYN timeout yields a ~10 ms sample (and a ~30 ms RTO)
-                rtt_sample(F, f, now - F.timing_time[f]);
+                rtt_sample(F, f, echo_sample ? echo_sample : now - F.timing_time[f]);
                 emit(c, f, F_ACK, 0, 0, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
                 // ConnectionSucceeded (ScheduleNow) lets the application write its due messages
                 ChainWord parent[CHAIN];
@@ -2208,7 +2474,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
             if (F.fin[f] & FIN_TW)
                 return;
             snd_ecn(c, f, p);
-            on_ack(c, f, p.sa, p.flags & F_ECE, now);
+            on_ack(c, f, p, now);
             F.fin[f] |= FIN_TW;
             emit(c, f, F_ACK, 0, 1, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
         }
@@ -2217,7 +2483,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
             if (F.fin[f] & FIN_TW)
                 return;
             snd_ecn(c, f, p);
-            on_ack(c, f, p.sa, p.flags & F_ECE, now);
+            on_ack(c, f, p, now);
         }
         return;
     }
@@ -2225,7 +2491,7 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
     // segment that acknowledges it
     if (!(p.flags & F_SYN) && F.r_up[f] && F.r_srtt[f] < 0 && F.r_synack_t[f] >= 0)
     {
-        int64_t m = now - F.r_synack_t[f];
+        int64_t m = echo_sample ? echo_sample : now - F.r_synack_t[f];
         F.r_srtt[f] = m;
         F.r_rttvar[f] = m / 2;
     }
@@ -2268,6 +2534,65 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
         listener_ecn(c, p); // (a pure ACK after the endpoint is gone: at the listener)
 }
 
+#ifdef TWINS_TCP_OPTIONS
+__device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
+{
+    const auto &s = *c.s;
+    const auto &F = s.fl;
+    const auto &pair = F.pairs[F.ip_pair[2*p.flow]];
+    auto &entry = F.fragments[pair.offset + (p.ip_id & pair.mask)];
+    if (entry.mask && entry.id != p.ip_id && now < entry.expires)
+    {
+        atomicAdd(&s.ev[34], 1ull);
+        atomicAdd(&s.ev[5], 1ull);
+        atomicAdd(&s.active_ovf_w[c.h / s.H1], 1ull);
+        return;
+    }
+    if (!entry.mask || now >= entry.expires)
+    {
+        entry.id = p.ip_id;
+        entry.mask = 0;
+        entry.expires = now + IP_FRAGMENT_TIMEOUT;
+    }
+    if (p.fragment == IP_HEAD)
+    {
+        entry.flow = p.flow;
+        entry.seq = p.sa;
+        entry.timestamp = p.timestamp;
+        entry.echo = p.echo;
+        entry.payload = p.tcp_payload;
+        entry.flags = p.flags;
+    }
+    entry.mask |= p.fragment;
+    if (entry.mask != (IP_HEAD | IP_TAIL))
+        return;
+    entry.mask = 0;
+    // The upper-layer receive belongs to the completing fragment's event.
+    // ns-3 keeps the IP ECN field of that fragment and the TCP header of the first.
+    Frame complete;
+    complete.flow = entry.flow;
+    complete.sa = entry.seq;
+    complete.to_sender = 0;
+    complete.flags = (entry.flags & ~(F_ECT | F_CE)) | (p.flags & (F_ECT | F_CE));
+    complete.tcp_payload = entry.payload;
+    complete.tcp_options = F.tcp_options[entry.flow];
+    complete.timestamp = entry.timestamp;
+    complete.echo = entry.echo;
+    on_tcp_frame(c, complete, now);
+}
+#endif
+
+__device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
+{
+#ifdef TWINS_TCP_OPTIONS
+    if (p.fragment != IP_WHOLE)
+    {
+        on_fragment(c, p, now);
+        return;
+    }
+#endif
+    on_tcp_frame(c, p, now);
+}
 
 
 // the event-order chain of a timer
@@ -2669,6 +2994,10 @@ __device__ inline int route(const Sim &s, int sw, const Frame &p, int ep = 0)
         if (e == x)
             return s.host_port[dst];
         uint32_t h = p.to_sender ? s.fl.hash_ack[p.flow] : s.fl.hash_data[p.flow];
+#ifdef TWINS_TCP_OPTIONS
+        if (p.fragment == IP_TAIL)
+            h = s.fl.fragment_hash[p.flow];
+#endif
         return route_up(s, sw, p.dst_node, (int)(h % s.rt_n[((size_t)ep * s.S1 + x) * s.S1 + e]), ep);
     }
     return route_up(s, sw, p.dst_node, p.up);

@@ -189,12 +189,16 @@ int main(int argc, char **argv)
     int k = 4, graph_k = 64;
     std::string flow_file, output = "fct.csv", tcp = "dctcp", ecmp_from, qtrace_file;
     int hash_check = 0;
+    bool qtrace_options = false;
+    bool drain = false;
     long long qtrace_until = 0, qtrace_from = 0;
     int host_lanes = 0; // 0: chosen from the host count
     int ooo_segs = 0;   // per-flow caps; 0: default
     int rtt_ring = 0;
     std::string topo = "fattree", worlds_file, topo_file, dump_routes, fail_spec;
     int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0, spray = 0;
+    int tcp_sack = 0, tcp_timestamps = 0;
+    auto option_value = [](const std::string &v) { return v == "0" ? 0 : v == "1" ? 1 : -1; };
     long long rng_seed = 1, rng_run = 1;
     bool force_general = false;
     bool no_compact = false; // --general: the general model (sent list, kernel) for everything (tests)
@@ -216,10 +220,18 @@ int main(int argc, char **argv)
             output = val("--out=");
         else if (a.rfind("--tcp=", 0) == 0)
             tcp = val("--tcp=");
+        else if (a.rfind("--tcp-sack=", 0) == 0)
+            tcp_sack = option_value(val("--tcp-sack="));
+        else if (a.rfind("--tcp-timestamps=", 0) == 0)
+            tcp_timestamps = option_value(val("--tcp-timestamps="));
         else if (a.rfind("--max_slots=", 0) == 0)
             max_slots = std::stoll(val("--max_slots="));
         else if (a.rfind("--qtrace=", 0) == 0)
             qtrace_file = val("--qtrace=");
+        else if (a == "--qtrace-options")
+            qtrace_options = true;
+        else if (a == "--drain")
+            drain = true;
         else if (a.rfind("--qtrace_from=", 0) == 0)
             qtrace_from = std::stoll(val("--qtrace_from="));
         else if (a.rfind("--qtrace_until=", 0) == 0)
@@ -323,12 +335,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: twins (--k=<4..32> | --topo=leafspine --leaves=L --spines=S --hpl=N | --topo=graph --topofile=F)\n"
                         "         (--flows=<csv> [--out=csv] [--tcp=dctcp|newreno|cubic] [--ecnK=30] [--queue=200] [--fin=0|1]\n"
                         "          [--ecmp_from=csv [--hash_check=1]] [--spray=1 [--RngSeed=1 --RngRun=1]]\n"
-                        "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,ecmp_from=..,out=..)\n"
+                        "          [--tcp-sack=0|1] [--tcp-timestamps=0|1]\n"
+                        "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,tcp-sack=..,tcp-timestamps=..,ecmp_from=..,out=..\n"
                         "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
         return 1;
     }
     Sim s;
     memset(&s, 0, sizeof(s));
+    s.drain = drain;
     // ---- worlds: independent simulations run side by side as disjoint copies of the topology
     struct World
     {
@@ -336,11 +350,12 @@ int main(int argc, char **argv)
         uint8_t cc = CC_DCTCP;
         int red_k = RED_K, qcap = QDISC_CAP;
         int fin = 0;
+        int sack = 0, timestamps = 0;
     };
     auto cc_of = [](const std::string &t) -> int { return t == "dctcp" ? CC_DCTCP : t == "newreno" ? CC_NEWRENO : t == "cubic" ? CC_CUBIC : -1; };
     std::vector<World> worlds;
     if (worlds_file.empty())
-        worlds.push_back({flow_file, ecmp_from, output, (uint8_t)cc_of(tcp), ecn_k, queue_pkts, fin});
+        worlds.push_back({flow_file, ecmp_from, output, (uint8_t)cc_of(tcp), ecn_k, queue_pkts, fin, tcp_sack, tcp_timestamps});
     else
     {
         std::ifstream in(worlds_file);
@@ -354,6 +369,8 @@ int main(int argc, char **argv)
             w.red_k = ecn_k;
             w.qcap = queue_pkts;
             w.fin = fin;
+            w.sack = tcp_sack;
+            w.timestamps = tcp_timestamps;
             std::stringstream ss(line);
             std::string kv;
             while (std::getline(ss, kv, ','))
@@ -370,6 +387,10 @@ int main(int argc, char **argv)
                     w.qcap = std::stoi(v);
                 else if (key == "fin")
                     w.fin = std::stoi(v);
+                else if (key == "tcp-sack")
+                    w.sack = option_value(v);
+                else if (key == "tcp-timestamps")
+                    w.timestamps = option_value(v);
                 else if (key == "ecmp_from")
                     w.ecmp_from = v;
                 else if (key == "out")
@@ -388,6 +409,23 @@ int main(int argc, char **argv)
             worlds.push_back(w);
         }
     }
+    if (worlds.empty() || tcp_sack < 0 || tcp_timestamps < 0 ||
+        std::any_of(worlds.begin(), worlds.end(), [](const World &w) { return w.sack < 0 || w.timestamps < 0; }))
+    {
+        fprintf(stderr, "TCP option values must be 0 or 1 and the batch must contain worlds\n");
+        return 1;
+    }
+#ifndef TWINS_TCP_OPTIONS
+    if (qtrace_options || std::any_of(worlds.begin(), worlds.end(), [](const World &w) { return w.sack || w.timestamps; }))
+    {
+        auto path = std::filesystem::canonical("/proc/self/exe").string();
+        auto links = path.rfind("-links");
+        path.insert(links != std::string::npos && links == path.size() - 6 ? links : path.size(), "-options");
+        execv(path.c_str(), argv);
+        perror("starting TCP options kernel");
+        return 1;
+    }
+#endif
     const int W = (int)worlds.size();
     // graph: the ports of each node in link order, the hosts' switches, the equal-cost tables
     std::vector<int> g_deg, g_hsw, g_hport;
@@ -739,6 +777,10 @@ int main(int argc, char **argv)
 #undef NS_INIT
     }
     std::vector<uint64_t> conn_bytes(F, 0);
+#ifdef TWINS_TCP_OPTIONS
+    std::vector<uint32_t> fragment_hash(F);
+    const bool timestamp_world = std::any_of(worlds.begin(), worlds.end(), [](const World &w) { return w.timestamps; });
+#endif
     {
         for (int c = 0; c < F; c++)
         {
@@ -747,10 +789,11 @@ int main(int argc, char **argv)
             recs[c].dst = first.dst;
             recs[c].m_first = mnew[conn_msgs[c][0]];
             recs[c].m_cnt = (int)conn_msgs[c].size();
-            recs[c].fin_on = (uint8_t)(worlds[first.src / H1].fin != 0);
+            const World &world = worlds[first.src / H1];
+            recs[c].fin_on = (uint8_t)(world.fin != 0);
             for (int m : conn_msgs[c])
                 recs[c].r_size += (uint32_t)flows[m].size;
-            recs[c].simple = (uint8_t)(conn_msgs[c].size() == 1 && !no_compact);
+            recs[c].simple = (uint8_t)(conn_msgs[c].size() == 1 && !no_compact && !world.sack && !world.timestamps);
             force_general |= no_compact;
             for (int m : conn_msgs[c])
                 conn_bytes[c] += flows[m].size;
@@ -803,6 +846,9 @@ int main(int argc, char **argv)
                 const uint32_t a = ip(recs[c].src % H1), b = ip(recs[c].dst % H1);
                 recs[c].hash_data = hash(a, b, sport, dport);
                 recs[c].hash_ack = hash(b, a, dport, sport);
+#ifdef TWINS_TCP_OPTIONS
+                fragment_hash[c] = hash(a, b, 0, 0);
+#endif
             }
         }
         int hash_same = 0, hash_n = 0;
@@ -895,6 +941,60 @@ int main(int argc, char **argv)
         s.fl.snd = dupload(sr);
         s.fl.rcv = dupload(rr);
     }
+#ifdef TWINS_TCP_OPTIONS
+    {
+        std::vector<uint8_t> options;
+        options.reserve(F);
+        for (const auto &f : recs)
+        {
+            const auto &w = worlds[f.src / H1];
+            options.push_back((w.sack ? TCP_SACK : 0) | (w.timestamps ? TCP_TIMESTAMPS : 0));
+        }
+        s.fl.tcp_options = dupload(options);
+        s.fl.rx_sacks = dalloc<SackList>(F);
+        if (timestamp_world)
+        {
+            s.fl.timestamps = dalloc<TcpTimestampState>(size_t(F) * 2);
+            std::map<std::pair<int,int>,uint32_t> pair_index;
+            std::vector<uint32_t> conn_pair(size_t(F) * 2);
+            std::vector<uint64_t> expected;
+            auto pair = [&](int src, int dst) {
+                auto entry = pair_index.emplace(std::make_pair(src,dst), pair_index.size());
+                if (entry.second)
+                    expected.push_back(0);
+                return entry.first->second;
+            };
+            for (int f = 0; f < F; ++f)
+            {
+                if (!(options[f] & TCP_TIMESTAMPS))
+                    continue;
+                uint32_t forward = pair(recs[f].src, recs[f].dst);
+                conn_pair[2*f] = forward;
+                conn_pair[2*f+1] = pair(recs[f].dst, recs[f].src);
+                expected[forward] += (conn_bytes[f] + MSS - 1) / MSS + recs[f].m_cnt + 8;
+            }
+            std::vector<FragmentPair> pairs(expected.size());
+            size_t entries = 0;
+            for (size_t i = 0; i < expected.size(); ++i)
+            {
+                uint32_t cap = 1;
+                if (expected[i])
+                {
+                    uint64_t want = exact_active ? 65536 : std::min<uint64_t>(65536, 4 * expected[i]);
+                    cap = 64;
+                    while (cap < want)
+                        cap *= 2;
+                }
+                pairs[i] = {entries, cap - 1, 0};
+                entries += cap;
+            }
+            s.fl.pairs = dupload(pairs);
+            s.fl.ip_pair = dupload(conn_pair);
+            s.fl.fragment_hash = dupload(fragment_hash);
+            s.fl.fragments = dalloc<FragmentEntry>(entries);
+        }
+    }
+#endif
     // the global view: static and sender fields in the sender records, receiver fields in the
     // receiver records
 #define NS_BASE_S(T, n, v) s.fl.n.base = reinterpret_cast<char *>(s.fl.snd) + offsetof(SndRec, n);
@@ -1081,7 +1181,7 @@ int main(int argc, char **argv)
         int64_t longest = link_serialization_ps(DATA_FRAME, l.bps);
         if (longest > INT64_MAX - l.delay_ps) return 1;
         max_lead = std::max(max_lead, longest + l.delay_ps);
-        shortest_tx = std::min(shortest_tx, link_serialization_ps(CTRL_FRAME, l.bps));
+        shortest_tx = std::min(shortest_tx, link_serialization_ps(MIN_FRAME, l.bps));
         if (rate_ids.emplace(l.bps, rate_ids.size()).second)
             for (int n = 0; n <= DATA_FRAME; ++n)
                 table.push_back(link_serialization_ps(n, l.bps));
@@ -1120,6 +1220,13 @@ int main(int argc, char **argv)
     printf("TCP heterogeneous slot %lld ps, %d banks, %d frames/slot, %zu-byte frame, %d history runs\n",
            (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
 #endif
+#ifdef TWINS_TCP_OPTIONS
+    if (timestamp_world && (max_slots <= 0 || max_slots >= IP_FRAGMENT_TIMEOUT / slot_width(s)))
+    {
+        fprintf(stderr, "TCP timestamps currently require a simulation horizon shorter than the IPv4 fragment timeout\n");
+        return 1;
+    }
+#endif
     printf("TCP arrival ring links=%d banks=%d frames_per_link_bucket=%d frame_bytes=%zu allocation_bytes=%zu\n",
            s.L, banks, tx_capacity, sizeof(Frame), (size_t)banks * s.L * (tx_capacity * sizeof(Frame) + sizeof(long long)));
     s.msg = dalloc<Frame>((size_t)banks * s.L * tx_capacity);
@@ -1153,6 +1260,10 @@ int main(int argc, char **argv)
     {
         s.qtrace_n = 20000000;
         s.qtrace = dalloc<QRec>(s.qtrace_n);
+#ifdef TWINS_TCP_OPTIONS
+        if (qtrace_options)
+            s.qoptions = dalloc<QOptionRec>(s.qtrace_n);
+#endif
     }
     int *h_finished;
     CHECK(cudaHostAlloc((void **)&h_finished, sizeof(int), cudaHostAllocMapped));
@@ -1247,6 +1358,9 @@ int main(int argc, char **argv)
 #ifdef TWINS_TCP_TIMER_ORDER
     printf("timer creation order: %llu chain ties resolved by exact per-host scheduling sequence\n",ev[33]);
 #endif
+#ifdef TWINS_TCP_OPTIONS
+    printf("IPv4 fragment-ovf %llu\n", ev[34]);
+#endif
     if (ev[25])
         printf("undecided-ties by cause: lossy %llu trunc %llu same-root %llu count %llu no-root %llu timers %llu short %llu\n", ev[26], ev[27],
                ev[28], ev[29], ev[30], ev[31], ev[32]);
@@ -1261,22 +1375,63 @@ int main(int argc, char **argv)
     {
         unsigned long long n;
         CHECK(cudaMemcpy(&n, s.qtrace_cnt, 8, cudaMemcpyDeviceToHost));
-        n = std::min(n, s.qtrace_n);
+        if (n > s.qtrace_n)
+        {
+            fprintf(stderr, "queue trace exceeded capacity: %llu records, cap %llu\n", n, s.qtrace_n);
+            return 1;
+        }
         std::vector<QRec> q = ddown(s.qtrace, n);
-        std::stable_sort(q.begin(), q.end(), [](const QRec &a, const QRec &b) {
+        auto before = [](const QRec &a, const QRec &b) {
             if (a.ts != b.ts)
                 return a.ts < b.ts;
             if (a.node != b.node)
                 return a.node < b.node;
             return a.dev < b.dev;
-        });
-        FILE *o = fopen(qtrace_file.c_str(), "w");
-        for (const QRec &r : q)
+        };
+#ifdef TWINS_TCP_OPTIONS
+        std::vector<QOptionRec> details;
+        std::vector<uint32_t> order;
+        if (s.qoptions)
         {
-            const char *kind = (r.flags & F_DATA) ? "D" : (r.flags & F_SYN) ? ((r.flags & F_ACK) && r.len == SYN_FRAME ? "SA" : "S") : "A";
-            if ((r.flags & F_SYN) && (r.flags & F_ACK))
-                kind = "SA";
-            fprintf(o, "%lld %d %d %d %d %s %u %d\n", (long long)r.ts, r.node, r.dev, r.src, r.dst, kind, r.sa, r.qlen);
+            details = ddown(s.qoptions, n);
+            order.resize(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return before(q[a], q[b]); });
+        }
+        else
+#endif
+            std::stable_sort(q.begin(), q.end(), before);
+        FILE *o = fopen(qtrace_file.c_str(), "w");
+        if (!o)
+        {
+            perror(qtrace_file.c_str());
+            return 1;
+        }
+        for (size_t i = 0; i < q.size(); ++i)
+        {
+            size_t index = i;
+#ifdef TWINS_TCP_OPTIONS
+            if (!order.empty())
+                index = order[i];
+#endif
+            const auto &r = q[index];
+            const char *kind = (r.flags & F_DATA) ? "D" : (r.flags & F_SYN) ? (r.flags & F_ACK ? "SA" : "S") : "A";
+#ifdef TWINS_TCP_OPTIONS
+            if (r.fragment == IP_TAIL)
+                kind = "F";
+#endif
+            fprintf(o, "%lld %d %d %d %d %s %u %d", (long long)r.ts, r.node, r.dev, r.src, r.dst, kind, r.sa, r.qlen);
+#ifdef TWINS_TCP_OPTIONS
+            if (!details.empty())
+            {
+                const auto &d = details[index];
+                fprintf(o, " %u %u %lld %lld %u %u", r.len, d.payload, d.ts ? (long long)d.timestamp : -1,
+                        d.ts ? (long long)d.echo : -1, d.sack_permitted, d.sacks.count);
+                for (int j = 0; j < d.sacks.count; ++j)
+                    fprintf(o, " %u %u", d.sacks.block[j].first, d.sacks.block[j].last);
+            }
+#endif
+            fputc('\n', o);
         }
         fclose(o);
         printf("qtrace: %llu records\n", n);

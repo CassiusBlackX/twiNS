@@ -54,11 +54,28 @@ def run(binary, args):
         level = initial_history_level(args)
     initial_level = level
     auto_oom_retried = False
+    transport = dict(arg[2:].split("=", 1) for arg in args if arg.startswith("--tcp-") and "=" in arg)
+    requested = ("tcp-sack", "tcp-timestamps")
+
+    def option_world(world):
+        effective = transport.copy()
+        if lines is not None:
+            effective.update(item.split("=", 1) for item in lines[world].split(",") if "=" in item)
+        return any(effective.get(key) == "1" for key in requested)
+
+    def extended(ids):
+        return "--topo=graph" in args and any(option_world(world) for world in ids)
+
     with tempfile.TemporaryDirectory() as tmp:
         def attempt(ids, level, expanded):
             nonlocal sim, total_flows, auto_oom_retried
-            cmd = [str(binary if level == 0 else binary.with_name(f"twins{sizes[level]}")),
-                   "--single-pass", *args]
+            if level == len(sizes):
+                target = binary.with_name("twins2048-options-links")
+            else:
+                target = binary if level == 0 else binary.with_name(f"twins{sizes[level]}")
+                if "--qtrace-options" in args or any(option_world(world) for world in ids):
+                    target = target.with_name(target.name + "-options")
+            cmd = [str(target), "--single-pass", *args]
             if expanded:
                 cmd.append("--size-active")
             if lines is not None:
@@ -97,8 +114,8 @@ def run(binary, args):
                 total_flows += int(complete[1])
             active = affected("active-ovf")
             ties = affected("undecided-ties")
-            layout = re.search(r"(\d+)-byte frame", log)
-            frame_bytes = int(layout[1]) if layout else sizes[level]
+            layout = re.search(r"\bframe_bytes=(\d+)", log)
+            frame_bytes = int(layout[1]) if layout else 0
             print(f"TCP pass bytes={frame_bytes} sized_active={int(expanded)} worlds={len(ids)} "
                   f"active_ovf={count('active-ovf')} ties={count('undecided-ties')} "
                   f"wall_s={time.monotonic()-t:.6f}", flush=True)
@@ -113,7 +130,7 @@ def run(binary, args):
                 sys.stdout.write(log.replace(duration[0] + "\n", ""))
                 sys.stderr.write(result.stderr)
                 return complete[1] == complete[2]
-            if (active and expanded) or (ties and level + 1 == len(sizes)):
+            if (active and expanded) or (ties and level + 1 >= len(sizes) + bool(extended(ties))):
                 sys.stderr.write(log + result.stderr)
                 return False
             # Worlds with no retry keep their first-pass outputs. A separate

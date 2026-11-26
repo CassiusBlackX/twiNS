@@ -32,7 +32,13 @@ constexpr uint32_t MSS = 1460;
 constexpr int DATA_FRAME = 1460 + 40 + 2; // payload + IPv4/TCP headers + PPP
 constexpr int CTRL_FRAME = 40 + 2;        // pure ACK
 constexpr int SYN_FRAME = 40 + 4 + 2;     // SYN / SYN-ACK carry an MSS option (padded)
-constexpr int MAX_TX = 300;             // frames a link can start in one slot: 1 us / 3.36 ns (a 42-byte frame at 100G) < 300
+#ifdef TWINS_TCP_OPTIONS
+constexpr int MIN_FRAME = 23; // PPP + IPv4 + the shortest final fragment (one byte)
+constexpr int MAX_TX = SLOT_PS / (MIN_FRAME * PS_PER_BYTE) + 2;
+#else
+constexpr int MIN_FRAME = CTRL_FRAME;
+constexpr int MAX_TX = 300; // 1 us / 3.36 ns (a 42-byte frame at 100G) < 300
+#endif
 constexpr int NB = 4;                   // message ring (receivers read slots s-1 and s-2)
 constexpr int QDISC_CAP = 200;          // default RED MaxSize (packets); per queue: red_k, qcap
 constexpr int RED_K = 30;               // default RED MinTh = MaxTh (packets), QW = 1
@@ -84,6 +90,43 @@ enum : uint8_t
 };
 constexpr int DATA_RETRIES = 6; // TcpSocket::DataRetries
 
+constexpr uint8_t TCP_SACK = 1, TCP_TIMESTAMPS = 2;
+#ifdef TWINS_TCP_OPTIONS
+struct SackBlock
+{
+    uint32_t first, last; // half-open, connection-relative sequence numbers
+};
+
+struct SackList
+{
+    SackBlock block[4];
+    uint8_t count;
+};
+
+constexpr int64_t IP_FRAGMENT_TIMEOUT = 30000000000000ll;
+enum : uint8_t { IP_WHOLE, IP_HEAD, IP_TAIL };
+
+struct TcpTimestampState
+{
+    uint32_t recent, echo, highest_ack; // timestamps in ms, ACK in absolute TCP sequence space
+};
+
+struct FragmentPair
+{
+    uint64_t offset;
+    uint32_t mask;
+    uint16_t next_id;
+};
+
+struct FragmentEntry
+{
+    int64_t expires;
+    uint32_t flow, seq, timestamp, echo;
+    uint16_t id, payload;
+    uint8_t flags, mask;
+};
+#endif
+
 // A frame: 64 bytes (128 with TWINS_CHAIN_RUNS=25).
 //
 // chain[] records the frame's place in ns-3's event order (run-length encoded, see chain_push). ns-3 runs simultaneous events in the
@@ -106,9 +149,16 @@ struct alignas(16) Frame
 #ifdef TWINS_LINK_TIMING
     int64_t arrival_lead;
 #endif
+#ifdef TWINS_TCP_OPTIONS
+    SackList sacks;
+    uint32_t timestamp, echo;
+    uint16_t ip_id, tcp_payload;
+    uint8_t tcp_options;
+    uint8_t fragment;
+#endif
     ChainWord chain[CHAIN]; // queued: the enqueue event's chain; on a link: the start's
 };
-#ifndef TWINS_LINK_TIMING
+#if !defined(TWINS_LINK_TIMING) && !defined(TWINS_TCP_OPTIONS)
 static_assert(sizeof(Frame) == 24 + 2 * CHAIN, "compact frame layout");
 #endif
 static_assert(sizeof(Frame) % 16 == 0, "vector copy alignment");
@@ -303,6 +353,15 @@ struct FlowSoA
     int64_t *h_t;
     // out-of-order blocks of the receiver, [start, end), sorted (oo_cap[f] at oo_off[f])
     uint32_t *oo_s, *oo_e;
+#ifdef TWINS_TCP_OPTIONS
+    uint8_t *tcp_options;
+    SackList *rx_sacks;
+    TcpTimestampState *timestamps; // [2 * conns], sender then receiver
+    uint32_t *ip_pair;              // [2 * conns], sender's and receiver's outgoing direction
+    uint32_t *fragment_hash;        // [conns], forward fragment with ports omitted
+    FragmentPair *pairs;
+    FragmentEntry *fragments;
+#endif
 };
 
 // Flows as the application sees them: messages written to a connection at their start times.
@@ -353,8 +412,18 @@ struct QRec
     int32_t node, dev, src, dst; // ns-3 node/device numbering; source/destination host
     uint32_t sa;                 // relative seq (data) or ack
     uint16_t len, qlen;          // qlen: queue disc length after the enqueue (0: dropped)
-    uint8_t flags, pad[3];
+    uint8_t flags, fragment, pad[2];
 };
+
+#ifdef TWINS_TCP_OPTIONS
+struct QOptionRec
+{
+    SackList sacks;
+    uint32_t timestamp, echo;
+    uint16_t payload;
+    uint8_t ts, sack_permitted;
+};
+#endif
 
 enum : uint8_t
 {
@@ -399,6 +468,7 @@ struct Sim
     int host_blocks, host_lanes, sw_per_block; // host_lanes: hosts per block (one per lane)
     // TCP of a host (its world): CC_NEWRENO, CC_DCTCP (ECN), CC_CUBIC
     int ring; // egress FIFO capacity: the largest queue limit + the device queue + 1
+    bool drain; // trace through the final transmissions and timers after flow completion
     FlowSoA fl;
     MsgSoA mg;
     int *mg_first_of_world; // [worlds] the first message of each world (message keys are world-local)
@@ -419,6 +489,9 @@ struct Sim
     int64_t max_slots;
     int *error;
     struct QRec *qtrace;         // optional trace of every enqueue (--qtrace), qtrace_n records
+#ifdef TWINS_TCP_OPTIONS
+    QOptionRec *qoptions;        // optional --qtrace-options metadata for the same records
+#endif
     unsigned long long *qtrace_cnt;
     unsigned long long qtrace_n;
     int64_t qtrace_until, qtrace_from;

@@ -83,12 +83,6 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         if (ticket == gridDim.x - 1)
         {
             __threadfence();
-            unsigned int fd = atomicAdd(s.flows_done, 0u);
-            if (fd >= (unsigned int)s.M || t + 1 >= s.max_slots)
-            {
-                *s.finished = 1;
-                *s.finished_host = 1;
-            }
             // exact idle skip: nothing sent in this or the previous slot (so nothing arrives in
             // the next) and no queued frames: run next at the earliest host timer or flow start
             unsigned int cur = atomicAdd(&s.activity[0], 0u), prev = s.activity[1];
@@ -99,6 +93,13 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
 #else
             bool flight_empty = true;
 #endif
+            unsigned int fd = atomicAdd(s.flows_done, 0u);
+            bool drained = flight_empty && cur == 0 && prev == 0 && nw == ~0ull;
+            if ((fd >= (unsigned int)s.M && (!s.drain || drained)) || t + 1 >= s.max_slots)
+            {
+                *s.finished = 1;
+                *s.finished_host = 1;
+            }
             if (flight_empty && cur == 0 && prev == 0 && nw != ~0ull && (int64_t)nw > next)
                 next = (int64_t)nw < s.max_slots ? (int64_t)nw : s.max_slots;
             s.activity[1] = cur;
