@@ -120,7 +120,7 @@ def freeze(native, destination):
 
 def clean(folder):
     log = (folder / "run.log").read_text()
-    labels = ("tx-cap", "active-ovf", "ooo-ovf", "due-ovf", "rtt-ovf", "ring-ovf", "undecided-ties")
+    labels = ("tx-cap", "active-ovf", "ooo-ovf", "due-ovf", "rtt-ovf", "ring-ovf", "undecided-ties", "fragment-timer-ovf")
     for label in labels:
         hits = re.findall(rf"\b{label} (\d+)", log)
         if not hits or int(hits[-1]):

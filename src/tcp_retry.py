@@ -53,6 +53,10 @@ def run(binary, args):
     elif lines is None:
         level = initial_history_level(args)
     initial_level = level
+    fragment_arg = next((v for v in args if v.startswith("--fragment-timers=")), None)
+    fragment_capacity = int(fragment_arg.split("=", 1)[1]) if fragment_arg else 256
+    if fragment_arg:
+        args = [v for v in args if v != fragment_arg]
     auto_oom_retried = False
     transport = dict(arg[2:].split("=", 1) for arg in args if arg.startswith("--tcp-") and "=" in arg)
     requested = ("tcp-sack", "tcp-timestamps")
@@ -67,7 +71,7 @@ def run(binary, args):
         return "--topo=graph" in args and any(option_world(world) for world in ids)
 
     with tempfile.TemporaryDirectory() as tmp:
-        def attempt(ids, level, expanded):
+        def attempt(ids, level, expanded, fragment_cap=fragment_capacity):
             nonlocal sim, total_flows, auto_oom_retried
             if level == len(sizes):
                 target = binary.with_name("twins2048-options-links")
@@ -76,6 +80,7 @@ def run(binary, args):
                 if "--qtrace-options" in args or any(option_world(world) for world in ids):
                     target = target.with_name(target.name + "-options")
             cmd = [str(target), "--single-pass", *args]
+            cmd.append(f"--fragment-timers={fragment_cap}")
             if expanded:
                 cmd.append("--size-active")
             if lines is not None:
@@ -88,10 +93,10 @@ def run(binary, args):
             if result.returncode:
                 if initial is None and not auto_oom_retried and level == initial_level and level > 0 and "out of memory" in result.stderr.lower():
                     auto_oom_retried = True
-                    return attempt(ids, 0, expanded)
+                    return attempt(ids, 0, expanded, fragment_cap)
                 if len(ids) > 1 and "out of memory" in result.stderr.lower():
                     middle = len(ids) // 2
-                    return attempt(ids[:middle], level, expanded) and attempt(ids[middle:], level, expanded)
+                    return attempt(ids[:middle], level, expanded, fragment_cap) and attempt(ids[middle:], level, expanded, fragment_cap)
                 sys.stderr.write(result.stdout + result.stderr)
                 return False
             duration = re.search(r"Simulation Duration: ([\d.]+)s", log)
@@ -110,22 +115,29 @@ def run(binary, args):
             if not complete:
                 sys.stderr.write(log + result.stderr)
                 return False
-            if level == initial_level and not expanded:
+            if level == initial_level and not expanded and fragment_cap == fragment_capacity:
                 total_flows += int(complete[1])
-            active = affected("active-ovf")
+            active = affected("active-ovf") | affected("due-ovf")
+            fragment = affected("fragment-timer-ovf")
             ties = affected("undecided-ties")
             layout = re.search(r"\bframe_bytes=(\d+)", log)
             frame_bytes = int(layout[1]) if layout else 0
             print(f"TCP pass bytes={frame_bytes} sized_active={int(expanded)} worlds={len(ids)} "
-                  f"active_ovf={count('active-ovf')} ties={count('undecided-ties')} "
+                  f"active_ovf={count('active-ovf')} due_ovf={count('due-ovf')} "
+                  f"fragment_timer_ovf={count('fragment-timer-ovf')} fragment_cap={fragment_cap} ties={count('undecided-ties')} "
                   f"wall_s={time.monotonic()-t:.6f}", flush=True)
             if active or ties:
                 for line in log.splitlines():
                     if line.startswith(("TCP arrival ring", "TCP compared runs", "TCP heterogeneous")):
                         print(line, flush=True)
-            if any(count(f) for f in ("ooo-ovf", "rtt-ovf", "ring-ovf", "due-ovf")):
+            if any(count(f) for f in ("ooo-ovf", "rtt-ovf", "ring-ovf")):
                 sys.stderr.write(log + result.stderr)
                 return False
+            if fragment:
+                if fragment_cap > (1 << 29):
+                    sys.stderr.write(log + result.stderr)
+                    return False
+                return attempt(ids, level, expanded, fragment_cap * 2)
             if not active and not ties:
                 sys.stdout.write(log.replace(duration[0] + "\n", ""))
                 sys.stderr.write(result.stderr)
@@ -143,7 +155,7 @@ def run(binary, args):
                         return False
             for group in (active - ties, ties - active, active & ties):
                 if group and not attempt(sorted(group), level + int(bool(group & ties)),
-                                         expanded or bool(group & active)):
+                                         expanded or bool(group & active), fragment_cap):
                     return False
             return True
         ok = attempt(list(range(len(lines))) if lines is not None else [0], level, False)

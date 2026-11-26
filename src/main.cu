@@ -198,6 +198,8 @@ int main(int argc, char **argv)
     std::string topo = "fattree", worlds_file, topo_file, dump_routes, fail_spec;
     int ecn_k = RED_K, queue_pkts = QDISC_CAP, fin = 0, spray = 0;
     int tcp_sack = 0, tcp_timestamps = 0;
+    int fragment_timer_cap = 256;
+    bool drop_first_fragment_tail = false;
     auto option_value = [](const std::string &v) { return v == "0" ? 0 : v == "1" ? 1 : -1; };
     long long rng_seed = 1, rng_run = 1;
     bool force_general = false;
@@ -212,6 +214,13 @@ int main(int argc, char **argv)
             continue;
         else if (a == "--size-active")
             exact_active = true;
+        else if (a == "--drop-first-fragment-tail")
+            drop_first_fragment_tail = true;
+        else if (a.rfind("--fragment-timers=", 0) == 0)
+        {
+            fragment_timer_cap = std::stoi(val("--fragment-timers="));
+            if (fragment_timer_cap <= 0) { fprintf(stderr, "fragment timer capacity must be positive\n"); return 1; }
+        }
         else if (a.rfind("--k=", 0) == 0)
             k = std::stoi(val("--k="));
         else if (a.rfind("--flows=", 0) == 0)
@@ -778,7 +787,7 @@ int main(int argc, char **argv)
     }
     std::vector<uint64_t> conn_bytes(F, 0);
 #ifdef TWINS_TCP_OPTIONS
-    std::vector<uint32_t> fragment_hash(F);
+    std::vector<uint32_t> fragment_hash(F), icmp_hash(F);
     const bool timestamp_world = std::any_of(worlds.begin(), worlds.end(), [](const World &w) { return w.timestamps; });
 #endif
     {
@@ -818,10 +827,10 @@ int main(int argc, char **argv)
                     if (g_links[i].first >= 0)
                         hsub[g_links[i].first] = i;
             auto ip = [&](int h) { return 0x0a000001u | (uint32_t)(hsub[h] & 0xFFFF) << 8; };
-            auto hash = [](uint32_t a, uint32_t b, uint16_t pa, uint16_t pb) {
+            auto hash = [](uint32_t a, uint32_t b, uint16_t pa, uint16_t pb, uint8_t proto = 6) {
                 uint8_t k[17] = {(uint8_t)(a >> 24), (uint8_t)(a >> 16), (uint8_t)(a >> 8), (uint8_t)a,
                                  (uint8_t)(b >> 24), (uint8_t)(b >> 16), (uint8_t)(b >> 8), (uint8_t)b,
-                                 6, (uint8_t)(pa >> 8), (uint8_t)pa, (uint8_t)(pb >> 8), (uint8_t)pb};
+                                 proto, (uint8_t)(pa >> 8), (uint8_t)pa, (uint8_t)(pb >> 8), (uint8_t)pb};
                 return ns3_hash32(k, 17);
             };
             std::vector<int> byhost(F);
@@ -848,6 +857,7 @@ int main(int argc, char **argv)
                 recs[c].hash_ack = hash(b, a, dport, sport);
 #ifdef TWINS_TCP_OPTIONS
                 fragment_hash[c] = hash(a, b, 0, 0);
+                icmp_hash[c] = hash(b, a, 0, 0, 1);
 #endif
             }
         }
@@ -991,6 +1001,7 @@ int main(int argc, char **argv)
             s.fl.pairs = dupload(pairs);
             s.fl.ip_pair = dupload(conn_pair);
             s.fl.fragment_hash = dupload(fragment_hash);
+            s.fl.icmp_hash = dupload(icmp_hash);
             s.fl.fragments = dalloc<FragmentEntry>(entries);
         }
     }
@@ -1024,6 +1035,10 @@ int main(int argc, char **argv)
     s.hs.link_free = dalloc<int64_t>(H);
     s.hs.last_start = dalloc<int64_t>(H);
     s.hs.last_chain = dalloc<ChainWord>((size_t)H * CHAIN);
+#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
+    s.host_frames = dalloc<Frame>(size_t(H) * 2);
+    s.host_event_chain = dalloc<ChainWord>(size_t(H) * CHAIN);
+#endif
 #ifdef TWINS_EVIDENCE
     twins_evidence::inline_allocated += (size_t)H * CHAIN * sizeof(uint16_t);
 #endif
@@ -1041,6 +1056,22 @@ int main(int argc, char **argv)
     };
     s.hs.act_snd = active_table(true, s.hs.snd_offset);
     s.hs.act_rcv = active_table(false, s.hs.rcv_offset);
+    std::vector<uint64_t> due_ends(H + 1, exact_active ? 0 : MAX_DUE);
+    due_ends[0] = 0;
+    if (exact_active)
+    {
+        for (const auto &f : recs)
+        {
+            due_ends[1 + f.src] += 2;
+            due_ends[1 + f.dst] += 4;
+        }
+        for (int h = 1; h <= H; ++h)
+        {
+            due_ends[h] = std::max(due_ends[h], uint64_t(MAX_DUE));
+            if (due_ends[h] > INT_MAX) { fprintf(stderr, "host timer capacity exceeds INT_MAX\n"); return 1; }
+        }
+    }
+    std::partial_sum(due_ends.begin(), due_ends.end(), due_ends.begin());
     s.hs.n_snd = dalloc<int>(H);
     s.hs.n_rcv = dalloc<int>(H);
     s.hs.pend_next = dupload(pend_next);
@@ -1221,10 +1252,29 @@ int main(int argc, char **argv)
            (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
 #endif
 #ifdef TWINS_TCP_OPTIONS
-    if (timestamp_world && (max_slots <= 0 || max_slots >= IP_FRAGMENT_TIMEOUT / slot_width(s)))
+    if (drop_first_fragment_tail) s.fragment_drop_tail = dupload(std::vector<uint8_t>(H, 1));
+    if (timestamp_world && max_slots <= 0)
     {
-        fprintf(stderr, "TCP timestamps currently require a simulation horizon shorter than the IPv4 fragment timeout\n");
+        fprintf(stderr, "TCP timestamps require a positive simulation horizon\n");
         return 1;
+    }
+    if (timestamp_world && max_slots >= IP_FRAGMENT_TIMEOUT / slot_width(s))
+    {
+        s.fragment_timer_cap = fragment_timer_cap;
+        s.fragment_timers = dalloc<FragmentTimer>(size_t(H) * fragment_timer_cap);
+        s.fragment_head = dalloc<uint64_t>(H);
+        s.fragment_tail = dalloc<uint64_t>(H);
+        s.fragment_timer_ovf_w = dalloc<unsigned long long>(W);
+        if (exact_active)
+        {
+            for (int h = H; h >= 1; --h)
+            {
+                if (due_ends[h] - due_ends[h-1] > uint64_t(INT_MAX - fragment_timer_cap))
+                { fprintf(stderr, "host timer capacity exceeds INT_MAX\n"); return 1; }
+                due_ends[h] += uint64_t(h) * fragment_timer_cap;
+            }
+        }
+        printf("IPv4 native timeout callbacks: %d per host\n", fragment_timer_cap);
     }
 #endif
     printf("TCP arrival ring links=%d banks=%d frames_per_link_bucket=%d frame_bytes=%zu allocation_bytes=%zu\n",
@@ -1250,6 +1300,7 @@ int main(int argc, char **argv)
     s.error = dalloc<int>(1);
     s.ev = dalloc<unsigned long long>(40);
     s.active_ovf_w = dalloc<unsigned long long>(W);
+    s.due_ovf_w = dalloc<unsigned long long>(W);
     s.ties_w = dalloc<unsigned long long>(W);
     s.qtrace = nullptr;
     s.qtrace_cnt = dalloc<unsigned long long>(1);
@@ -1271,7 +1322,9 @@ int main(int argc, char **argv)
     CHECK(cudaHostGetDevicePointer((void **)&s.finished_host, h_finished, 0));
     if (M == 0)
         *h_finished = 1;
-    Due *due = dalloc<Due>((size_t)H * MAX_DUE);
+    if (due_ends.back() > SIZE_MAX / sizeof(Due)) return 1;
+    s.due_offset = dupload(due_ends);
+    Due *due = dalloc<Due>(due_ends.back());
     size_t per_sw = (size_t)k * 2 * tx_capacity;
     int64_t *sw_ts = dalloc<int64_t>((size_t)S * per_sw);
     uint32_t *sw_ref = dalloc<uint32_t>((size_t)S * per_sw);
@@ -1338,8 +1391,8 @@ int main(int argc, char **argv)
     printf("Executed Slots: %lld\n", (long long)slots);
     printf("flows %d completed %u wall %.4f s drops %llu marks %llu retx %llu rto %llu | tx-cap %llu active-ovf %llu ooo-ovf %llu due-ovf %llu"
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
-           " | undecided-ties %llu\n",
-           M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25]);
+           " | undecided-ties %llu fragment-timer-ovf %llu\n",
+           M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25], ev[36]);
 #ifdef TWINS_SCALE_HIST
     unsigned long long general[2][CHAIN_RUNS+1], basic_runs[2][CHAIN_RUNS+1]{};
     CHECK(hipMemcpyFromSymbol(general,HIP_SYMBOL(kfull::comparison_runs),sizeof(general)));
@@ -1359,7 +1412,7 @@ int main(int argc, char **argv)
     printf("timer creation order: %llu chain ties resolved by exact per-host scheduling sequence\n",ev[33]);
 #endif
 #ifdef TWINS_TCP_OPTIONS
-    printf("IPv4 fragment-ovf %llu\n", ev[34]);
+    printf("IPv4 fragment-ovf %llu fragment-expired %llu fragment-completed %llu\n", ev[34], ev[37], ev[38]);
 #endif
     if (ev[25])
         printf("undecided-ties by cause: lossy %llu trunc %llu same-root %llu count %llu no-root %llu timers %llu short %llu\n", ev[26], ev[27],
@@ -1419,6 +1472,8 @@ int main(int argc, char **argv)
 #ifdef TWINS_TCP_OPTIONS
             if (r.fragment == IP_TAIL)
                 kind = "F";
+            if (r.fragment == IP_ICMP)
+                kind = "I";
 #endif
             fprintf(o, "%lld %d %d %d %d %s %u %d", (long long)r.ts, r.node, r.dev, r.src, r.dst, kind, r.sa, r.qlen);
 #ifdef TWINS_TCP_OPTIONS
@@ -1501,6 +1556,24 @@ int main(int argc, char **argv)
                 if (counts[w]) printf(" %d", w);
             printf("\n");
         }
+        if (ev[7])
+        {
+            auto counts = ddown(s.due_ovf_w, W);
+            printf("due-ovf by world:");
+            for (int w = 0; w < W; ++w)
+                if (counts[w]) printf(" %d", w);
+            printf("\n");
+        }
+#ifdef TWINS_TCP_OPTIONS
+        if (ev[36])
+        {
+            auto counts = ddown(s.fragment_timer_ovf_w, W);
+            printf("fragment-timer-ovf by world:");
+            for (int w = 0; w < W; ++w)
+                if (counts[w]) printf(" %d", w);
+            printf("\n");
+        }
+#endif
         if (ev[25])
         {
             // World indices refer to this pass.

@@ -104,7 +104,7 @@ struct SackList
 };
 
 constexpr int64_t IP_FRAGMENT_TIMEOUT = 30000000000000ll;
-enum : uint8_t { IP_WHOLE, IP_HEAD, IP_TAIL };
+enum : uint8_t { IP_WHOLE, IP_HEAD, IP_TAIL, IP_ICMP };
 
 struct TcpTimestampState
 {
@@ -121,9 +121,17 @@ struct FragmentPair
 struct FragmentEntry
 {
     int64_t expires;
+    uint64_t next, previous; // host's native timeout-list links, encoded as index + 1
     uint32_t flow, seq, timestamp, echo;
-    uint16_t id, payload;
+    uint16_t id, payload, head_bytes;
     uint8_t flags, mask;
+};
+
+struct FragmentTimer
+{
+    int64_t at; // zero is free; completed datagrams leave their native callback scheduled
+    uint64_t order;
+    ChainWord chain[CHAIN];
 };
 #endif
 
@@ -361,6 +369,7 @@ struct FlowSoA
     uint32_t *fragment_hash;        // [conns], forward fragment with ports omitted
     FragmentPair *pairs;
     FragmentEntry *fragments;
+    uint32_t *icmp_hash;
 #endif
 };
 
@@ -470,6 +479,13 @@ struct Sim
     int ring; // egress FIFO capacity: the largest queue limit + the device queue + 1
     bool drain; // trace through the final transmissions and timers after flow completion
     FlowSoA fl;
+#ifdef TWINS_TCP_OPTIONS
+    int fragment_timer_cap;
+    FragmentTimer *fragment_timers;
+    uint64_t *fragment_head, *fragment_tail;
+    unsigned long long *fragment_timer_ovf_w;
+    uint8_t *fragment_drop_tail; // optional deterministic receive-error experiment
+#endif
     MsgSoA mg;
     int *mg_first_of_world; // [worlds] the first message of each world (message keys are world-local)
     uint32_t *app_key;      // [conns] root key of the connection's application start (see chain_set_root)
@@ -479,6 +495,10 @@ struct Sim
     int *host_in_link; // [H]
     int *sw_in_link;   // [S*k]
     Frame *msg;        // [NB][L][MAX_TX]
+#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
+    Frame *host_frames; // emission and reassembly scratch, owned by one host lane
+    ChainWord *host_event_chain;
+#endif
     long long *msg_cnt; // [NB][L] slot << 16 | frames (a count from another slot reads as 0)
     unsigned int *activity;        // [2] entities that sent frames or hold queued ones: this slot, previous
     unsigned long long *next_wake; // earliest slot a host must run (timers, flow starts)
@@ -496,6 +516,8 @@ struct Sim
     unsigned long long qtrace_n;
     int64_t qtrace_until, qtrace_from;
     unsigned long long *active_ovf_w;
+    uint64_t *due_offset; // [H+1] timer scratch bounds, widened with --size-active
+    unsigned long long *due_ovf_w;
     unsigned long long *ties_w; // [worlds] undecided ties per world
     unsigned long long *ev; // [16] counters: drops, marks, retx, rto, tx-cap hits, active overflow, ooo overflow,
                             // due overflow, retransmissions by congestion state (8 + C_*)

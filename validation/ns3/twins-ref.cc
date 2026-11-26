@@ -54,6 +54,28 @@ static bool g_fin = false;
 static std::atomic<uint64_t> g_drops{0}, g_marks{0}, g_retx{0};
 static std::atomic<uint64_t> g_retx_state[5], g_rto{0}; // retransmissions by TcpCongState_t; RTOs
 
+class DropFirstFragmentTail : public ErrorModel
+{
+    bool dropped = false;
+    bool DoCorrupt(Ptr<Packet> packet) override
+    {
+        if (dropped) return false;
+        auto copy = packet->Copy();
+        PppHeader ppp;
+        copy->RemoveHeader(ppp);
+        if (ppp.GetProtocol() != 0x0021) return false;
+        Ipv4Header ip;
+        copy->PeekHeader(ip);
+        if (ip.GetFragmentOffset())
+        {
+            dropped = true;
+            return true;
+        }
+        return false;
+    }
+    void DoReset() override { dropped = false; }
+};
+
 // On a point-to-point device PhyTxBegin observes each actual PPP frame,
 // including any IP fragments. The first 82 bytes cover PPP, IPv4 and a
 // maximal TCP header for the scenario's IPv4 headers without IP options.
@@ -261,6 +283,7 @@ int main(int argc, char *argv[])
     uint32_t queuePkts = 200;
     bool perFlowEcmp = false;
     bool sack = false, timestamps = false;
+    bool dropFirstTail = false;
     std::string wirePath;
     double stopSec = 1.0;
     uint32_t dupThresh = 3;
@@ -289,6 +312,7 @@ int main(int argc, char *argv[])
     cmd.AddValue("flowEcmp", "per-flow instead of per-packet ECMP", perFlowEcmp);
     cmd.AddValue("tcp-sack", "Enable TCP selective acknowledgements", sack);
     cmd.AddValue("tcp-timestamps", "Enable TCP timestamps", timestamps);
+    cmd.AddValue("dropFirstTail", "Drop the first non-initial IPv4 fragment on each receiving host", dropFirstTail);
     cmd.AddValue("traceWire", "PPP transmission header output (sequential)", wirePath);
     cmd.AddValue("traceWireUntil", "Exclusive end of wire tracing in picoseconds", g_wire_until);
     cmd.AddValue("traceWireNode", "Restrict wire tracing to this node ID", g_wire_node);
@@ -580,10 +604,21 @@ int main(int argc, char *argv[])
     }
     for (NodeList::Iterator it = NodeList::Begin(); it != NodeList::End(); ++it)
     {
+        if (getenv("TRACE_FRAGMENTS"))
+            (*it)->GetObject<Ipv4L3Protocol>()->TraceConnectWithoutContext("Drop", MakeBoundCallback(
+                +[](uint32_t node, const Ipv4Header &header, Ptr<const Packet> packet,
+                    Ipv4L3Protocol::DropReason reason, Ptr<Ipv4>, uint32_t) {
+                    if (reason == Ipv4L3Protocol::DROP_FRAGMENT_TIMEOUT)
+                        std::cout << "IP_EXPIRE " << Simulator::Now().GetPicoSeconds() << ' ' << node << ' '
+                                  << header.GetIdentification() << ' ' << packet->GetSize() << std::endl;
+                }, (*it)->GetId()));
         Ptr<TrafficControlLayer> tc = (*it)->GetObject<TrafficControlLayer>();
         for (uint32_t d = 0; d < (*it)->GetNDevices(); d++)
         {
             Ptr<NetDevice> device = (*it)->GetDevice(d);
+            if (dropFirstTail && (*it)->GetId() < H)
+                if (auto point = DynamicCast<PointToPointNetDevice>(device))
+                    point->SetReceiveErrorModel(CreateObject<DropFirstFragmentTail>());
             if (g_wire.is_open() && DynamicCast<PointToPointNetDevice>(device))
                 device->TraceConnectWithoutContext("PhyTxBegin", MakeBoundCallback(&TraceWire, (*it)->GetId(), d));
             Ptr<QueueDisc> q = tc ? tc->GetRootQueueDiscOnDevice(device) : nullptr;
@@ -612,7 +647,12 @@ int main(int argc, char *argv[])
                         uint32_t sa = ip->GetHeader().GetIdentification();
                         uint32_t payload = 0;
                         TcpHeader th;
-                        if (!ip->GetHeader().GetFragmentOffset())
+                        if (ip->GetHeader().GetProtocol() == 1)
+                        {
+                            kind = "I";
+                            sa = 0;
+                        }
+                        else if (!ip->GetHeader().GetFragmentOffset())
                         {
                             item->GetPacket()->PeekHeader(th);
                             payload = item->GetPacket()->GetSize() - th.GetSerializedSize();

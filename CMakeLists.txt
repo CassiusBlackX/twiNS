@@ -87,13 +87,7 @@ foreach(T IN LISTS tcp_targets)
             # ROCm clang 22 crashes in SimplifyCFG after inlining the wide
             # history kernel. Keep device optimizations and out-of-line calls.
             if(CMAKE_HIP_COMPILER_VERSION VERSION_GREATER_EQUAL 22 AND CMAKE_HIP_COMPILER_VERSION VERSION_LESS 23)
-                if(T STREQUAL "twins2048-options-links" AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1200")
-                    # The optimized gfx1200 build faults with histories beyond
-                    # 31 runs. This extended audit/fallback stays at -O0.
-                    target_compile_options(${T} PRIVATE -O0 -fno-inline-functions)
-                else()
-                    target_compile_options(${T} PRIVATE -O2 -fno-inline-functions)
-                endif()
+                target_compile_options(${T} PRIVATE -O2 -fno-inline-functions)
             endif()
         endif()
         target_compile_options(${T} PRIVATE -ffp-contract=off -Wno-unused-value)

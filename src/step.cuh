@@ -122,6 +122,10 @@ struct Fifo
             int64_t duration = (int64_t)f.len * PS_PER_BYTE;
 #endif
             int64_t end = start + duration;
+#ifdef TWINS_FRAGMENT_PROBE
+            if (f.fragment == IP_ICMP)
+                printf("WIRE %lld %u\n", (long long)start, unsigned(f.len));
+#endif
 #if TWINS_WIDE_HIP_FIFO
             // The arrival is in a later slot, and this link owns its bucket
             // until publication. Extend the outgoing frame in that bucket.
@@ -344,11 +348,44 @@ struct HostCtx
     Fifo *nic;
     int h;
     int dctcp, cubic; // the host's TCP
+#if TWINS_WIDE_HIP_FIFO
+    ChainWord *echain;
+#else
     ChainWord echain[CHAIN]; // ns-3 event-order chain of the event being processed
+#endif
     Due *due;               // timers due in this slot, sorted; [*id, *nd) are pending
     int *nd, *id;
     int64_t slot_end;
 };
+
+__device__ inline int due_capacity(const HostCtx &c)
+{
+    return int(c.s->due_offset[c.h + 1] - c.s->due_offset[c.h]);
+}
+
+__device__ inline void due_overflow(const Sim &s, int h)
+{
+    atomicAdd(&s.ev[7], 1ull);
+    atomicAdd(&s.due_ovf_w[h / s.H1], 1ull);
+}
+
+__device__ inline bool due_current(const HostCtx &c, const Due &d)
+{
+    const auto &f = c.s->fl;
+    switch (d.kind)
+    {
+    case 0: return f.rto_at[d.flow] == d.at;
+    case 1: return f.delack_at[d.flow] == d.at;
+    case 2: return f.syn_at[d.flow] == d.at;
+    case 3: return f.srv_syn_at[d.flow] == d.at;
+    case 4: return f.r_last_at[d.flow] == d.at;
+    case 5: return f.r_frx_at[d.flow] == d.at;
+#ifdef TWINS_TCP_OPTIONS
+    case 6: return c.s->fragment_timers[size_t(c.h) * c.s->fragment_timer_cap + d.flow].at == d.at;
+#endif
+    default: return false;
+    }
+}
 
 // Timers of one host are scheduled by that host's sequential handler. Their local
 // creation sequence preserves their relative reference UIDs even when remote events interleave.
@@ -368,10 +405,20 @@ __device__ inline void due_insert(HostCtx &c, int64_t at, int f, int kind)
     if (at >= c.slot_end)
         return; // collected at the start of its slot
     int n = *c.nd;
-    if (n >= MAX_DUE)
+    if (n >= due_capacity(c))
     {
-        atomicAdd(&c.s->ev[7], 1ull);
-        return;
+        // Reuse consumed/cancelled entries before declaring a capacity failure.
+        int pending = 0;
+        for (int i = *c.id; i < n; ++i)
+            if (due_current(c, c.due[i]))
+                c.due[pending++] = c.due[i];
+        *c.id = 0;
+        *c.nd = n = pending;
+        if (n >= due_capacity(c))
+        {
+            due_overflow(*c.s, c.h);
+            return;
+        }
     }
     int j = n;
     while (j > *c.id && c.due[j - 1].at > at)
@@ -438,7 +485,11 @@ __device__ inline void emit(HostCtx &c, int f, uint8_t flags, uint32_t seq, uint
                             bool to_sender, int64_t now)
 {
     const FlowSoA &F = c.s->fl;
+#if TWINS_WIDE_HIP_FIFO
+    Frame &fr = c.s->host_frames[size_t(c.h) * 2];
+#else
     Frame fr;
+#endif
     fr.ts = now;
     fr.flow = (uint32_t)f;
     fr.sa = (flags & F_DATA) ? seq : ack;
@@ -1921,6 +1972,10 @@ __device__ TWINS_COLD void on_rto(HostCtx &c, int f, int64_t now)
         return;
     }
     atomicAdd(&c.s->ev[3], 1ull);
+#ifdef TWINS_TRACE_TCP_RTO
+    printf("TCP_RTO %lld %d %d %d %d %u %u\n", (long long)now, f,
+           F.src[f], F.dst[f], int(F.cong[f]), F.una[f] + 1, F.high[f] + 1);
+#endif
     uint32_t before = inflight(F, f);
     F.dupacks[f] = 0;
     tb_all_lost(F, f); // ResetRenoSack + SetSentListLost(resetSack)
@@ -2460,10 +2515,7 @@ __device__ inline void on_tcp_frame(HostCtx &c, const Frame &p, int64_t now)
                 rtt_sample(F, f, echo_sample ? echo_sample : now - F.timing_time[f]);
                 emit(c, f, F_ACK, 0, 0, 0, (MUT(18) ? CTRL_FRAME - 2 : CTRL_FRAME), false, now);
                 // ConnectionSucceeded (ScheduleNow) lets the application write its due messages
-                ChainWord parent[CHAIN];
-                for (int i = 0; i < CHAIN; i++)
-                    parent[i] = c.echain[i];
-                chain_push(c.echain, CHAIN_NOW, parent);
+                chain_push(c.echain, CHAIN_NOW, c.echain);
                 app_write(c, f, now);
             }
         }
@@ -2513,10 +2565,7 @@ __device__ inline void on_tcp_frame(HostCtx &c, const Frame &p, int64_t now)
             return; // ESTABLISHED: a duplicate SYN
         // the SYN-ACK is sent from CompleteFork, which the SYN's arrival schedules (ScheduleNow)
         c.nic->woke = now;
-        ChainWord parent[CHAIN];
-        for (int i = 0; i < CHAIN; i++)
-            parent[i] = c.echain[i];
-        chain_push(c.echain, CHAIN_NOW, parent);
+        chain_push(c.echain, CHAIN_NOW, c.echain);
         send_synack(c, f, now);
     }
     else if (p.flags & (F_DATA | F_FIN))
@@ -2535,26 +2584,119 @@ __device__ inline void on_tcp_frame(HostCtx &c, const Frame &p, int64_t now)
 }
 
 #ifdef TWINS_TCP_OPTIONS
+__device__ inline void fragment_schedule(HostCtx &c, int64_t now, int64_t at)
+{
+    const auto &s = *c.s;
+    for (int i = 0; i < s.fragment_timer_cap; ++i)
+    {
+        auto &timer = s.fragment_timers[size_t(c.h) * s.fragment_timer_cap + i];
+        if (timer.at) continue;
+        timer.at = at;
+        chain_push(timer.chain, chain_lead(at - now), c.echain);
+#ifdef TWINS_TCP_TIMER_ORDER
+        auto &sequence = s.hs.timer_sequence[c.h];
+        timer.order = sequence == ~0ull ? 0 : ++sequence;
+#endif
+        due_insert(c, at, i, 6);
+        return;
+    }
+    atomicAdd(&s.ev[36], 1ull);
+    atomicAdd(&s.fragment_timer_ovf_w[c.h / s.H1], 1ull);
+}
+
+__device__ inline void fragment_unlink(HostCtx &c, uint64_t encoded)
+{
+    const auto &s = *c.s;
+    auto &entry = s.fl.fragments[encoded - 1];
+    if (entry.previous) s.fl.fragments[entry.previous - 1].next = entry.next;
+    else s.fragment_head[c.h] = entry.next;
+    if (entry.next) s.fl.fragments[entry.next - 1].previous = entry.previous;
+    else s.fragment_tail[c.h] = entry.previous;
+    entry.previous = entry.next = 0;
+}
+
+__device__ TWINS_COLD void on_fragment_timeout(HostCtx &c, int slot, int64_t now)
+{
+    const auto &s = *c.s;
+    const auto &F = s.fl;
+    auto &timer = s.fragment_timers[size_t(c.h) * s.fragment_timer_cap + slot];
+    timer.at = 0;
+    while (s.fragment_head[c.h])
+    {
+        const uint64_t encoded = s.fragment_head[c.h];
+        auto &entry = F.fragments[encoded - 1];
+        if (entry.expires != now) break;
+        if (entry.head_bytes > 8)
+        {
+#if TWINS_WIDE_HIP_FIFO
+            Frame &icmp = s.host_frames[size_t(c.h) * 2];
+#else
+            Frame icmp;
+#endif
+            const int f = entry.flow;
+            icmp.ts = now;
+            icmp.flow = f;
+            icmp.sa = 0;
+            icmp.len = 58; // IPv4 + ICMP time exceeded, quoted IPv4 and first 8 bytes + PPP
+            icmp.dst_node = F.src[f] % s.H1;
+            icmp.flags = 0;
+            icmp.to_sender = 1;
+            icmp.up = F.icmp_hash[f] % uint32_t(s.ecmp_n);
+            icmp.sacks = {};
+            icmp.tcp_options = icmp.tcp_payload = icmp.ip_id = 0;
+            icmp.timestamp = icmp.echo = 0;
+            icmp.fragment = IP_ICMP;
+            for (int j = 0; j < CHAIN; ++j) icmp.chain[j] = c.echain[j];
+            c.nic->enqueue(icmp, now);
+#ifdef TWINS_FRAGMENT_PROBE
+            c.nic->advance(now);
+#endif
+        }
+#ifdef TWINS_TRACE_FRAGMENTS
+        printf("EXPIRE %lld %u %u\n", (long long)now, entry.id, entry.head_bytes);
+#endif
+        entry.mask = 0;
+        fragment_unlink(c, encoded);
+        atomicAdd(&s.ev[37], 1ull);
+    }
+    if (s.fragment_head[c.h])
+        fragment_schedule(c, now, F.fragments[s.fragment_head[c.h] - 1].expires);
+}
+
 __device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
 {
     const auto &s = *c.s;
     const auto &F = s.fl;
     const auto &pair = F.pairs[F.ip_pair[2*p.flow]];
     auto &entry = F.fragments[pair.offset + (p.ip_id & pair.mask)];
-    if (entry.mask && entry.id != p.ip_id && now < entry.expires)
+    if (entry.mask && entry.id != p.ip_id)
     {
         atomicAdd(&s.ev[34], 1ull);
         atomicAdd(&s.ev[5], 1ull);
         atomicAdd(&s.active_ovf_w[c.h / s.H1], 1ull);
         return;
     }
-    if (!entry.mask || now >= entry.expires)
+    if (!entry.mask)
     {
         entry.id = p.ip_id;
         entry.mask = 0;
         entry.expires = now + IP_FRAGMENT_TIMEOUT;
+        entry.head_bytes = 0;
+        if (s.fragment_timers)
+        {
+            const uint64_t encoded = uint64_t(&entry - F.fragments) + 1;
+            entry.previous = s.fragment_tail[c.h];
+            entry.next = 0;
+            if (entry.previous) F.fragments[entry.previous - 1].next = encoded;
+            else
+            {
+                s.fragment_head[c.h] = encoded;
+                fragment_schedule(c, now, entry.expires);
+            }
+            s.fragment_tail[c.h] = encoded;
+        }
     }
-    if (p.fragment == IP_HEAD)
+    if (p.fragment == IP_HEAD && !(entry.mask & IP_HEAD))
     {
         entry.flow = p.flow;
         entry.seq = p.sa;
@@ -2562,14 +2704,25 @@ __device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
         entry.echo = p.echo;
         entry.payload = p.tcp_payload;
         entry.flags = p.flags;
+        entry.head_bytes = p.len - 22;
     }
     entry.mask |= p.fragment;
     if (entry.mask != (IP_HEAD | IP_TAIL))
         return;
     entry.mask = 0;
+    if (s.fragment_timers) fragment_unlink(c, uint64_t(&entry - F.fragments) + 1);
+    atomicAdd(&s.ev[38], 1ull);
+#ifdef TWINS_FRAGMENT_PROBE
+    printf("DELIVER %lld %u\n", (long long)now, unsigned(entry.payload));
+    return;
+#endif
     // The upper-layer receive belongs to the completing fragment's event.
     // ns-3 keeps the IP ECN field of that fragment and the TCP header of the first.
+#if TWINS_WIDE_HIP_FIFO
+    Frame &complete = c.s->host_frames[size_t(c.h) * 2 + 1];
+#else
     Frame complete;
+#endif
     complete.flow = entry.flow;
     complete.sa = entry.seq;
     complete.to_sender = 0;
@@ -2585,6 +2738,12 @@ __device__ TWINS_COLD void on_fragment(HostCtx &c, const Frame &p, int64_t now)
 __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
 {
 #ifdef TWINS_TCP_OPTIONS
+    if (p.fragment == IP_ICMP) return; // TcpSocketBase's default ICMP notification has no state effect
+    if (p.fragment == IP_TAIL && c.s->fragment_drop_tail && c.s->fragment_drop_tail[c.h])
+    {
+        c.s->fragment_drop_tail[c.h] = 0;
+        return;
+    }
     if (p.fragment != IP_WHOLE)
     {
         on_fragment(c, p, now);
@@ -2596,8 +2755,12 @@ __device__ inline void on_frame(HostCtx &c, const Frame &p, int64_t now)
 
 
 // the event-order chain of a timer
-__device__ inline const ChainWord *due_chain(const FlowSoA &F, const Due &d)
+__device__ inline const ChainWord *due_chain(const Sim &s, const Due &d, int h)
 {
+    const auto &F = s.fl;
+#ifdef TWINS_TCP_OPTIONS
+    if (d.kind == 6) return s.fragment_timers[size_t(h) * s.fragment_timer_cap + d.flow].chain;
+#endif
     const ChainWord *base = d.kind == 1 || d.kind == 3 || d.kind == 4 ? F.dchain
                            : d.kind == 5 || (d.kind == 2 && F.st[d.flow] == S_EST) ? F.schain
                                                                                     : F.rchain;
@@ -2612,10 +2775,16 @@ __device__ TWINS_COLD bool timer_after(const Sim &s, const FlowSoA &F, const Due
         printf("timer tie\n"); // (mutation builds: TWINS_MUT=99 prints every tie of two timers)
 #endif
     int why;
-    int r = chain_cmp(due_chain(F, a), due_chain(F, b), &why);
+    int r = chain_cmp(due_chain(s, a, h), due_chain(s, b, h), &why);
 #ifdef TWINS_TCP_TIMER_ORDER
     if (r==0) {
-        const uint64_t ka=F.timer_order[(size_t)a.flow*6+a.kind],kb=F.timer_order[(size_t)b.flow*6+b.kind];
+        const auto order = [&](const Due &d) -> uint64_t {
+#ifdef TWINS_TCP_OPTIONS
+            if (d.kind == 6) return s.fragment_timers[size_t(h) * s.fragment_timer_cap + d.flow].order;
+#endif
+            return F.timer_order[(size_t)d.flow*6+d.kind];
+        };
+        const uint64_t ka=order(a),kb=order(b);
         if(ka && kb && ka!=kb){atomicAdd(&s.ev[33],1ull);return ka>kb;}
     }
 #endif
@@ -2634,7 +2803,7 @@ __device__ TWINS_COLD bool timer_before_arrival(const Sim &s, const FlowSoA &F, 
     ChainWord arr[CHAIN];
     chain_push(arr, arrival_code(p), p.chain);
     int why;
-    int r = chain_cmp(due_chain(F, d), arr, &why);
+    int r = chain_cmp(due_chain(s, d, h), arr, &why);
     if (r == 0)
     {
         atomicAdd(&s.ev[25], 1ull);
@@ -2699,35 +2868,43 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     nic.red_k = hs.red_k[h];
     nic.qcap = hs.qcap[h];
     HostCtx c{&s, &nic, h, hs.cc[h] == CC_DCTCP, hs.cc[h] == CC_CUBIC, {}, due, nullptr, nullptr, E0};
+#if TWINS_WIDE_HIP_FIFO
+    c.echain = s.host_event_chain + size_t(h) * CHAIN;
+#endif
 
     // timers due in this slot (new timers are always set >= 10 us ahead, so none can become
     // due during the slot; cancelled or moved ones are skipped when their turn comes)
     int nd = 0;
     int ns = hs.n_snd[h], nr = hs.n_rcv[h];
+    auto collect = [&](int64_t at, int f, int kind) {
+        if (at < 0 || at >= E0) return;
+        if (nd < due_capacity(c)) due[nd++] = {at, f, kind};
+        else due_overflow(s, h);
+    };
     for (int i = 0; i < ns; i++)
     {
         int f = hs.act_snd[hs.snd_offset[h] + i];
         int64_t a = F.rto_at[f], b = F.syn_at[f];
-        if (a >= 0 && a < E0 && nd < MAX_DUE)
-            due[nd++] = {a, f, 0};
-        if (b >= 0 && b < E0 && nd < MAX_DUE)
-            due[nd++] = {b, f, 2};
+        collect(a, f, 0);
+        collect(b, f, 2);
     }
     for (int i = 0; i < nr; i++)
     {
         int f = hs.act_rcv[hs.rcv_offset[h] + i];
         int64_t a = F.delack_at[f], b = F.srv_syn_at[f], l = F.r_last_at[f], x = F.r_frx_at[f];
-        if (a >= 0 && a < E0 && nd < MAX_DUE)
-            due[nd++] = {a, f, 1};
-        if (b >= 0 && b < E0 && nd < MAX_DUE)
-            due[nd++] = {b, f, 3};
-        if (l >= 0 && l < E0 && nd < MAX_DUE)
-            due[nd++] = {l, f, 4};
-        if (x >= 0 && x < E0 && nd < MAX_DUE)
-            due[nd++] = {x, f, 5};
+        collect(a, f, 1);
+        collect(b, f, 3);
+        collect(l, f, 4);
+        collect(x, f, 5);
     }
-    if (nd >= MAX_DUE)
-        atomicAdd(&s.ev[7], 1ull);
+#ifdef TWINS_TCP_OPTIONS
+    if (s.fragment_timers)
+        for (int i = 0; i < s.fragment_timer_cap; ++i)
+        {
+            const auto &timer = s.fragment_timers[size_t(h) * s.fragment_timer_cap + i];
+            if (timer.at) collect(timer.at, i, 6);
+        }
+#endif
     for (int i = 1; i < nd; i++) // insertion sort by time, then (equal times) by chain
     {
         Due x = due[i];
@@ -2759,14 +2936,19 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             if (st < E0)
                 tp = st;
         }
-        int64_t now = tr < td ? tr : td;
-        now = now < tp ? now : tp;
-        if (now == INT64_MAX)
+        const int64_t timed = tr < td ? tr : td;
+        const int64_t selected = timed < tp ? timed : tp;
+        if (selected == INT64_MAX)
             break;
-        if (now < S0)
-            now = S0; // a flow start or timer from a skipped slot range (not expected)
+        const int64_t now = selected < S0 ? S0 : selected;
+#ifdef TWINS_TRACE_DUE
+        if (selected < S0)
+            printf("TCP_OVERDUE %d %lld %lld %lld %lld %lld %d %d %d %d\n", h,
+                   (long long)S0, (long long)selected, (long long)tr, (long long)td,
+                   (long long)tp, i1, n1, id, nd);
+#endif
         nic.advance(now);
-        if (now == tp && s.mg.conn[hs.pend_msg[pn]] >= 0 && F.m_first[s.mg.conn[hs.pend_msg[pn]]] != hs.pend_msg[pn])
+        if (selected == tp && s.mg.conn[hs.pend_msg[pn]] >= 0 && F.m_first[s.mg.conn[hs.pend_msg[pn]]] != hs.pend_msg[pn])
         {
             // a later message of a connection: FlowSender::SendMessage
             int m = hs.pend_msg[pn++], f = s.mg.conn[m];
@@ -2775,7 +2957,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             if (F.st[f] == S_EST)
                 app_write(c, f, now);
         }
-        else if (now == tp)
+        else if (selected == tp)
         {
             int m = hs.pend_msg[pn++], f = s.mg.conn[m];
             chain_set_root(c.echain, s.app_key[f]); // application starts are scheduled at setup, host by host
@@ -2791,12 +2973,19 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
             F.timing_time[f] = now;
             emit(c, f, F_SYN, 0, 0, 0, SYN_FRAME, false, now);
         }
-        else if (now == td && (now != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h)))
+        else if (selected == td && (selected != tr || timer_before_arrival(s, F, due[id], i2 < n2 ? m2[i2] : m1[i1], h)))
         {
             Due d = due[id++];
-            const ChainWord *tc = due_chain(F, d);
+            const ChainWord *tc = due_chain(s, d, h);
             for (int i = 0; i < CHAIN; i++)
                 c.echain[i] = tc[i];
+#ifdef TWINS_TCP_OPTIONS
+            if (d.kind == 6)
+            {
+                if (due_current(c, d)) on_fragment_timeout(c, d.flow, now);
+            }
+            else
+#endif
             if (d.kind == 0 && F.rto_at[d.flow] == d.at)
                 on_rto(c, d.flow, now);
             else if (d.kind == 1 && F.delack_at[d.flow] == d.at)
@@ -2845,7 +3034,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         }
         else
         {
-            Frame p = i2 < n2 ? m2[i2++] : m1[i1++];
+            const Frame &p = i2 < n2 ? m2[i2++] : m1[i1++];
             chain_push(c.echain, arrival_code(p), p.chain);
             on_frame(c, p, now);
         }
@@ -2918,6 +3107,14 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
         if (st < next)
             next = st;
     }
+#ifdef TWINS_TCP_OPTIONS
+    if (s.fragment_timers)
+        for (int i = 0; i < s.fragment_timer_cap; ++i)
+        {
+            int64_t at = s.fragment_timers[size_t(h) * s.fragment_timer_cap + i].at;
+            if (at && at < next) next = at;
+        }
+#endif
     hs.wake[h] = nic.size > 0 ? t + 1 : (next == INT64_MAX ? INT64_MAX : next / slot_width(s));
     *wake = hs.wake[h];
     return (nic.sent > 0 || nic.size > 0) ? 1 : 0;
@@ -2997,6 +3194,8 @@ __device__ inline int route(const Sim &s, int sw, const Frame &p, int ep = 0)
 #ifdef TWINS_TCP_OPTIONS
         if (p.fragment == IP_TAIL)
             h = s.fl.fragment_hash[p.flow];
+        if (p.fragment == IP_ICMP)
+            h = s.fl.icmp_hash[p.flow];
 #endif
         return route_up(s, sw, p.dst_node, (int)(h % s.rt_n[((size_t)ep * s.S1 + x) * s.S1 + e]), ep);
     }

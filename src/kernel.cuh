@@ -36,7 +36,7 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         if (threadIdx.x < s.host_lanes && h < s.H)
         {
             int64_t w = INT64_MAX;
-            if (host_step(s, h, t, due_buf + (size_t)h * MAX_DUE, &w))
+            if (host_step(s, h, t, due_buf + s.due_offset[h], &w))
                 blk_act = 1;
             atomicMin(&blk_wake, (unsigned long long)w);
         }

@@ -1,0 +1,14 @@
+# TCP follow-up acceptance
+
+This campaign closes the four TCP questions in the paper's November 26 TODO.
+
+* `native_rto.py` compiles one instrumented native TCP object and relinks an isolated internet library. Set `LD_PRELOAD` to that library and `TWINS_TRACE_TCP_RTO=1` when running the sequential driver. The production oracle tree is not modified. A `TWINS_TRACE_TCP_RTO` GPU build prints the matching expiry tuple. Count executions with data outstanding separately from congestion-state transitions.
+* Host timer scratch uses per-host offsets. `--size-active` reserves two sender and four receiver timer slots per connection. The ordinary driver retries active-list and timer-list overflows from pristine inputs. Clamping a stale event to a slot boundary preserves its original event type. Consumed and cancelled timer slots can be reused.
+* Optimized wide HIP builds keep host emission frames, reassembly frames and current-event histories in lane-owned device storage. The 127-run fallback uses `-O2 -fno-inline-functions` on ROCm clang 22. `build_all.py` records the full family, commands and source hashes before/after compilation.
+* The production reassembler retains the host FIFO timeout list and scheduled callbacks, even when the originating datagram completes. Callback creation, rescheduling and ICMP enqueue inherit the actual parent history. `--fragment-timers=N` sets an initial per-host callback capacity, doubled on overflow by the ordinary driver. Short horizons avoid allocating this storage. `--drop-first-fragment-tail` is a deterministic receive-error experiment, paired with the native driver's `--dropFirstTail=1`.
+
+`fragment-native.cc` calls the installed ns-3 IPv4 receive implementation. `fragment-gpu.cu` executes production reassembly handlers, FIFO and event-history comparison, observing delivery at the reassembly boundary. Six cases cover early/equal/late tail delivery, a missing tail, and rescheduling a callback whose original datagram completed. Equal-time cases differ only in event creation order.
+
+`accept.py BINARY_DIR INPUTS EXPECTED_JSON OUTPUT` runs 18 checks: four dense/allocation combinations, four optimized wide-history inputs, six reassembly probes, and four long-horizon network comparisons. The orphan pair checks every queue entry including native ICMP traffic after 30 seconds. The 40-connection pair starts traffic from 1 through 40 simulated seconds, begins with one callback slot per host, and checks the complete replay output against the native oracle. The separate option matrix and release regression remain in `paper_tcp_options`.
+
+Run GPU work through the existing user systemd services with `MemoryMax=28G` and one active GPU campaign. Build HIP and native oracles on a87 under `/home/cassius/netsim`. CUDA campaigns take the existing s50 campaign lock after its old queue finishes and run no new CPU oracle. Keep and verify full evidence on the local workstation.
