@@ -3413,6 +3413,8 @@ __device__ __forceinline__ void s_forward(SCtx &c, int inport, Pkt p, int out, i
     s_dequeue(c, out);
 }
 
+#include "conweave.cuh"
+
 __device__ __forceinline__ const LFrame &sw_frame(const Sim &s, const SwPortLds &w) { return s.msg[w.abase + w.ai]; }
 
 // the next arrival of a port in [t0, t1), or none (INT64_MAX)
@@ -4145,6 +4147,20 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
                             best = p, bk = k;
                     }
                 }
+                if (s.conweave && node == s.conweave_rx && s.conweave->length &&
+                    s.conweave->due < t1)
+                {
+                    const ConWeaveState &cw = *s.conweave;
+                    // The flush is a real local event, even when no packet or
+                    // transmission completion falls in this slot.
+                    if (cw.due < bt || (cw.due == bt && best >= 0 &&
+                        before(s, bt, 0, cw.flush_chain, bt, bk ? 0 : w[best].acode,
+                               bk ? tcs[best] : sw_arr_chain(c, w[best]))))
+                    {
+                        cw_flush(c);
+                        continue;
+                    }
+                }
                 if (best < 0)
                     break;
                 int p = best;
@@ -4210,6 +4226,9 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
                         }
                     }
                 }
+                else if (s.conweave && pk.kind == K_DATA && pk.flow == (uint32_t)s.conweave_flow &&
+                         (node == s.conweave_tx || node == s.conweave_rx))
+                    cw_forward(c, p, pk, out, q);
                 else
                     s_forward(c, p, pk, out, q);
     #ifdef RDMA_PROF
@@ -4516,6 +4535,8 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
 #ifdef TWINS_IRN_PROFILE
     if (profile) profile->end=device_clock();
 #endif
+    if (lane == 0 && s.conweave && node == s.conweave_rx && s.conweave->length)
+        act = true; // the VOQ deadline keeps this switch runnable in an otherwise idle slot
     return act ? 1 : 0;
 }
 

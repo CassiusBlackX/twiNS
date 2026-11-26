@@ -437,6 +437,13 @@ struct SlotSample {
 #endif
 struct Sim
 {
+    // Optional single-epoch ConWeave VOQ experiment (conweave.cuh).
+    struct ConWeaveState *conweave;
+    Pkt *conweave_fifo;
+    int conweave_flow, conweave_tx, conweave_rx, conweave_old, conweave_new;
+    uint32_t conweave_tail, conweave_cap;
+    int64_t conweave_slack, conweave_wait;
+    bool conweave_drop_tail, conweave_trace;
     IrnSender *irn_sender;
     IrnMap *irn_receiver;
     RxLifetime *rx_lifetime; // receiver deletion on sender completion

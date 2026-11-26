@@ -3,6 +3,7 @@ namespace TWINS_NS
 {
 
 
+template <int Threads = BLOCK>
 __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t *sw_up)
 {
     const Sim &s = c_sim;
@@ -12,25 +13,17 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
 #ifdef TWINS_TCP_ACTIVITY_AUDIT
     auto *audit = s.activity_audit + (t * slot_width(s) >= 46000000000ll ? 4 : 0);
 #endif
-    __shared__ int rows[BLOCK * 33];
-    __shared__ int base[BLOCK], cnt[BLOCK];
-    __shared__ int in_win[BLOCK * 3];
-    __shared__ int mpos[BLOCK];
-    __shared__ int blk_act;
+    // Each lane owns one port at every barrier in switch_step. A wide switch
+    // occupies a whole 64-thread block, spanning two CUDA warps.
+    __shared__ int rows[Threads * (Threads + 1)];
+    __shared__ int base[Threads], cnt[Threads];
+    __shared__ int in_win[Threads * 3];
+    __shared__ int mpos[Threads];
     __shared__ unsigned long long blk_wake;
+    bool lane_active = false;
     if (threadIdx.x == 0)
-    {
-        blk_act = 0;
         blk_wake = ~0ull;
-    }
     __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        if (blk_act)
-            atomicAdd(&s.activity[0], 1u);
-        if (blk_wake != ~0ull)
-            atomicMin(s.next_wake, blk_wake);
-    }
 #ifdef NS_PROF
     long long p0 = wall_clock64();
 #endif
@@ -45,7 +38,7 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
             int64_t w = INT64_MAX;
             if (host_step(s, h, t, due_buf + s.due_offset[h], &w))
             {
-                blk_act = 1;
+                lane_active = true;
 #ifdef TWINS_TCP_ACTIVITY_AUDIT
                 atomicAdd(&audit[2], 1ull);
 #endif
@@ -77,13 +70,13 @@ __global__ void ns_slot(Due *due_buf, int64_t *sw_ts, uint32_t *sw_ref, uint8_t 
         sc.ref = sw_ref + (size_t)(active ? sw : 0) * per_sw;
         if (switch_step(s, sw, q, t, active, sc))
         {
-            blk_act = 1;
+            lane_active = true;
 #ifdef TWINS_TCP_ACTIVITY_AUDIT
             atomicAdd(&audit[3], 1ull);
 #endif
         }
     }
-    __syncthreads();
+    const bool blk_act = __syncthreads_or(lane_active);
     if (threadIdx.x == 0)
     {
         if (blk_act)

@@ -1,0 +1,8 @@
+hosts 2
+switches 4
+link h0 s0 rate=100Gbps delay=1000ns
+link h1 s1 rate=100Gbps delay=1000ns
+link s0 s2 rate=100Gbps delay=4000ns
+link s2 s1 rate=100Gbps delay=4000ns
+link s0 s3 rate=100Gbps delay=1000ns
+link s3 s1 rate=100Gbps delay=1000ns

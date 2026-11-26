@@ -33,6 +33,7 @@ using namespace nsm;
     } while (0)
 
 constexpr int BLOCK = 32;
+constexpr int WIDE_BLOCK = 64;
 
 // The simulation's pointers and sizes, in constant memory: a by-value kernel argument whose
 // address is taken (every step function holds a Sim reference) is copied to scratch memory,
@@ -359,7 +360,7 @@ int main(int argc, char **argv)
         }
 #endif
     bool bad_topo = is_graph ? (g_hosts < 1 || g_switches < 1)
-                    : ls  ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > BLOCK || leaves * hpl > 65535)
+                    : ls  ? (leaves < 1 || spines < 1 || hpl < 1 || std::max(hpl + spines, leaves) > WIDE_BLOCK || leaves * hpl > 65535)
                           : (topo != "fattree" || k < 4 || k > 32 || (k & (k - 1)));
     const auto cc_of = [](const std::string &t) -> int {
 #define TWINS_POLICY_LOOKUP(key, id, name) if (t == name) return CC_##key;
@@ -374,7 +375,7 @@ int main(int argc, char **argv)
                         "          [--ecmp_from=csv [--hash_check=1]] [--spray=1 [--RngSeed=1 --RngRun=1]]\n"
                         "          [--tcp-sack=0|1] [--tcp-timestamps=0|1]\n"
                         "          | --worlds=<file>: one world per line, flows=..,tcp=..,ecnK=..,queue=..,fin=..,tcp-sack=..,tcp-timestamps=..,ecmp_from=..,out=..\n"
-                        "         leaf-spine: max(N+S, L) <= %d\n", BLOCK);
+                        "         leaf-spine: max(N+S, L) <= %d\n", WIDE_BLOCK);
 #define TWINS_POLICY_HELP(key, id, name) fprintf(stderr, "  imported --tcp=%s\n", name);
         TWINS_IMPORTED_POLICIES(TWINS_POLICY_HELP)
 #undef TWINS_POLICY_HELP
@@ -530,9 +531,9 @@ int main(int argc, char **argv)
         k = 0;
         for (int d : g_deg)
             k = std::max(k, d);
-        if (k > BLOCK)
+        if (k > WIDE_BLOCK)
         {
-            fprintf(stderr, "%s: a switch has %d ports (at most %d)\n", topo_file.c_str(), k, BLOCK);
+            fprintf(stderr, "%s: a switch has %d ports (at most %d)\n", topo_file.c_str(), k, WIDE_BLOCK);
             return 1;
         }
         // link failures: T:sA:sB[:up], the first link between two switches; epoch i follows the
@@ -689,7 +690,8 @@ int main(int argc, char **argv)
         host_lanes = s.H <= 128 ? 1 : s.H / 128;
     s.host_lanes = std::max(1, std::min(host_lanes, BLOCK));
     s.host_blocks = (s.H + s.host_lanes - 1) / s.host_lanes;
-    s.sw_per_block = BLOCK / k;
+    const bool wide_switches = k > BLOCK;
+    s.sw_per_block = (wide_switches ? WIDE_BLOCK : BLOCK) / k;
     s.max_slots = max_slots;
     const int H = s.H, S = s.S, E = k * hk, H1 = s.H1, S1 = s.S1;
 
@@ -1463,7 +1465,7 @@ int main(int argc, char **argv)
     }
 
     // the lean kernel unless a general feature is needed
-    bool basic = !is_graph && !spray && !force_general;
+    bool basic = !wide_switches && !is_graph && !spray && !force_general;
     for (int c = 0; c < F && basic; c++)
         basic = recs[c].simple && !recs[c].fin_on;
     if (getenv("TWINS_VERBOSE"))
@@ -1483,7 +1485,9 @@ int main(int argc, char **argv)
     CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     for (int i = 0; i < graph_k; i++)
     {
-        if (basic)
+        if (wide_switches)
+            kfull::ns_slot<WIDE_BLOCK><<<grid, WIDE_BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);
+        else if (basic)
             kbasic::ns_slot<<<grid, BLOCK, 0, stream>>>(reinterpret_cast<kbasic::Due *>(due), sw_ts, sw_ref, sw_up);
         else
             kfull::ns_slot<<<grid, BLOCK, 0, stream>>>(due, sw_ts, sw_ref, sw_up);

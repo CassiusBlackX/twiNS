@@ -613,8 +613,25 @@ static bool build_world(World &w, const Config &config, const string &topo_file,
                     f >> a >> b;
                     auto id = [&](const string &y) { return (y[0] == 'h' ? 0 : H) + atoi(y.c_str() + 1); };
                     links.push_back({id(a), id(b)});
-                    link_rate.push_back(bps);
-                    link_delay.push_back(delay);
+                    // Unit-bearing overrides are explicit. Older graph files
+                    // also carry bare TCP timing columns, which RDMA ignored.
+                    string rest, token;
+                    std::getline(f, rest);
+                    std::istringstream fields(rest);
+                    uint64_t rate = bps;
+                    int64_t ns = delay;
+                    while (fields >> token && token[0] != '#')
+                    {
+                        if (token.compare(0, 5, "rate=") == 0) rate = parse_rate(token.substr(5));
+                        if (token.compare(0, 6, "delay=") == 0) ns = parse_delay(token.substr(6));
+                    }
+                    if (!rate || ns <= 0)
+                    {
+                        fprintf(stderr, "%s: invalid rate or delay on link %s-%s\n", topo_file.c_str(), a.c_str(), b.c_str());
+                        return false;
+                    }
+                    link_rate.push_back(rate);
+                    link_delay.push_back(ns);
                 }
             } while (f >> x);
         if (!P.simai)
@@ -1191,6 +1208,9 @@ int main(int argc, char **argv)
     bool drain = false, due_fixed = false;
     int due_cap = MAX_DUE;
     string due_report;
+    string conweave;
+    int cw_cap = 4096;
+    bool cw_drop_tail = false;
     string q3_overrides, queue_report;
     bool q3_auto = false;
     int64_t queue_grace = -2;
@@ -1322,6 +1342,12 @@ int main(int argc, char **argv)
             serial = 1;
         else if (k == "--irn-parallel")
             irn_parallel = true;
+        else if (k == "--conweave-voq")
+            conweave = v;
+        else if (k == "--conweave-voq-cap")
+            cw_cap = std::stoi(v);
+        else if (k == "--conweave-drop-tail")
+            cw_drop_tail = true;
         else if (k == "--win")
         {
             kw = std::max(1, std::min(255, atoi(v.c_str())));
@@ -1720,6 +1746,52 @@ int main(int argc, char **argv)
     s.link_dport = dev_copy(link_dport);
     s.rt = dev_copy(rt);
     s.rtp = dev_copy(rtp);
+    if (!conweave.empty())
+    {
+        // flow ID, TX switch, RX switch, old/new device numbers, and the
+        // phase-0 tail byte. The controlled experiment changes one QP.
+        int f, tx, rx, old_dev, new_dev;
+        uint64_t tail_seq;
+        char comma[5];
+        std::istringstream spec(conweave);
+        const bool parsed = bool(spec >> f >> comma[0] >> tx >> comma[1] >> rx >> comma[2]
+                                      >> old_dev >> comma[3] >> new_dev >> comma[4] >> tail_seq);
+        spec >> std::ws;
+        if (!parsed || !spec.eof() || std::any_of(std::begin(comma), std::end(comma), [](char c) { return c != ','; }) ||
+            tail_seq > UINT32_MAX || W != 1 || !P.irn || P.simai || K > SAFE_LANES || worlds[0].dag ||
+            f < 0 || f >= F || tx < H || tx >= N || rx < H || rx >= N || tx == rx ||
+            old_dev < 1 || old_dev > deg[tx] || new_dev < 1 || new_dev > deg[tx] || cw_cap < 1 || cw_cap > 1048576 ||
+            link_dst[out_link[fi[f].src * K]] != tx || link_dst[out_link[fi[f].dst * K]] != rx)
+        {
+            fprintf(stderr, "--conweave-voq=flow,tx-switch,rx-switch,old-dev,new-dev,tail-byte needs one narrow IRN world and directly attached endpoints\n");
+            return 1;
+        }
+        const Route &to_receiver = rt[si[tx - H].rt_off + fi[f].dst];
+        const auto ports = rtp.begin() + to_receiver.off;
+        const auto last = ports + to_receiver.n;
+        if (std::find(ports, last, old_dev - 1) == last || std::find(ports, last, new_dev - 1) == last)
+        {
+            fprintf(stderr, "ConWeave devices must both lead toward the receiver\n");
+            return 1;
+        }
+        const Cfg settings{base};
+        s.conweave_slack = 1000ll * settings.u32("CONWEAVE_EXTRA_VOQ_FLUSH_TIME", 32);
+        s.conweave_wait = 1000ll * settings.u32("CONWEAVE_DEFAULT_VOQ_WAITING_TIME", 500);
+        s.conweave = dev_alloc<ConWeaveState>(1);
+        s.conweave_fifo = dev_alloc<Pkt>(cw_cap);
+        s.conweave_flow = f;
+        s.conweave_tx = tx;
+        s.conweave_rx = rx;
+        s.conweave_old = old_dev - 1;
+        s.conweave_new = new_dev - 1;
+        s.conweave_tail = tail_seq;
+        s.conweave_cap = cw_cap;
+        s.conweave_drop_tail = cw_drop_tail;
+        s.conweave_trace = getenv("TWINS_CW_TRACE") != nullptr;
+        serial = 1;
+        irn_parallel = false;
+        drain = true;
+    }
     // (global windows: the entities' bounds as per-entity windows', which they replace; no ranks
     // ahead, whose wide switches run single slots)
     // The final ACK on the sender's last hop also schedules receiver-QP
@@ -2946,6 +3018,14 @@ int main(int argc, char **argv)
         if (s.irn_parallel) printf("IRN active switch slots: %llu parallel, %llu fallback\n", n[4], n[5]);
     }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
+    if (s.conweave)
+    {
+        ConWeaveState result;
+        CK(cudaMemcpy(&result, s.conweave, sizeof(result), cudaMemcpyDeviceToHost));
+        printf("ConWeave VOQ: high-water %u, flushes %u, pending %u, overflow %u\n",
+               result.high_water, result.flushes, result.length, result.overflow);
+        bad |= result.overflow != 0;
+    }
     if (s.due_peaks)
     {
         vector<int> peaks(H);
