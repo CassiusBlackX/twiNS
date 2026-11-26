@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 from statistics import median
 import subprocess
@@ -28,6 +29,25 @@ def replace(path,old,new):
 def sha(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def invoke_bounded(command, cwd, env, stream, timeout):
+    # A pidfd signals exit without the 50 ms polling backoff in wait(timeout=...).
+    with subprocess.Popen(command,cwd=cwd,env=env,stdout=stream,stderr=subprocess.STDOUT) as proc:
+        try:
+            fd=os.pidfd_open(proc.pid)
+        except ProcessLookupError:
+            return proc.wait()
+        try:
+            poller=select.poll()
+            poller.register(fd,select.POLLIN)
+            if poller.poll(round(timeout*1000)):
+                return proc.wait()
+            proc.kill()
+            proc.wait()
+            return 124
+        finally:
+            os.close(fd)
 
 def compile_variants(output):
     work=output/'builds'
@@ -96,13 +116,15 @@ def route_hashes(case, out):
             writer.writerow((a,0,0,0,0,0,code))
     return ports
 
-def run(out, engines, case, spec, name, trial, observe=False):
+def run(out, engines, case, spec, name, trial, observe=False, environment=None, timeout=420):
     work=out/f'trial-{trial}'/name
     work.mkdir(parents=True)
     binary=engines[name]
     k=spec['k']
     env=os.environ.copy()
     env.pop('GEDES_PAIRED_LEAF',None)
+    if environment:
+        env.update(environment)
     if name=='twins':
         cmd=[binary,f'--k={k}','--tcp=newreno','--queue=200','--ecnK=200',
              f'--max_slots={spec.get("cap_ns",10_000_000)//1000}',f'--flows={case}/twins.csv',f'--ecmp_from={out}/twins-hash.csv','--out=fct.csv']
@@ -116,10 +138,7 @@ def run(out, engines, case, spec, name, trial, observe=False):
     cmd=['taskset','-c','0',*map(str,cmd)]
     start=time.perf_counter_ns()
     with (work/'process.log').open('wb') as stream:
-        try:
-            rc=subprocess.run(cmd,cwd=work,env=env,stdout=stream,stderr=subprocess.STDOUT,timeout=420).returncode
-        except subprocess.TimeoutExpired:
-            rc=124
+        rc=invoke_bounded(cmd,work,env,stream,timeout)
         elapsed=time.perf_counter_ns()-start
     log=(work/'process.log').read_text(errors='replace')
     row=dict(engine=name,trial=trial,rc=rc,wall_ns=elapsed,command=cmd,sha256=sha(binary),observation=observe)

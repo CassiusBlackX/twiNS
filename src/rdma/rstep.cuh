@@ -1539,6 +1539,7 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
     if (i >= s.tx_cap)
         return;
     TxRec &r = s.tx[i];
+    r.index = i;
     r.ts = now;
     r.node = node;
     r.dev = port + 1;
@@ -1553,7 +1554,6 @@ __device__ __forceinline__ void trace_tx(const Sim &s, int64_t now, int node, in
         extra.sack_bytes = ack ? p.sack.size : 0;
         extra.cnp = ack ? p.cnp : 0;
         extra.dport = s.fi[p.flow].dport;
-        r.index = i;
     }
     if (p.kind >= K_PAUSE)
     {

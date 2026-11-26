@@ -47,7 +47,7 @@ def audit(out):
             ('src/astra/closed.h','src/rdma/rmain.cu','src/rdma/rstep.cuh','src/rdma/rdma.h') if (root/p).is_file()})
     save(static/'provenance.json',data)
 
-def run_one(out,binary,name,hosts,opts):
+def run_one(out,binary,name,hosts,opts,env=None):
     out.mkdir(parents=True)
     suffix=name.replace('_hpn','_')
     command=['taskset','-c','0',str(binary),str(NEW/'validation/simai/SimAI.conf'),
@@ -57,7 +57,7 @@ def run_one(out,binary,name,hosts,opts):
     start=time.monotonic_ns()
     with log.open('wb') as stream:
         try:
-            rc=subprocess.run(command,cwd=out,stdout=stream,stderr=subprocess.STDOUT,timeout=1200).returncode
+            rc=subprocess.run(command,cwd=out,env=env,stdout=stream,stderr=subprocess.STDOUT,timeout=1200).returncode
         except subprocess.TimeoutExpired:
             rc=124
     elapsed=time.monotonic_ns()-start

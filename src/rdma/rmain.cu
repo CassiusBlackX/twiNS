@@ -2473,7 +2473,10 @@ int main(int argc, char **argv)
         vector<TxRec> r(n);
         CK(cudaMemcpy(r.data(), s.tx, n * sizeof(TxRec), cudaMemcpyDeviceToHost));
         std::sort(r.begin(), r.end(), [](const TxRec &a, const TxRec &b) {
-            return a.ts != b.ts ? a.ts < b.ts : a.node != b.node ? a.node < b.node : a.dev < b.dev;
+            if (a.ts != b.ts) return a.ts < b.ts;
+            if (a.node != b.node) return a.node < b.node;
+            if (a.dev != b.dev) return a.dev < b.dev;
+            return a.index < b.index;
         });
         vector<IrnWire> feedback(s.irn_wire ? n : 0);
         if (s.irn_wire)

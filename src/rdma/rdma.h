@@ -684,7 +684,7 @@ struct TxRec
     uint32_t a, b, sport, seq; // src/dst host (PFC: queue, 0)
     uint16_t size;
     uint8_t kind, ecn;
-    uint32_t index; // original offset of the optional IRN feedback fields
+    uint32_t index; // capture order and offset of the optional IRN feedback fields
 };
 
 // a link's frames arriving in a slot: their count, and the index of the first in s.msg

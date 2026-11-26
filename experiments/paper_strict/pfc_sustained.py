@@ -52,7 +52,7 @@ def freeze(out):
         save(common/'provenance.json',dict(pool_mib=pool,burst_mib=burst,
              workload_sha256=sha(wl),reference_topology_sha256=sha(topology),config_sha256=sha(cfg)))
 
-def reference(out,core=4):
+def reference(out,core=4,trace_wire=True,timeout=3600,docker_options=()):
     topo=next(DATA.glob('topo/DCN+SingleToR_128g*200Gbps*A100*'))
     extractor=Path(__file__).with_name('trace2dag.py')
     for label,pool,burst in DESIGN:
@@ -66,12 +66,14 @@ def reference(out,core=4):
         name=f'twins-pfc-confirm-{out.parent.name.lower()}-{pool}'
         cmd=['docker','run','--rm','--name',name,'--network=none','--ulimit','core=0',
              '--user',f'{os.getuid()}:{os.getgid()}','--cpuset-cpus',str(core),'--memory=20g','--memory-swap=20g',
-             '-e','AS_SEND_LAT=3','-e','TWINS_TRACE=/raw/events.trace','-e','TWINS_TXTRACE=/raw/wire.trace',
-             '-e','TWINS_TXUNTIL=400000','-v',f'{MODEL}:/simai:ro','-v',f'{DATA}:/data:ro',
+             '-e','AS_SEND_LAT=3','-e','TWINS_TRACE=/raw/events.trace']
+        if trace_wire:
+            cmd+=['-e','TWINS_TXTRACE=/raw/wire.trace','-e','TWINS_TXUNTIL=400000']
+        cmd+=[*docker_options,'-v',f'{MODEL}:/simai:ro','-v',f'{DATA}:/data:ro',
              '-v',f'{raw}:/raw','-v',f'{raw}/etc:/etc/astra-sim','-v',f'{common}:/case:ro',
              '-w','/raw','localhost/simai-build','/simai/'+SIM_BIN,
              '-t','1','-w','/case/workload.log','-n',f'/data/topo/{topo.name}','-c','/case/config.log']
-        rc,wall=timed(cmd,ref,'process.log',3600)
+        rc,wall=timed(cmd,ref,'process.log',timeout)
         if rc==124:
             subprocess.run(['docker','stop','-t','4',name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         fct=raw/'etc/simulation/llama_hpn7_fct.txt'
@@ -138,7 +140,7 @@ def measure(out,instrumented):
                     with (work/'hotspot-wire.log').open('w') as dst:
                         for line in raw.open():
                             fields=line.split()
-                            if len(fields)==14 and fields[1].isdigit() and int(fields[1])==node:
+                            if len(fields) in (10,14) and fields[1].isdigit() and int(fields[1])==node:
                                 dst.write(line)
                 row=dict(case=label,arm=arm,sample=epoch,rc=rc,wall_ns=elapsed,binary_sha256=sha(binary),
                          reference_rc=proven['rc'],matched=equal,accepted=rc==0 and proven['rc']==0 and all(equal.values()),

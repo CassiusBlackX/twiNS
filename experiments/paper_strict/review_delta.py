@@ -116,6 +116,29 @@ def publish():
         lines+=['',f'复核 {len(r["runs"])} 个原 CUDA lineage 观测和计时点，'
                 f'识别到 {r["runs_with_detected_retries"]} 次运行发生重试。'
                 '逐遍、整进程墙钟及根 ID 匹配条件记录在 lineage-timing-and-retries.json。']
+    if (r:=read(BASE/'remaining-s50-verified.json')):
+        lines+=['','## s50 最终验收','',
+            f'本轮 s50 的 {r["verified_s50_files"]:,} 份回传文件已通过 SHA-256 校验。'
+            'CUDA 统一候选通过网络 972/985、闭环 42/42、what-if 44/47。'
+            '12 个网络点受定时器约束，1 个网络点和 3 个 what-if 复现滞留。','',
+            'TwiNS 和 GeDES 的八组退出快照均复现冻结 FCT。两档节奏输入退出时，'
+            '观测的队列、在途帧和已武装计时器均为空。1,024 主机节奏输入的 '
+            'TwiNS 最后实际处理槽索引为 40,969，逻辑边界为 40.970 ms。'
+            '原 Executed Slots 字段记录了退出后的槽游标，其值为 100,000。'
+            'GeDES 在 1,024 主机突发输入的截止点仍有 192 个未确认数据的 RTO 状态。','',
+            '四档 PFC 共 32 次结果匹配独立参考。热点回收时纳入当前十字段线迹，'
+            '有效前缀的十字段多重集均与顺序参照一致。带相同时间戳的控制帧与数据帧'
+            '在部分端口的输出排列不同，归档表同存次序差异和多重集核对。','',
+            '| 场景 | 热点暂停或 headroom 占比 | 最长连续活跃暂停槽 | safe / serial 墙钟中位数 s |',
+            '| --- | ---: | ---: | ---: |']
+        for key,row in r['pfc'].items():
+            lines.append(f'| {key} | {100*row["committed_hotspot_pause_fraction"]:.2f}% | '
+                f'{row["max_pause_streak_slots"]:,} | {row["safe_wall_median_s"]:.6f} / {row["serial_wall_median_s"]:.6f} |')
+        lines+=['','DCTCP 与 CUBIC 在原拓扑和亚纳秒输入上的四组完整库 FMA 及 CUDA 核对均通过。'
+            'HIP 数值对照随本机 A5 作业结束而进入同一卡的队列。','',
+            'AI 漂移的 36 次同机配对均匹配输出。GPT‑3 13B 探针的默认墙钟从 63.275 s '
+            '变为 67.986 s。关闭网络全局窗口或关闭 persistent 启动，旧版与候选的时间差仍出现。'
+            '旧版和候选的内核资源回执已归档，具体内核增时原因仍待定位。']
     tmp=REPORT.with_suffix('.tmp')
     tmp.write_text('\n'.join(lines)+'\n')
     tmp.replace(REPORT)
