@@ -182,7 +182,10 @@ ordinals, the deepest ordinal difference where lineages meet, roots in set-up or
 simultaneous events (all pairs of groups up to 256, else neighbours and random pairs). 70 runs of
 jobs1-3, jobs_dctcp and small topologies (the 1,024-host ones left out for the oracle's memory):
 365 M events, 2.00 billion pairs (47.7 M at one node); Theorem 1 disagrees 0; the comparator is right
-on every pair, 0 undecided, 0 wrong. (`validation/audit/oracle_rdma.sh`, a87 `~/netsim/rdma/oracle`.)
+on every pair, 0 undecided, 0 wrong. (`validation/audit/oracle_rdma.sh`, a87 `~/netsim/rdma/oracle`.) The other 4
+jobs (k8 permutation, 64 lockstep 14.5 MB flows, QCN off/on) were stopped after ~6 h: every lead
+agrees down to the root, so the oracle's full-lineage walk grows with the run (0.8 MB/s of log,
+days to finish). TwiNS-RDMA's own runs of these jobs stay identical to the reference.
 
 ### Vanilla ns-3.46.1 (R-2)
 Our TCP reference is ns-3.46.1 from Unison's tree run sequentially. Vanilla ns-3.46.1 has no per-flow
@@ -226,3 +229,9 @@ intervals must be at least the slot), HPCC at 5 and 10 us first overflowed a lin
 ### CUDA
 `TailNode::pos` is uint64_t (unsigned long): CUDA's atomics need unsigned long long*; the seqlock
 code now casts (HIP accepted it, so the seqlock had not been compiled for CUDA before).
+
+### 5090, final build (CUDA)
+TCP check_all 306/306, sweeps 138/138 and 48/48, grid 200/200, RDMA jobs1/2/3/dctcp/topo and the
+32-world sweep, AI collectives 18/18, LLaMA, 42 paper runs and the 47-run matrix in closed loop: all
+identical. Lead-fingerprint checks over the 89 closed-loop runs: 1.0e11, bounds summing to 5.2e-13.
+RX (HIP): the same 42 paper runs and 47-run matrix with NVLink islands: all identical.
