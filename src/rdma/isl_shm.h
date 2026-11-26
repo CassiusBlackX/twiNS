@@ -43,6 +43,8 @@ struct IslShm
     int64_t slot;       // the island's slot after the command
     uint64_t in_n, out_n, in_cap, out_cap;
     double busy_s; // the island's time in its runs
+    uint64_t run_ready_ns; // first output published on the host monotonic clock
+    bool profile;
     uint64_t nodes; // the tail nodes the island has made (its ring holds the last 2^ringlog)
     unsigned long long ev[40]; // its counters (Sim::ev): undecided ties, ties on lost tails, overflows
     uint32_t copy_gen;   // the table of the GPU's nodes (IslCopies): remap when this changes

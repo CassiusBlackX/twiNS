@@ -149,6 +149,8 @@ __device__ __forceinline__ LFrame *link_push(const Sim &s, int64_t ts, OutBucket
     if (o.n >= o.cap)
     {
         atomicAdd(&s.ev[4], 1ull);
+        if (s.frame_overflow_world)
+            atomicAdd(&s.frame_overflow_world[s.link_world[o.link]], 1ull);
         return nullptr;
     }
     return s.msg + o.base + o.n++;
@@ -1682,11 +1684,11 @@ __device__ __forceinline__ bool win_bound(const Params &P, const SndQP &q)
 }
 
 // QbbNetDevice::TransmitStart: TransmitComplete after tx, the peer's Receive after tx + delay
-__device__ inline void irn_final_hop(const Sim &s, const Pkt &p, int link, int64_t now, int64_t at, const Chain &parent)
+__device__ inline void rx_final_hop(const Sim &s, const Params &params, const Pkt &p, int link, int64_t now, int64_t at, const Chain &parent)
 {
-    if (p.kind != K_NACK || s.link_dst[link] != p.src || p.seq < s.fi[p.flow].size)
+    if (p.kind != (params.irn ? K_NACK : K_ACK) || s.link_dst[link] != p.src || p.seq < s.fi[p.flow].size)
         return;
-    auto &life = s.irn_lifetime[p.flow];
+    auto &life = s.rx_lifetime[p.flow];
     if (atomicCAS(&life.close_at, 0ull, (unsigned long long)at) == 0)
         cpush(&life.close_chain, ccode(at - now, p.ord), parent);
 }
@@ -1729,7 +1731,7 @@ __device__ __forceinline__ void h_transmit(HCtx<ND> &c, Pkt p)
     f->ts = ts;
     f->c = c.cur;
     f->p = p;
-    if (c.P->irn) irn_final_hop(s, p, c.ob().link, c.now, ts, c.cur);
+    if (s.rx_lifetime) rx_final_hop(s, *c.P, p, c.ob().link, c.now, ts, c.cur);
     trace_tx(s, c.now, c.h, c.d, p);
 }
 
@@ -2034,10 +2036,24 @@ __device__ __forceinline__ void due_note(HCtx<ND> &c, const SndQP &q, int64_t t)
         m = t;
 }
 
+#ifdef RDMA_TIMER_AUDIT
+template <int ND>
+__device__ inline void dcqcn_audit(const HCtx<ND> &c, int f, const SndQP &q, const char *kind)
+{
+    const auto &fi = c.s->fi[f];
+    printf("DCQCN %lld %u %u %u %s %d %d %llu\n", (long long)c.now,
+           unsigned(fi.src), unsigned(fi.dst), unsigned(fi.sport), kind,
+           int(q.alpha_cnp), int(q.dec_cnp), (unsigned long long)q.rate);
+}
+#endif
+
 // RdmaHw::cnp_received_mlx
 template <int ND>
 __device__ __forceinline__ void dcqcn_cnp(HCtx<ND> &c, int f, SndQP &q)
 {
+#ifdef RDMA_TIMER_AUDIT
+    dcqcn_audit(c, f, q, "cnp");
+#endif
     const Sim &s = *c.s;
     q.alpha_cnp = 1;
     q.dec_cnp = 1;
@@ -2105,6 +2121,9 @@ __device__ __forceinline__ void dcqcn_timer(HCtx<ND> &c, int f, int kind)
     const Sim &s = *c.s;
     const Params &P = *c.P;
     SndQP &q = s.qp[f];
+#ifdef RDMA_TIMER_AUDIT
+    dcqcn_audit(c, f, q, kind == 0 ? "alpha" : kind == 1 ? "dec" : "rp");
+#endif
     if (kind == 0)
     {
         if (q.alpha_cnp)
@@ -2233,16 +2252,20 @@ __device__ __forceinline__ void h_data(HCtx<ND> &c, const Pkt &p)
 {
     const Sim &s = *c.s;
     RcvQP &r = s.rx[p.flow];
+#ifdef RDMA_LIFETIME_PROBE
+    if (s.duplicate_packet && p.flow == 0 && p.seq == 1000 && c.now < s.duplicate_at)
+        *s.duplicate_packet = p;
+#endif
     uint32_t payload = p.size - data_hdr(*c.P);
-    // data for a flow received whole: if the sender has completed by now, ns-3 has deleted the
-    // receiving queue pair, and a new one would answer with a NACK (not modelled; needs a drop)
+    // HPCC deletes the receive QP in the sender's completion event. The final
+    // hop publishes that event before either endpoint can reach its slot.
     if (r.expected >= s.fi[p.flow].size)
     {
-        if (!c.P->irn)
+        if (!s.rx_lifetime)
             atomicAdd(&s.ev[13], 1ull);
         else
         {
-            auto &life = s.irn_lifetime[p.flow];
+            auto &life = s.rx_lifetime[p.flow];
             int64_t at = atomicAdd(&life.close_at, 0ull);
             if (!life.reopened && at && (at < c.now ||
                 (at == c.now && before(s, at, 0, life.close_chain, at, 0, c.cur))))
@@ -2771,6 +2794,29 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
                         bt = t;
                     }
                 }
+#ifdef RDMA_LIFETIME_PROBE
+        if (h == 1 && s.duplicate_packet && s.duplicate_packet->size && !*s.duplicate_processed &&
+            s.duplicate_at >= t0 && s.duplicate_at < t1 && s.duplicate_at <= bt)
+        {
+            c.now = s.duplicate_at;
+            c.ord = 0;
+            const auto &life = s.rx_lifetime[0];
+            if (s.duplicate_after_close)
+                cpush(&c.cur, ccode(0, 0), life.close_chain);
+            else
+            {
+                Chain setup{};
+                setup.root = s.fi[0].start_chain.root;
+                chash_reset(setup);
+                cpush(&c.cur, ccode(s.duplicate_at, 0), setup);
+            }
+            printf("RXQP duplicate %lld expected %u close %llu\n", (long long)c.now, s.rx[0].expected, life.close_at);
+            hsel(c, s.fi[0].rnic);
+            h_data(c, *s.duplicate_packet);
+            *s.duplicate_processed = 1;
+            continue;
+        }
+#endif
         if (bk < 0)
             break;
 #ifdef RDMA_PROF
@@ -2901,6 +2947,10 @@ __device__ __forceinline__ bool host_step(const Sim &s, const BlockInfo &bi, int
             w = st.tc_at;
         s.hs[c.nic0 + d] = st;
     }
+#ifdef RDMA_LIFETIME_PROBE
+    if (h == 1 && s.duplicate_packet && !*s.duplicate_processed && s.duplicate_at < w)
+        w = s.duplicate_at;
+#endif
     s.hs[c.nic0].wake = w; // (with its TransmitCompletes: when it must run again without input)
     *wake = w;
     return act;
@@ -3027,8 +3077,26 @@ __device__ __forceinline__ void s_transmit(SCtx &c, int port, Pkt p)
     f->ts = ts;
     f->c = cur;
     f->p = p;
-    if (c.P->irn) irn_final_hop(s, p, c.w[port].ob.link, c.now, ts, cur);
+    if (s.rx_lifetime) rx_final_hop(s, *c.P, p, c.w[port].ob.link, c.now, ts, cur);
     trace_tx(s, c.now, c.node, port, p);
+}
+
+__device__ __forceinline__ uint64_t q3_offset(const Sim &s, size_t pi)
+{
+    return s.q3_offsets ? s.q3_offsets[pi] : uint64_t(pi) * s.q3_cap;
+}
+
+__device__ __forceinline__ int q3_capacity(const Sim &s, size_t pi, uint64_t offset)
+{
+    return s.q3_offsets ? int(s.q3_offsets[pi + 1] - offset) : s.q3_cap;
+}
+
+__device__ __forceinline__ void s_queue_overflow(SCtx &c, size_t pi, int cls)
+{
+    const Sim &s = *c.s;
+    atomicAdd(&s.ev[5], 1ull);
+    if (s.queue_overflow_at && !s.queue_overflow_at[2 * pi + cls])
+        s.queue_overflow_at[2 * pi + cls] = c.now + 1;
 }
 
 __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p)
@@ -3040,7 +3108,7 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
     {
         if (pt.q0_n >= s.q0_cap)
         {
-            atomicAdd(&s.ev[5], 1ull);
+            s_queue_overflow(c, pi, 0);
             return;
         }
         s.q0[pi * s.q0_cap + ring_add(pt.q0_head, pt.q0_n, s.q0_cap)] = p;
@@ -3048,12 +3116,14 @@ __device__ __forceinline__ void s_enqueue(SCtx &c, int port, int q, const Pkt &p
     }
     else
     {
-        if (pt.q3_n >= s.q3_cap)
+        const uint64_t offset = q3_offset(s, pi);
+        const int capacity = q3_capacity(s, pi, offset);
+        if (pt.q3_n >= capacity)
         {
-            atomicAdd(&s.ev[5], 1ull);
+            s_queue_overflow(c, pi, 1);
             return;
         }
-        s.q3[pi * s.q3_cap + ring_add(pt.q3_head, pt.q3_n, s.q3_cap)] = p;
+        s.q3[offset + ring_add(pt.q3_head, pt.q3_n, capacity)] = p;
         pt.q3_n++;
     }
     pt.bytes_total += p.size;
@@ -3106,8 +3176,10 @@ __device__ __forceinline__ void s_dequeue(SCtx &c, int port)
     }
     if ((pt.paused >> PG & 1) || pt.q3_n == 0)
         return;
-    Pkt p = s.q3[((size_t)s.pbase[c.x] + port) * s.q3_cap + pt.q3_head];
-    pt.q3_head = ring_add(pt.q3_head, 1, s.q3_cap);
+    const size_t pi = size_t(s.pbase[c.x]) + port;
+    const uint64_t offset = q3_offset(s, pi);
+    Pkt p = s.q3[offset + pt.q3_head];
+    pt.q3_head = ring_add(pt.q3_head, 1, q3_capacity(s, pi, offset));
     pt.q3_n--;
     pt.bytes_total -= p.size;
     s_start_q3(c, port, p);
@@ -3681,6 +3753,35 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
     }
     if (nsl > 1 && !safe)
         return 2;
+#ifdef RDMA_PFC_AUDIT
+    int pfc_reason = -1;
+    unsigned long long pfc_started = 0;
+    if (lane == 0 && (node == 144 || node == 145) && nsl == 1)
+    {
+        bool held = false, incoming_pause = false, bounded = true;
+        uint64_t arrival_bytes = 0;
+        for (int p = 0; p < deg; ++p)
+        {
+            held |= w[p].pt.hdrm || w[p].pt.mmu_paused;
+            incoming_pause |= w[p].pt.paused != 0;
+            arrival_bytes += abytes[p];
+        }
+        const auto &sw = s.sw[x];
+        const int64_t room = int64_t(uint32_t(WP.buffer_size - sw.total_hdrm - sw.total_rsrv)) - sw.shared_used - int64_t(arrival_bytes);
+        const int64_t threshold = sw.fixed_pfc_limit ? sw.fixed_pfc_limit : room > 0 ? room >> sw.max_shift : -1;
+        for (int p = 0; p < deg; ++p)
+        {
+            const int64_t demand = int64_t(w[p].pt.ing) + abytes[p] - RESERVE;
+            const int64_t shared = demand > 0 ? demand : 0;
+            bounded &= shared < threshold &&
+                !(abytes[p] > s.pc[s.pbase[x] + p].hdrm_cap && shared + abytes[p] > threshold);
+        }
+        const bool layout = !pooled || total > LK || D > 65535 || deg > lanes || (!WIDE && deg > SAFE_LANES);
+        pfc_reason = int(safe) | (int(held) << 1) | (int(!bounded) << 2) | (int(layout) << 3) |
+                     (int(incoming_pause) << 4) | (int(s.serial) << 5);
+        pfc_started = clock64();
+    }
+#endif
     if (lane == 0 && irn_check)
     {
         bool busy = total != 0;
@@ -4343,6 +4444,25 @@ __device__ __forceinline__ int switch_step(const Sim &s, const BlockInfo &bi, in
         }
     }
     __syncthreads();
+#ifdef RDMA_PFC_AUDIT
+    if (pfc_reason >= 0)
+    {
+        const auto cycles = clock64() - pfc_started;
+        int transmitting = 0, frames = 0;
+        for (int p = 0; p < deg; ++p)
+        {
+            transmitting += w[p].nout > 0;
+            frames += w[p].nout;
+        }
+        auto *row = s.pfc_profile + (size_t((node - 144) * 64 + pfc_reason) * (KMAX + 1) + transmitting) * 5;
+        atomicAdd(row, 1ull);
+        atomicAdd(row + 1, (unsigned long long)cycles);
+        atomicAdd(row + 2, (unsigned long long)frames);
+        atomicAdd(row + 3, (unsigned long long)total);
+        if (transmitting > 1 && total == 0 && !(pfc_reason & (2 | 16)))
+            atomicAdd(row + 4, 1ull);
+    }
+#endif
     for (int p = lane; p < deg; p += lanes)
     {
         link_flush(s, w[p].ob);

@@ -9,6 +9,8 @@
 // (its overrides on top of CONFIG's and the command line's), run side by side with the others;
 // world name's results go to DIR/name.fct. The worlds share the slot (the shortest link delay).
 // --q3cap: frames a switch port's queue holds (default 4096; an overflow is reported)
+// --q3-overrides=FILE: node, one-based device, and capacity per line for exceptional ports
+// --queue-capacity-report=FILE: each port/class's first overflow and its occupancy
 // --win: the most slots a block runs in one launch (default 1: one slot per launch; windows rarely
 // run in busy networks, and checking for them cost more than they saved)
 // --gwin=N: global windows: every launch runs up to N slots for all entities, as many as no frame
@@ -1069,6 +1071,10 @@ int main(int argc, char **argv)
 {
     g_argc = argc;
     g_argv = argv;
+#if defined(RDMA_TIMER_AUDIT) && !defined(TWINS_USE_HIP) && !defined(TWINS_CPU)
+    // Keep the full event trace even when a launch emits large timer batches.
+    CK(cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 64u << 20));
+#endif
     if (argc < 2)
     {
         fprintf(stderr, "usage: twins-rdma CONFIG --topo=F --flows=F --out=F [--txtrace=F --from=ns --until=ns] [KEY=VALUE ...]\n"
@@ -1080,6 +1086,9 @@ int main(int argc, char **argv)
         return 1;
     string topo_file, flow_file, out_file = "fct.txt", tx_file, rate_s = "100Gbps", batch_file, out_dir = ".", data_dirs = "", sent_file;
     int64_t delay = 1000, tx_from = 0, tx_until = INT64_MAX;
+    string q3_overrides, queue_report;
+    vector<int> batch_select, batch_source_ids;
+    int64_t retry_slot = INT64_MAX;
     int q3cap = 4096, tail_log2 = 24, spread = 32, serial = 0, kw = 1, rank_ahead = 2, rank_join = 1, rank_bs = 512, rank_every = 8, persist = 1;
     int gwin = 32;
     bool irn_parallel = false;
@@ -1122,6 +1131,20 @@ int main(int argc, char **argv)
             delay = atoll(v.c_str());
         else if (k == "--q3cap")
             q3cap = atoi(v.c_str());
+        else if (k == "--q3-overrides")
+            q3_overrides = v;
+        else if (k == "--queue-capacity-report")
+            queue_report = v;
+        else if (k == "--batch-retry-select")
+        {
+            batch_select.clear();
+            std::istringstream list(v);
+            string item;
+            while (std::getline(list, item, ',')) batch_select.push_back(std::stoi(item));
+            std::sort(batch_select.begin(), batch_select.end());
+        }
+        else if (k == "--batch-retry-slot-ns")
+            retry_slot = std::stoll(v);
         else if (k == "--tail")
         {
             tail_log2 = atoi(v.c_str());
@@ -1295,12 +1318,19 @@ int main(int argc, char **argv)
             return 1;
         }
         string line;
+        int source_id = 0;
         while (std::getline(f, line))
         {
             std::istringstream is(line);
             string name, topo, flows, kv;
             if (!(is >> name) || name[0] == '#' || !(is >> topo >> flows))
                 continue;
+            const int id = source_id++;
+            if (id == 0)
+                simai_link0(find_file(topo), &bps, &delay);
+            if (!batch_select.empty() && !std::binary_search(batch_select.begin(), batch_select.end(), id))
+                continue;
+            batch_source_ids.push_back(id);
             Config cfg = base;
             while (is >> kv)
             {
@@ -1312,8 +1342,6 @@ int main(int argc, char **argv)
                 }
                 set_override(cfg, kv.substr(0, eq), kv.substr(eq + 1));
             }
-            if (worlds.empty())
-                simai_link0(find_file(topo), &bps, &delay);
             worlds.emplace_back();
             worlds.back().name = name;
             if (!build_world(worlds.back(), cfg, find_file(topo), find_file(flows), bps, delay))
@@ -1331,11 +1359,29 @@ int main(int argc, char **argv)
         }
     }
     const int W = worlds.size();
-    // the slot: the shortest link delay of all worlds
+    // A slot cannot span another firing of a periodic host timer.
+    // Link propagation stays in w.ldelay and is independent of this bound.
     int64_t D = INT64_MAX;
     for (auto &w : worlds)
         for (int64_t d : w.ldelay)
             D = std::min(D, d);
+    const int64_t shortest_link = D;
+    for (auto &w : worlds)
+        if (w.P.cc == 1)
+        {
+            const int64_t interval = std::min({w.P.alpha_int, w.P.dec_int, w.P.rp_int});
+            if (interval <= 0)
+            {
+                fprintf(stderr, "%s: DCQCN timer intervals must be positive\n", w.name.c_str());
+                return 1;
+            }
+            D = std::min(D, interval);
+        }
+    if (D < shortest_link)
+        printf("DCQCN execution slot %lld ns; shortest physical link %lld ns\n",
+               (long long)D, (long long)shortest_link);
+    if (retry_slot <= 0) { fprintf(stderr, "invalid RDMA retry slot\n"); return 1; }
+    D = std::min(D, retry_slot);
     for (auto &w : worlds)
     {
         w.P.delay = D;
@@ -1346,12 +1392,6 @@ int main(int argc, char **argv)
 #ifdef TWINS_ASTRA_HOST
         if (w.P.irn && g_nvl_islands) { fprintf(stderr, "IRN uses GPU network execution\n"); return 1; }
 #endif
-        if (w.P.cc == 1 && (w.P.alpha_int < D || w.P.dec_int < D || w.P.rp_int < D))
-        {
-            fprintf(stderr, "%s: DCQCN timer intervals must be at least the slot (the shortest link delay, %lld ns)\n", w.name.c_str(),
-                    (long long)D);
-            return 1;
-        }
     }
     delay = D;
 
@@ -1824,7 +1864,6 @@ int main(int argc, char **argv)
         s.irn_off = dev_copy(offsets);
         s.irn_sender = dev_alloc<IrnSender>(F);
         s.irn_receiver = dev_alloc<IrnMap>(F);
-        s.irn_lifetime = dev_alloc<IrnLifetime>(F);
         s.irn_tx_bits = dev_alloc<uint32_t>(offsets.back());
         s.irn_rx_bits = dev_alloc<uint32_t>(offsets.back());
         s.irn_counts = dev_alloc<unsigned long long>(6);
@@ -1832,6 +1871,24 @@ int main(int argc, char **argv)
     s.qp = dev_alloc<SndQP>(F);
     s.qc = dev_alloc<QPChains>(F);
     s.rx = dev_alloc<RcvQP>(F);
+    if (!P.simai || s.irn_sender)
+        s.rx_lifetime = dev_alloc<RxLifetime>(F);
+#ifdef RDMA_LIFETIME_PROBE
+    s.duplicate_at = INT64_MAX;
+    if (const char *at = getenv("TWINS_DUPLICATE_NS"))
+    {
+        s.duplicate_at = atoll(at);
+        if (W != 1 || P.simai || F < 2 || fi[0].src != 0 || fi[0].dst != 1 || fi[0].size != 2000 ||
+            P.mtu != 1000 || s.duplicate_at <= fi[0].start)
+        {
+            fprintf(stderr,"duplicate probe requires the frozen two-flow fixture\n");
+            return 1;
+        }
+        s.duplicate_after_close = getenv("TWINS_DUPLICATE_AT_CLOSE") != nullptr;
+        s.duplicate_packet = dev_alloc<Pkt>(1);
+        s.duplicate_processed = dev_alloc<int>(1);
+    }
+#endif
     s.start_list = dev_copy(start_list);
     // per NIC: a host's devices in turn (its flow starts in its first device's Host)
     vector<int> nic_off(H + 1, 0);
@@ -1947,8 +2004,39 @@ int main(int argc, char **argv)
     s.p_tc = dev_alloc<Chain>(nports);
     s.q0_cap = 64;
     s.q3_cap = q3cap;
+    if (q3cap <= 0 || q3cap > INT_MAX / 2)
+    {
+        fprintf(stderr, "invalid --q3cap\n");
+        return 1;
+    }
     s.q0 = dev_alloc<Pkt>((size_t)nports * s.q0_cap);
-    s.q3 = dev_alloc<Pkt>((size_t)nports * s.q3_cap);
+    vector<uint64_t> q3_offsets;
+    size_t q3_entries = nports * size_t(q3cap);
+    if (!q3_overrides.empty())
+    {
+        vector<int> capacities(nports, q3cap);
+        std::ifstream in(q3_overrides);
+        int node, device, capacity;
+        while (in >> node >> device >> capacity)
+        {
+            if (node < H || node >= N || device <= 0 || device > deg[node] ||
+                capacity <= 0 || capacity > INT_MAX / 2)
+            {
+                fprintf(stderr, "invalid queue override: %d %d %d\n", node, device, capacity);
+                return 1;
+            }
+            capacities[pbase[node - H] + device - 1] = capacity;
+        }
+        if (!in.eof() || in.bad()) { fprintf(stderr, "invalid queue override file\n"); return 1; }
+        q3_offsets.resize(nports + 1);
+        for (size_t p = 0; p < nports; ++p)
+            q3_offsets[p + 1] = q3_offsets[p] + capacities[p];
+        q3_entries = q3_offsets.back();
+        s.q3_offsets = dev_copy(q3_offsets);
+    }
+    printf("RDMA queue storage: data slots %zu, bytes %zu\n", q3_entries, q3_entries * sizeof(Pkt));
+    s.q3 = dev_alloc<Pkt>(q3_entries);
+    if (!queue_report.empty()) s.queue_overflow_at = dev_alloc<int64_t>(2 * nports);
     // links: rate classes (tx tables), and the rings of arrival slots. A frame starting in slot k
     // arrives by (k + 1) D - 1 + its tx time + the delay, so at most 1 + (txmax + delay - 1) / D
     // slots later; a slot's bucket holds the frames that can arrive in D at one per shortest frame
@@ -2089,6 +2177,17 @@ int main(int argc, char **argv)
     }
 #endif
     s.ev = dev_alloc<unsigned long long>(40);
+    if (!batch_file.empty() && W > 1)
+    {
+        vector<int> owners(L);
+        for (int i = 0; i < W; ++i)
+            std::fill_n(owners.begin() + lbase[i], worlds[i].L, i);
+        s.link_world = dev_copy(owners);
+        s.frame_overflow_world = dev_alloc<unsigned long long>(W);
+    }
+#ifdef RDMA_PFC_AUDIT
+    s.pfc_profile = dev_alloc<unsigned long long>(2 * 64 * (KMAX + 1) * 5);
+#endif
     {
         Memo m;
         uint64_t cap = 1ull << 22; // 32 MB
@@ -2558,15 +2657,45 @@ int main(int argc, char **argv)
         if (s.irn_parallel) printf("IRN active switch slots: %llu parallel, %llu fallback\n", n[4], n[5]);
     }
     bool bad = ev[4] || ev[5] || ev[6] || ev[7] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36];
+#ifdef RDMA_PFC_AUDIT
+    vector<unsigned long long> counters(2 * 64 * (KMAX + 1) * 5);
+    CK(cudaMemcpy(counters.data(), s.pfc_profile, counters.size() * sizeof(counters[0]), cudaMemcpyDeviceToHost));
+    for (int node = 0; node < 2; ++node)
+        for (int reason = 0; reason < 64; ++reason)
+            for (int txports = 0; txports <= KMAX; ++txports)
+            {
+                const auto *row = counters.data() + (size_t(node * 64 + reason) * (KMAX + 1) + txports) * 5;
+                if (row[0])
+                    printf("pfc_work %d %d %d %llu %llu %llu %llu %llu\n", node + 144, reason, txports,
+                           row[0], row[1], row[2], row[3], row[4]);
+            }
+#endif
     if (ev[36])
         fprintf(stderr, "error: a persistent launch's blocks did not all run (--persist=0)\n");
+    if (s.queue_overflow_at)
+    {
+        vector<int64_t> at(2 * nports);
+        CK(cudaMemcpy(at.data(), s.queue_overflow_at, at.size() * sizeof(at[0]), cudaMemcpyDeviceToHost));
+        std::ofstream report(queue_report);
+        if (!report) { fprintf(stderr, "cannot write queue capacity report\n"); return 1; }
+        report << "time_ns node device class occupancy\n";
+        for (int sw = 0; sw < S; ++sw)
+            for (int i = pbase[sw]; i < pbase[sw + 1]; ++i)
+                for (int cls = 0; cls < 2; ++cls)
+                    if (at[2 * i + cls])
+                    {
+                        const int cap = q3_offsets.empty() ? q3cap : int(q3_offsets[i + 1] - q3_offsets[i]);
+                        report << at[2 * i + cls] - 1 << ' ' << H + sw << ' ' << i - pbase[sw] + 1
+                               << ' ' << (cls ? 3 : 0) << ' ' << (cls ? cap : s.q0_cap) << '\n';
+                    }
+    }
     if (ev[14] || ev[15] || ev[32] || ev[33])
         fprintf(stderr, "error: DAG message overflow %llu, ready-flow overflow %llu, late events %llu, inputs to a window already run %llu\n", ev[14], ev[15], ev[32], ev[33]);
     if (bad)
         fprintf(stderr, "warning: capacity overflow, results are not exact\n");
     if (ev[13])
-        fprintf(stderr, "warning: %llu data frames reached receivers after their flows' last byte; if their senders had "
-                        "completed, ns-3 would answer them with NACKs (not modelled)\n", ev[13]);
+        fprintf(stderr, "warning: %llu data frames reached SimAI receivers after their flows' last byte; if their senders had "
+                        "completed, SimAI would recreate the receive QP (not modelled)\n", ev[13]);
 #ifdef TWINS_MEMO_AUDIT
     {
         unsigned long long au[4];
@@ -2591,8 +2720,11 @@ int main(int argc, char **argv)
         ev[8] += g_rank_lossy;
     }
     if (ev[8] || ev[9])
+    {
+        bad = true;
         fprintf(stderr, "warning: ties the chains did not decide exactly (%llu undecided, %llu on lost tails; a larger --tail helps)\n",
                 ev[8], ev[9]);
+    }
     // a slot's DAG messages overflowed (more firings in one slot than dcap), or a tie met an
     // overwritten tail: the run is not exact; it starts again with more room, the same arguments
     // otherwise
@@ -2609,6 +2741,30 @@ int main(int argc, char **argv)
         string more = redo_d ? "--dcap=" + std::to_string(4 * dcap) : redo_t ? "--tail-auto=" + std::to_string(std::min(tail_max, tail_log2 < 26 ? 26 : 27)) : "";
         if (redo_f)
             more += string(more.empty() ? "" : " ") + "--fcap-auto=" + std::to_string(std::min(65535, 4 * fcap));
+        if (redo_f && s.frame_overflow_world && q3_overrides.empty() && queue_report.empty() &&
+            !(ev[5] || ev[6] || ev[7] || ev[8] || ev[9] || ev[12] || ev[14] || ev[15] || ev[32] || ev[33] || ev[36]))
+        {
+            vector<unsigned long long> overflow(W);
+            CK(cudaMemcpy(overflow.data(), s.frame_overflow_world, W * sizeof(overflow[0]), cudaMemcpyDeviceToHost));
+            string selected;
+            bool complete = true;
+            int affected = 0;
+            for (int i = 0; i < W; ++i)
+                if (overflow[i])
+                {
+                    if (!selected.empty()) selected += ',';
+                    selected += std::to_string(batch_source_ids[i]);
+                    ++affected;
+                }
+                else
+                    complete &= std::all_of(fct.begin() + fbase[i], fct.begin() + fbase[i] + worlds[i].fi.size(),
+                                            [](int64_t ns) { return ns >= 0; });
+            if (complete && affected && affected < W)
+            {
+                more += " --batch-retry-select=" + selected + " --batch-retry-slot-ns=" + std::to_string(D);
+                fprintf(stderr, "RDMA frame retry: %d of %d worlds\n", affected, W);
+            }
+        }
 #ifndef TWINS_HASH_MEMO
         if (!g_fp_given) // (the same bases again)
             more += string(more.empty() ? "" : " ") + "--fp-bases=" + std::to_string(h_fp[0]) + "," + std::to_string(h_fp[1]);

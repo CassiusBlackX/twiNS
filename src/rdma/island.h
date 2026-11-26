@@ -352,6 +352,9 @@ static void island_live(Island &is)
         m->slot = *s.slot;
         m->nodes = *g_tail.cnt - g_tail_side;
         memcpy(m->ev, s.ev, sizeof(m->ev));
+        if (cmd == ISL_RUN && m->profile)
+            m->run_ready_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
         isl_wake(m->done_seq);
     }
 }

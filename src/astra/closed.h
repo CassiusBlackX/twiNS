@@ -83,6 +83,7 @@ struct NvlIslands
     int64_t sent_limit = 0;          // the limit of the last run
     string dir;
     double t_wait = 0, t_xfer = 0;
+    std::ofstream collect_profile;
     unsigned long long xn_seen = 0, items_in = 0, items_out = 0;
 
     // the files, segments and processes: servers spread over P processes (--nvl-islands=P), each
@@ -107,6 +108,12 @@ struct NvlIslands
         {
             n = 0;
             return;
+        }
+        if (const char *path = getenv("TWINS_ISLAND_PROFILE"))
+        {
+            collect_profile.open(path);
+            if (!collect_profile) { perror(path); exit(1); }
+            collect_profile << "limit collect_start_ns last_worker_ready_ns first_wait_ns copy_ns continuation_wait_ns continuation_chunks records\n";
         }
         wsw.assign(n, {});
         wflows.assign(n, {});
@@ -254,6 +261,7 @@ struct NvlIslands
                 fprintf(stderr, "nvl: cannot make %s\n", name.c_str());
                 exit(1);
             }
+            m->profile = collect_profile.is_open();
             shm.push_back(m);
             names.push_back(name);
             // the island: the config and every KEY=VALUE given here, the cluster's RTT and window
@@ -342,28 +350,54 @@ struct NvlIslands
     // each island's answer: what it made, in order
     void collect(vector<vector<NvlRec>> &out)
     {
-        auto t0 = std::chrono::steady_clock::now();
+        using Clock = std::chrono::steady_clock;
+        const auto t0 = Clock::now();
+        const bool profile = collect_profile.is_open();
+        const auto ns = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); };
+        uint64_t last_ready = 0, records = 0, chunks = 0;
+        int64_t first_wait = 0, copy = 0, continuation = 0;
         out.assign(n, {});
         for (int k = 0; k < n; k++)
         {
             IslShm *m = shm[k];
+            auto began = profile ? Clock::now() : Clock::time_point{};
             isl_wait(m->done_seq, done_at[k]);
+            if (profile)
+            {
+                first_wait += ns(Clock::now() - began);
+                last_ready = std::max(last_ready, m->run_ready_ns);
+            }
             for (;;)
             {
+                if (profile) began = Clock::now();
                 out[k].insert(out[k].end(), m->out(), m->out() + m->out_n);
                 items_out += m->out_n;
+                if (profile)
+                {
+                    copy += ns(Clock::now() - began);
+                    records += m->out_n;
+                }
                 if (!m->more)
                     break;
                 const uint32_t d = m->done_seq.load(std::memory_order_acquire);
                 m->cmd = ISL_MORE;
+                if (profile) began = Clock::now();
                 isl_wake(m->cmd_seq);
                 isl_wait(m->done_seq, d);
+                if (profile)
+                {
+                    continuation += ns(Clock::now() - began);
+                    ++chunks;
+                }
             }
             slot = m->slot;
             if (m->nodes - nodes_at_go[k] >= (1ull << (RING_LOG - 1)))
                 wide_windows++; // (the GPU may have read a node as it was overwritten: a lost tail)
         }
         t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (profile)
+            collect_profile << sent_limit << ' ' << ns(t0.time_since_epoch()) << ' ' << last_ready << ' '
+                            << first_wait << ' ' << copy << ' ' << continuation << ' ' << chunks << ' ' << records << '\n';
     }
     // the islands' items into the GPU's rings: nodes renumbered, completions after the GPU's own
     template <typename P>
@@ -547,6 +581,7 @@ struct NvlIslands
     // the end: the islands write their flows' completion times; these, by global id
     void finish(vector<int64_t> &start, vector<int64_t> &fct, unsigned &done)
     {
+        if (collect_profile.is_open()) collect_profile.close();
         double busy = 0;
         uint64_t nodes_max = 0;
         for (int k = 0; k < n; k++)
@@ -1417,13 +1452,19 @@ static bool closed_prepare(const string &topo, const string &wl, const string &f
         if (!freopen("/dev/null", "w", stdout))
             _exit(1);
         vector<astra::Flow> flows;
+        const auto stub_start = std::chrono::steady_clock::now();
         auto st = astra::stub_run(atopo, awl, 400, &flows);
+        const auto stub_done = std::chrono::steady_clock::now();
         FILE *f = fopen(path.c_str(), "w");
         if (!f || !st.finished)
             _exit(1);
         for (size_t i = 0; i < flows.size(); i++)
             fprintf(f, "flow %zu %d %d %llu\n", i, flows[i].src, flows[i].dst, (unsigned long long)flows[i].size);
         fclose(f);
+        if (getenv("TWINS_STUB_PROFILE"))
+            fprintf(stderr, "stub phases: frontend %.6f s callbacks %.6f s record copy/teardown %.6f s serialization %.6f s\n",
+                    st.init_s, st.run_s, std::chrono::duration<double>(stub_done - stub_start).count() - st.init_s - st.run_s,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - stub_done).count());
         _exit(0);
     }
     int stc = 0;

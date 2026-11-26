@@ -37,7 +37,11 @@ constexpr int MIN_FRAME = 23; // PPP + IPv4 + the shortest final fragment (one b
 constexpr int MAX_TX = SLOT_PS / (MIN_FRAME * PS_PER_BYTE) + 2;
 #else
 constexpr int MIN_FRAME = CTRL_FRAME;
+#ifdef TWINS_TCP_TEST_TX_CAP
+constexpr int MAX_TX = TWINS_TCP_TEST_TX_CAP;
+#else
 constexpr int MAX_TX = 300; // 1 us / 3.36 ns (a 42-byte frame at 100G) < 300
+#endif
 #endif
 constexpr int NB = 4;                   // message ring (receivers read slots s-1 and s-2)
 constexpr int QDISC_CAP = 200;          // default RED MaxSize (packets); per queue: red_k, qcap
@@ -68,6 +72,12 @@ constexpr uint32_t INIT_CWND = 10 * MSS;
 constexpr int DUPTHRESH = 3;
 #ifndef TWINS_CHAIN_RUNS
 #define TWINS_CHAIN_RUNS 9 // 64-byte frames; 25 gives 128-byte frames with longer histories
+#endif
+#if defined(TWINS_LINK_TIMING) && (TWINS_CHAIN_RUNS >= 63 || (defined(TWINS_USE_HIP) && TWINS_CHAIN_RUNS >= 31))
+#define TWINS_TCP_DEVICE_SCRATCH
+#endif
+#if defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 63
+#define TWINS_TCP_PACKED_BUCKETS
 #endif
 constexpr int CHAIN_RUNS = TWINS_CHAIN_RUNS; // recorded runs; then the root (2 words)
 constexpr int CHAIN = 2 * CHAIN_RUNS + 2;
@@ -495,7 +505,11 @@ struct Sim
     int *host_in_link; // [H]
     int *sw_in_link;   // [S*k]
     Frame *msg;        // [NB][L][MAX_TX]
-#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
+#ifdef TWINS_TCP_PACKED_BUCKETS
+    uint64_t *arrival_offset;
+    int *arrival_banks, *arrival_cap;
+#endif
+#ifdef TWINS_TCP_DEVICE_SCRATCH
     Frame *host_frames; // emission and reassembly scratch, owned by one host lane
     ChainWord *host_event_chain;
 #endif
@@ -549,6 +563,26 @@ __host__ __device__ inline int64_t mi(const Sim &s, int64_t slot, int link)
     return (slot & (NB - 1)) * s.L + link;
 #endif
 }
+
+#ifdef TWINS_LINK_TIMING
+__device__ inline int arrival_capacity(const Sim &s, int link)
+{
+#ifdef TWINS_TCP_PACKED_BUCKETS
+    return s.arrival_cap[link];
+#else
+    return s.max_tx;
+#endif
+}
+
+__device__ inline Frame *arrival_bucket(const Sim &s, int64_t slot, int link)
+{
+#ifdef TWINS_TCP_PACKED_BUCKETS
+    return s.msg + s.arrival_offset[link] + size_t(slot % s.arrival_banks[link]) * s.arrival_cap[link];
+#else
+    return s.msg + size_t(mi(s, slot, link)) * s.max_tx;
+#endif
+}
+#endif
 
 // frames in link's message of slot `slot` (0 if that ring entry was last written for another slot)
 __host__ __device__ inline int msg_count(const Sim &s, int64_t slot, int link)

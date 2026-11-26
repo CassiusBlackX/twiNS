@@ -57,6 +57,9 @@ namespace kbasic = kfull;
 #endif
 using kfull::Due;
 
+#ifdef TWINS_TCP_BUCKET_AUDIT
+static size_t explicit_device_bytes = 0;
+#endif
 
 template <typename T>
 static T *dalloc(size_t n)
@@ -64,6 +67,9 @@ static T *dalloc(size_t n)
     T *p;
     CHECK(cudaMalloc(&p, sizeof(T) * std::max<size_t>(n, 1)));
     CHECK(cudaMemset(p, 0, sizeof(T) * std::max<size_t>(n, 1)));
+#ifdef TWINS_TCP_BUCKET_AUDIT
+    explicit_device_bytes += sizeof(T) * std::max<size_t>(n, 1);
+#endif
 #ifdef TWINS_EVIDENCE
     twins_evidence::allocated += sizeof(T)*std::max<size_t>(n,1);
     if constexpr (std::is_same<T,Frame>::value) twins_evidence::inline_allocated += sizeof(T)*std::max<size_t>(n,1) * sizeof(Frame::chain)/sizeof(Frame);
@@ -1035,7 +1041,7 @@ int main(int argc, char **argv)
     s.hs.link_free = dalloc<int64_t>(H);
     s.hs.last_start = dalloc<int64_t>(H);
     s.hs.last_chain = dalloc<ChainWord>((size_t)H * CHAIN);
-#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
+#ifdef TWINS_TCP_DEVICE_SCRATCH
     s.host_frames = dalloc<Frame>(size_t(H) * 2);
     s.host_event_chain = dalloc<ChainWord>(size_t(H) * CHAIN);
 #endif
@@ -1200,6 +1206,7 @@ int main(int argc, char **argv)
     }
     s.sw_in_link = dupload(sw_in);
     int banks = NB, tx_capacity = MAX_TX;
+    size_t arrival_entries = 0;
 #ifdef TWINS_LINK_TIMING
     if (timing.empty()) { fprintf(stderr, "heterogeneous kernel needs a graph topology\n"); return 1; }
     s.slot_ps = INT64_MAX;
@@ -1248,6 +1255,25 @@ int main(int argc, char **argv)
     s.delay_ps = dupload(delays);
     s.last_arrival_slot = dalloc<unsigned long long>(1);
     if (size_t(banks) > SIZE_MAX / s.L / tx_capacity / sizeof(Frame)) return 1;
+#ifdef TWINS_TCP_PACKED_BUCKETS
+    // An individual link uses only its own serialization rate and transit time.
+    // Tags retain the common time ring. The smaller frame banks use the same
+    // per-link lookahead bound, including a spare bank before reuse.
+    std::vector<uint64_t> offsets(s.L);
+    std::vector<int> link_banks(s.L, 1), link_cap(s.L);
+    for (int link = 0; link < s.L; ++link)
+    {
+        offsets[link] = arrival_entries;
+        if (!delays[link]) continue; // padding up to the maximum switch degree
+        const size_t rate = size_t(rates[link]) * (DATA_FRAME + 1);
+        link_cap[link] = int(s.slot_ps / table[rate + MIN_FRAME]) + 2;
+        link_banks[link] = int((delays[link] + table[rate + DATA_FRAME]) / s.slot_ps) + 3;
+        arrival_entries += size_t(link_cap[link]) * link_banks[link];
+    }
+    s.arrival_offset = dupload(offsets);
+    s.arrival_banks = dupload(link_banks);
+    s.arrival_cap = dupload(link_cap);
+#endif
     printf("TCP heterogeneous slot %lld ps, %d banks, %d frames/slot, %zu-byte frame, %d history runs\n",
            (long long)s.slot_ps, banks, tx_capacity, sizeof(Frame), CHAIN_RUNS);
 #endif
@@ -1277,9 +1303,10 @@ int main(int argc, char **argv)
         printf("IPv4 native timeout callbacks: %d per host\n", fragment_timer_cap);
     }
 #endif
+    if (!arrival_entries) arrival_entries = (size_t)banks * s.L * tx_capacity;
     printf("TCP arrival ring links=%d banks=%d frames_per_link_bucket=%d frame_bytes=%zu allocation_bytes=%zu\n",
-           s.L, banks, tx_capacity, sizeof(Frame), (size_t)banks * s.L * (tx_capacity * sizeof(Frame) + sizeof(long long)));
-    s.msg = dalloc<Frame>((size_t)banks * s.L * tx_capacity);
+           s.L, banks, tx_capacity, sizeof(Frame), arrival_entries * sizeof(Frame) + (size_t)banks * s.L * sizeof(long long));
+    s.msg = dalloc<Frame>(arrival_entries);
     s.msg_cnt = dalloc<long long>((size_t)banks * s.L);
     {
         std::vector<long long> init((size_t)banks * s.L, -(1ll << 16)); // no slot
@@ -1393,17 +1420,32 @@ int main(int argc, char **argv)
            " | retx by state open %llu disorder %llu cwr %llu recovery %llu loss %llu | max-inflight %llu segs rtt-ovf %llu ring-ovf %llu"
            " | undecided-ties %llu fragment-timer-ovf %llu\n",
            M, fd, sec, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11], ev[12], ev[13], ev[14], ev[19], ev[25], ev[36]);
+#ifdef TWINS_TCP_TEST_TX_CAP
+    printf("TCP full with next transmission outside this slot: %llu observations\n", ev[20]);
+#endif
 #ifdef TWINS_SCALE_HIST
     unsigned long long general[2][CHAIN_RUNS+1], basic_runs[2][CHAIN_RUNS+1]{};
+#ifdef TWINS_USE_HIP
     CHECK(hipMemcpyFromSymbol(general,HIP_SYMBOL(kfull::comparison_runs),sizeof(general)));
 #ifndef TWINS_LINK_TIMING
     CHECK(hipMemcpyFromSymbol(basic_runs,HIP_SYMBOL(kbasic::comparison_runs),sizeof(basic_runs)));
+#endif
+#else
+    CHECK(cudaMemcpyFromSymbol(general,kfull::comparison_runs,sizeof(general)));
+#ifndef TWINS_LINK_TIMING
+    CHECK(cudaMemcpyFromSymbol(basic_runs,kbasic::comparison_runs,sizeof(basic_runs)));
+#endif
 #endif
     for(int truncated=0; truncated<2; ++truncated) {
         printf("TCP compared runs truncated=%d bins=",truncated);
         for(int n=0;n<=CHAIN_RUNS;++n) printf("%s%llu",n?",":"",general[truncated][n]+basic_runs[truncated][n]);
         printf("\n");
     }
+#endif
+#ifdef TWINS_TCP_BUCKET_AUDIT
+    printf("TCP arrival writes: %llu frames, %llu active logical buckets, %llu frame bytes, peak %llu frames per bucket\n",
+           ev[39], ev[35], ev[39] * sizeof(Frame), ev[20]);
+    printf("TCP explicit device allocation: %zu bytes\n", explicit_device_bytes);
 #endif
 #ifdef TWINS_EVIDENCE
     twins_evidence::report();

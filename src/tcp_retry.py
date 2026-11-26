@@ -125,12 +125,12 @@ def run(binary, args):
             print(f"TCP pass bytes={frame_bytes} sized_active={int(expanded)} worlds={len(ids)} "
                   f"active_ovf={count('active-ovf')} due_ovf={count('due-ovf')} "
                   f"fragment_timer_ovf={count('fragment-timer-ovf')} fragment_cap={fragment_cap} ties={count('undecided-ties')} "
-                  f"wall_s={time.monotonic()-t:.6f}", flush=True)
+                  f"loop_s={duration[1]} wall_s={time.monotonic()-t:.6f}", flush=True)
             if active or ties:
                 for line in log.splitlines():
                     if line.startswith(("TCP arrival ring", "TCP compared runs", "TCP heterogeneous")):
                         print(line, flush=True)
-            if any(count(f) for f in ("ooo-ovf", "rtt-ovf", "ring-ovf")):
+            if any(count(f) for f in ("tx-cap", "ooo-ovf", "rtt-ovf", "ring-ovf")):
                 sys.stderr.write(log + result.stderr)
                 return False
             if not active and not ties and not fragment:

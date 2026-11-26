@@ -175,6 +175,10 @@ static unordered_map<uint32_t, unordered_map<uint32_t, uint16_t> > portNumber;
 static map<uint64_t, uint32_t> flow_of; // (src, dst, sport) -> id
 static uint32_t has_win = 1, global_t = 1, flows_done;
 static FILE *fct_out;
+static uint64_t probe_duplicate_ns;
+static bool probe_duplicate_at_close;
+static Ptr<const Packet> probe_duplicate_packet;
+static void probe_duplicate();
 
 static uint64_t flow_key(uint32_t s, uint32_t d, uint32_t sport) { return ((uint64_t)s << 40) | ((uint64_t)d << 16) | sport; }
 
@@ -200,10 +204,14 @@ static void ScheduleFlowInputs()
 static void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q)
 {
     uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+    if ((probe_duplicate_ns || probe_duplicate_at_close) && sid == 0 && did == 1)
+        printf("RXQP close %lu\n", Simulator::Now().GetTimeStep());
     fprintf(fout, "%u %lu %lu\n", flow_of[flow_key(sid, did, q->sport)], q->startTime.GetTimeStep(),
             (Simulator::Now() - q->startTime).GetTimeStep());
     Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
     rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+    if (probe_duplicate_at_close && sid == 0 && did == 1)
+        Simulator::ScheduleNow(&probe_duplicate);
     if (++flows_done == flows.size())
         Simulator::Stop();
 }
@@ -228,8 +236,24 @@ static void tx_begin(uint32_t node, uint32_t dev, Ptr<const Packet> p)
         kind = ch.l3Prot == 0xFC ? 'A' : 'N', sport = ch.ack.dport, seq = ch.ack.seq;
     else if (ch.l3Prot == 0xFE)
         kind = ch.pfc.time > 0 ? 'P' : 'R', a = ch.pfc.qIndex, b = 0;
+    if ((probe_duplicate_ns || probe_duplicate_at_close) && kind == 'D' && node == 0 && a == 0 && b == 1 && seq == 1000)
+        probe_duplicate_packet = p->Copy();
     fprintf(tx_out, "%lu %u %u %c %u %u %u %u %u %u\n", now, node, dev, kind, a, b, sport, seq, p->GetSize(),
             (unsigned)(ch.m_tos & 3));
+}
+
+// Replay a duplicate of an actual data packet through the native receiver handler.
+static void probe_duplicate()
+{
+    if (!probe_duplicate_packet) { fprintf(stderr, "duplicate probe has no captured packet\n"); std::abort(); }
+    Ptr<Packet> p = probe_duplicate_packet->Copy();
+    CustomHeader h(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
+    h.getInt = 1;
+    p->PeekHeader(h);
+    auto receiver = n.Get(1)->GetObject<RdmaDriver>()->m_rdma;
+    printf("RXQP duplicate %lu present %d seq %u\n", Simulator::Now().GetTimeStep(),
+           bool(receiver->GetRxQp(h.dip, h.sip, h.udp.dport, h.udp.sport, h.udp.pg, false)), h.udp.seq);
+    receiver->ReceiveUdp(p, h);
 }
 
 // ---------------------------------------------------------------- main
@@ -565,6 +589,15 @@ int main(int argc, char *argv[])
         Simulator::Schedule(NanoSeconds(flows[0].start), ScheduleFlowInputs);
 
     Simulator::Stop(Seconds(num("SIMULATOR_STOP_TIME", 10.0)));
+    probe_duplicate_at_close = getenv("TWINS_DUPLICATE_AT_CLOSE") != nullptr;
+    if (probe_duplicate_at_close && !tx_out) { fprintf(stderr, "duplicate probe requires --txtrace\n"); return 1; }
+    const char *value = probe_duplicate_at_close ? nullptr : getenv("TWINS_DUPLICATE_NS");
+    if (value)
+    {
+        if (!tx_out) { fprintf(stderr, "duplicate probe requires --txtrace\n"); return 1; }
+        probe_duplicate_ns = strtoull(value, nullptr, 10);
+        Simulator::Schedule(NanoSeconds(probe_duplicate_ns), &probe_duplicate);
+    }
     Simulator::Run();
     Simulator::Destroy();
     fclose(fct_out);

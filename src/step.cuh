@@ -29,7 +29,7 @@ constexpr bool GENERAL = TWINS_GENERAL;
 #define TWINS_COLD inline
 #endif
 
-#if defined(TWINS_USE_HIP) && defined(TWINS_LINK_TIMING) && TWINS_CHAIN_RUNS >= 31
+#ifdef TWINS_TCP_DEVICE_SCRATCH
 // Keep the wide frames in their owning rings and inline the two queue
 // boundaries. This avoids the gfx1200 fault on the optimized path with
 // private wide frame copies without inlining the entire TCP model.
@@ -132,12 +132,12 @@ struct Fifo
             int64_t lead = duration + s->delay_ps[id];
             int64_t arrival_slot = (start + lead) / s->slot_ps;
             int n = msg_count(*s, arrival_slot, id);
-            if (n >= s->max_tx)
+            if (n >= arrival_capacity(*s, id))
             {
                 atomicAdd(&s->ev[19], 1ull);
                 return;
             }
-            Frame &o = s->msg[size_t(mi(*s, arrival_slot, id)) * s->max_tx + n];
+            Frame &o = arrival_bucket(*s, arrival_slot, id)[n];
             o = f;
 #else
             Frame o = f;
@@ -176,14 +176,19 @@ struct Fifo
             o.ts = start + o.arrival_lead;
             int64_t arrival_slot = o.ts / s->slot_ps;
             int n = msg_count(*s, arrival_slot, id);
-            if (n >= s->max_tx)
+            if (n >= arrival_capacity(*s, id))
             {
                 atomicAdd(&s->ev[19], 1ull);
                 return;
             }
-            frame_copy(s->msg + size_t(mi(*s, arrival_slot, id)) * s->max_tx + n, &o);
+            frame_copy(arrival_bucket(*s, arrival_slot, id) + n, &o);
 #endif
             msg_set(*s, arrival_slot, id, n + 1);
+#ifdef TWINS_TCP_BUCKET_AUDIT
+            atomicAdd(&s->ev[39], 1ull);
+            if (!n) atomicAdd(&s->ev[35], 1ull);
+            atomicMax(&s->ev[20], (unsigned long long)(n + 1));
+#endif
             atomicMax(s->last_arrival_slot, (unsigned long long)arrival_slot);
 #else
             o.ts = end + PROP_PS;
@@ -194,7 +199,14 @@ struct Fifo
             head = (head + 1) % s->ring;
             size--;
         }
-        if (size > 0 && sent >= tx_capacity(*s))
+#ifdef TWINS_TCP_TEST_TX_CAP
+        if (size > 0 && sent >= tx_capacity(*s) &&
+            (ring[head].ts >= slot_end || link_free >= slot_end))
+            atomicAdd(&s->ev[20], 1ull);
+#endif
+        if (size > 0 && sent >= tx_capacity(*s) &&
+            ring[head].ts <= until && link_free <= until &&
+            ring[head].ts < slot_end && link_free < slot_end)
         {
             atomicAdd(&s->ev[4], 1ull);
 #ifdef NS_TRACE_CAP
@@ -2828,7 +2840,7 @@ __device__ inline int host_step(const Sim &s, int h, int64_t t, Due *due, int64_
     int n2 = 0, n1 = 0, i2 = 0;
 #ifdef TWINS_LINK_TIMING
     n1 = msg_count(s, t, link);
-    m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+    m1 = arrival_bucket(s, t, link);
 #else
     if (t >= 2)
     {
@@ -3257,7 +3269,7 @@ __device__ inline Input input_of(const Sim &s, int link, int64_t t)
         return in; // an unused port
 #ifdef TWINS_LINK_TIMING
     in.n1 = msg_count(s, t, link);
-    in.m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+    in.m1 = arrival_bucket(s, t, link);
 #else
     if (t >= 2)
     {
@@ -3289,7 +3301,7 @@ __device__ inline Input input_cached(const Sim &s, const SwScratch &sc, int sw, 
     in.n1 = sc.in_win[3 * iq + 2];
 #ifdef TWINS_LINK_TIMING
     in.m2 = nullptr;
-    in.m1 = s.msg + size_t(mi(s, t, link)) * s.max_tx;
+    in.m1 = arrival_bucket(s, t, link);
 #else
     in.m2 = t >= 2 ? s.msg + (size_t)mi(s, t - 2, link) * MAX_TX : nullptr;
     in.m1 = t >= 1 ? s.msg + (size_t)mi(s, t - 1, link) * MAX_TX : nullptr;

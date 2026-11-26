@@ -439,7 +439,13 @@ struct Sim
 {
     IrnSender *irn_sender;
     IrnMap *irn_receiver;
-    IrnLifetime *irn_lifetime;
+    RxLifetime *rx_lifetime; // HPCC and IRN receiver deletion on sender completion
+#ifdef RDMA_LIFETIME_PROBE
+    int64_t duplicate_at;
+    bool duplicate_after_close;
+    Pkt *duplicate_packet;
+    int *duplicate_processed;
+#endif
     size_t *irn_off;
     uint32_t *irn_tx_bits, *irn_rx_bits;
     unsigned long long *irn_counts; // emitted SACK, retransmitted data, RTO, received live-QP SACK
@@ -453,6 +459,8 @@ struct Sim
     // topology: node n's port p (device p + 1) sends on link out_link[n K + p], receives on
     // in_link[n K + p]; a link's receiving node and port
     int *deg, *out_link, *in_link, *link_dst, *link_dport;
+    const int *link_world;
+    unsigned long long *frame_overflow_world;
     // routes: switch x towards host h of its world, rt[si[x].rt_off + h]
     struct Route *rt;
     const uint8_t *rtp;
@@ -496,6 +504,11 @@ struct Sim
     struct SwPortLds *swws; // [ns_b][kb] the wide switches' ports, when they exceed LDS (else none)
     int *aidx;          // [S][2 POOL] their order per egress port (safe slots)
     int q0_cap, q3_cap;
+    const uint64_t *q3_offsets; // optional packed per-port queue boundaries
+    int64_t *queue_overflow_at; // optional first failed enqueue per port and queue class, plus 1
+#ifdef RDMA_PFC_AUDIT
+    unsigned long long *pfc_profile;
+#endif
     // links
     const LinkInfo *li; // [L]
     LFrame *msg;        // per link [nb][cap]

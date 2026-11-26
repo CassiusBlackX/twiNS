@@ -51,7 +51,7 @@ struct IrnSender
 
 // The last hop knows the completion time one propagation delay before either
 // endpoint can process it. Each QP has one final ACK route.
-struct IrnLifetime
+struct RxLifetime
 {
     unsigned long long close_at;
     Chain close_chain;
